@@ -10,7 +10,7 @@ proxy relay** — without the server publishing a reachable public address.
 Scope decisions (agreed up front):
 
 - **New crate.** Add an integration crate (working name **`isekai-p2p`**) that
-  wraps the `isekai-agent` primitives into a high-level session API. The CLI and
+  wraps the `isekai-p2p-core` primitives into a high-level session API. The CLI and
   the camera apps both depend on it.
 - **P2P is an added option, not a replacement.** The camera apps keep their
   current `isekai-link-utils` direct/cert path; P2P becomes a second connection
@@ -92,111 +92,134 @@ Everything between the two loopback sockets is the existing relay data path
 ### 3.2 New crate `isekai-p2p`
 
 A `msquic`-only integration crate — it always needs the relay legs, so unlike
-`isekai-agent` it has no msquic-free build. It re-exports nothing new from the
+`isekai-p2p-core` it has no msquic-free build. It re-exports nothing new from the
 transport layer; it adds two orchestration facades plus a shared config.
 
 ```
 rust/isekai-p2p/
-├── Cargo.toml        # deps: isekai-agent (features=["msquic"]), anyhow, tokio,
-│                     #       tracing, thiserror; workspace edition
+├── Cargo.toml        # deps: isekai-p2p-core (features=["msquic"]), anyhow, tokio,
+│                     #       tracing (+ argh/serde/tracing-subscriber for the bin)
 └── src/
     ├── lib.rs
-    ├── config.rs     # ProxyConfig, IdentityConfig, endpoint-key load/persist
+    ├── config.rs     # P2pConfig, load_or_generate_key, issue_endpoint_token
     ├── listener.rs   # ListenerSession  (target side)
-    └── initiator.rs  # InitiatorSession (initiator side)
+    ├── initiator.rs  # InitiatorSession (initiator side)
+    └── bin/
+        └── isekai-agent.rs   # the CLI (moved here; see §3.3)
 ```
 
 **Shared setup (`config.rs`).**
 
 ```rust
-/// How to reach the two services and which Endpoint key to use.
+/// How to reach the services and which Endpoint key to use.
 pub struct P2pConfig {
     pub identity_url: String,      // https://identity...:8443
     pub identity_http3: bool,      // pick the h3 transport
     pub proxy_url: String,         // https://proxy...:8443
     pub auth0_token: String,       // for the Identity API only
     pub protocol: String,          // e.g. "isekai-validator-v1"
+    pub register: bool,            // register on first use of a fresh key
+    pub device_name: Option<String>,
+    pub token_ttl: Option<i64>,
     pub key: EndpointKey,          // load_or_generate below
 }
 
 /// Load a PKCS#8 PEM key, or generate + persist one (0600) on first use.
 pub fn load_or_generate_key(path: &Path) -> anyhow::Result<EndpointKey>;
 
-/// register (if needed) → issue Endpoint Token. Wraps IdentityClient over the
-/// selected transport (mirrors `main.rs::token`).
-async fn issue_endpoint_token(cfg: &P2pConfig) -> anyhow::Result<String>;
+/// register (if configured) → issue Endpoint Token, over the selected transport.
+pub async fn issue_endpoint_token(cfg: &P2pConfig) -> anyhow::Result<EndpointToken>;
 ```
 
-**`ListenerSession` (target).** Encapsulates the CLI's create-listener +
-issue-capability + bind flow.
+**`ListenerSession` (target).** Two-phase (see §3.5): `create` the listener and
+issue capabilities up front; `bind` once the initiator's `connection_id` exists.
 
 ```rust
 pub struct ListenerSession {
     pub listener_id: String,
-    pub endpoint_id: String,          // this peer's; the client needs it? no — see note
-    bind: BindSession,                // holds the relay open; drop = stop
-    proxy: ProxyClient<...>,
+    pub endpoint_id: String,
+    /* proxy client + token + key + forward_to + bind guard */
 }
 
 impl ListenerSession {
-    /// register/token → create private peer-listener → open bind session that
-    /// forwards inbound relay UDP to `forward_to` (the local video listener).
-    pub async fn start(cfg: &P2pConfig, forward_to: SocketAddr)
+    /// issue token → create private peer-listener (forward_to = local video listener).
+    pub async fn create(cfg: &P2pConfig, forward_to: SocketAddr, ttl: Option<u64>)
         -> anyhow::Result<Self>;
 
     /// Mint a capability for `allowed_endpoint` (the client's Endpoint ID).
-    /// Returns the opaque token to hand out of band.
-    pub async fn issue_capability(&self, allowed_endpoint: &str)
-        -> anyhow::Result<String>;
+    pub async fn issue_capability(&self, allowed_endpoint: &str, ttl: Option<u64>)
+        -> anyhow::Result<Capability>;
+
+    /// Open the relay bind leg for the initiator's connection id.
+    pub async fn bind(&mut self, connection_id: &str) -> anyhow::Result<()>;
 
     pub async fn close(self);
 }
 ```
 
-**`InitiatorSession` (initiator).** Encapsulates the CLI's `connect` +
-open-connect-relay flow.
+**`InitiatorSession` (initiator).** `peer_connect` + open the relay connect leg.
 
 ```rust
 pub struct InitiatorSession {
     /// The local UDP address the app dials its video QUIC at.
     pub local_addr: SocketAddr,
-    pub connection_id: String,
+    pub connection: PeerConnection,   // .connection_id, relay info
     relay: ConnectRelay,              // holds the leg open; drop = stop
 }
 
 impl InitiatorSession {
-    /// register/token → peer-connect(capability, listener_id) →
-    /// open connect relay leg. `local_bind` defaults to 127.0.0.1:0.
+    /// issue token → peer-connect(capability, listener_id) → open connect relay.
     pub async fn connect(
-        cfg: &P2pConfig,
-        capability: &str,
-        listener_id: &str,
-        local_bind: SocketAddr,
+        cfg: &P2pConfig, capability: &str, listener_id: &str,
+        candidates: &[Candidate], local_bind: SocketAddr,
     ) -> anyhow::Result<Self>;
 
+    /// Same, but with a token the caller already has (skips the Identity call).
+    /// Used by the CLI's `connect --relay`.
+    pub async fn connect_with_token(
+        cfg: &P2pConfig, endpoint_token: &str, capability: &str, listener_id: &str,
+        candidates: &[Candidate], local_bind: SocketAddr,
+    ) -> anyhow::Result<Self>;
+
+    pub fn connection_id(&self) -> &str;
     pub async fn close(self);
 }
 ```
 
-These are thin: each is the exact call sequence already in `main.rs`, moved
-behind a struct and returning the session guard instead of blocking on Ctrl-C.
+These are thin: each is the call sequence the CLI already ran, moved behind a
+struct and returning the session guard instead of blocking on Ctrl-C.
 Errors surface as `anyhow::Error` (the apps only need to display them).
 
-### 3.3 What moves out of `ISEKAI-agent/main.rs`
+### 3.3 Crate split and the CLI move
 
-`main.rs` shrinks to argument parsing that builds a `P2pConfig` and calls the
-same session facades. Concretely:
+The primitives crate is **renamed `isekai-agent` → `isekai-p2p-core`**: now that
+it is a library of P2P Connect building blocks under `isekai-p2p`, "agent" was
+misleading. (The library rename does not touch the *binary*, which stays
+`isekai-agent` — the user-facing CLI tool.)
+
+The plan first envisioned the CLI staying with the primitives and depending on
+`isekai-p2p`. That would be a dependency **cycle** (`isekai-p2p-core` →
+`isekai-p2p` → `isekai-p2p-core`), which Cargo forbids. So the CLI binary moves
+into `isekai-p2p` (keeping the `isekai-agent` binary name via `[[bin]]`), and
+`isekai-p2p-core` is a primitives-only library. This is the split the plan
+intended — "the CLI depends on `isekai-p2p`" — realized without the cycle.
+
+The CLI's argument surface is unchanged. Internally:
 
 - `token` → `config::issue_endpoint_token`.
-- the `Connect` arm's control-plane call + `open_connect_relay` →
-  `InitiatorSession::connect`.
-- `run_bind` (+ the separate `create-listener` / `issue-capability` subcommands)
-  → `ListenerSession::start` / `issue_capability`.
+- `connect --relay` → `InitiatorSession::connect_with_token` (the token/key come
+  from `--token` / `--key`, so no Identity round-trip).
+- `connect` without `--relay`, and `create-listener` / `issue-capability` /
+  `get-connection` / `report-state` / `bind`: single one-shot control-plane or
+  relay calls, so they keep using the `isekai-p2p-core` primitives directly. The
+  `ListenerSession` facade (create + capability + bind in one process) doesn't
+  fit these separate one-shot invocations, so it isn't used by the CLI — only by
+  the camera apps.
 
 The low-level modules (`identity`, `proxy`, `bind`, `transport`, `https`,
-`endpoint`, `pop`) **stay in `isekai-agent`** and keep their current API;
-`isekai-p2p` builds on top. This keeps the split clean: `isekai-agent` =
-protocol primitives, `isekai-p2p` = orchestration.
+`endpoint`, `pop`) **stay in `isekai-p2p-core`** and keep their current API;
+`isekai-p2p` builds on top. Split: `isekai-p2p-core` = protocol primitives,
+`isekai-p2p` = orchestration + CLI.
 
 ### 3.4 Camera-app integration
 
@@ -208,20 +231,24 @@ token, key path, and — after start — a read-only display of `listener_id` an
 `endpoint_id`, plus a text box to paste the **client's** Endpoint ID and an
 "Issue capability" button that shows the resulting capability to copy.
 
-Flow, replacing `run_isekai_connection` when mode = P2P:
+Flow, replacing `run_isekai_connection` when mode = P2P (`ListenerSession` is
+**two-phase** — see §3.5 for why):
 1. Bind the existing ALPN-`sample` QUIC listener on `127.0.0.1:0` → `S` (reuse
    the current listener/accept/uni-stream push loop verbatim).
-2. `ListenerSession::start(cfg, S)`.
-3. On operator action, `issue_capability(client_endpoint_id)` → display it.
-4. Keep the session alive while streaming; `close()` on stop.
+2. `ListenerSession::create(cfg, S, ttl)` → `listener_id` (displayed).
+3. On operator action, `issue_capability(client_endpoint_id, ttl)` → display it.
+4. When the operator pastes the client's `connection_id`,
+   `session.bind(connection_id)` attaches the relay leg.
+5. Keep the session alive while streaming; `close()` on stop.
 
 **`camera-client` (P2P mode).** New UI fields: identity URL, proxy URL, Auth0
 token, key path, and pasted `capability` + `listener_id` (from the server
-operator). Its own `endpoint_id` is shown so it can be sent to the server.
+operator). Its own `endpoint_id` and, after connecting, its `connection_id` are
+shown so they can be sent to the server.
 
 Flow, replacing the direct dial when mode = P2P:
-1. `InitiatorSession::connect(cfg, capability, listener_id, 127.0.0.1:0)` →
-   `local_addr = C`.
+1. `InitiatorSession::connect(cfg, capability, listener_id, &[], 127.0.0.1:0)` →
+   `local_addr = C`, `connection_id` (displayed for the server).
 2. Dial the existing ALPN-`sample` QUIC connection at `C` instead of the public
    `IP:port` (reuse the current `accept_inbound_uni_stream` decode loop
    verbatim).
@@ -229,19 +256,26 @@ Flow, replacing the direct dial when mode = P2P:
 The video code (OpenCV capture, JPEG encode/decode, egui rendering, the uni
 stream push/read loops) is untouched in both apps.
 
-### 3.5 Endpoint IDs the peers must exchange
+### 3.5 Values the peers must exchange
 
-Manual exchange carries three values, all shown in the respective UIs:
+The relay edge is allocated when the **initiator** connects, and the target's
+bind leg must reference that same `connection_id` — so the manual exchange
+carries **four** values, not three, and the target's `ListenerSession` is
+two-phase (create the listener up front, bind once the `connection_id` exists):
 
 | value | produced by | consumed by |
 | --- | --- | --- |
-| server `listener_id` | `ListenerSession::start` | client (`connect`) |
 | client `endpoint_id` | client key | server (`issue_capability`) |
+| server `listener_id` | `ListenerSession::create` | client (`connect`) |
 | `capability` | server `issue_capability` | client (`connect`) |
+| client `connection_id` | `InitiatorSession::connect` | server (`bind`) |
 
-Order: client starts first to reveal its `endpoint_id` → operator gives it to
-the server → server issues the capability + `listener_id` → operator gives both
-to the client → client connects.
+Order:
+1. client reveals its `endpoint_id`;
+2. server `create`s the listener and `issue_capability` for that endpoint,
+   revealing `listener_id` + `capability`;
+3. client `connect`s with them, revealing `connection_id`;
+4. server `bind`s that `connection_id`; the relay is now live.
 
 ## 4. Auth model
 
@@ -267,10 +301,10 @@ to the client → client connects.
 Unit / integration (no cameras, no network hardware):
 - `isekai-p2p`: `config::load_or_generate_key` round-trips and enforces `0600`;
   `issue_endpoint_token` against the cleartext axum mock already used by
-  `ISEKAI-agent/tests/identity_flow.rs` (reuse the harness).
-- `ISEKAI-agent`: existing tests must still pass after the orchestration move
+  `isekai-p2p-core/tests/identity_flow.rs` (reuse the harness).
+- `isekai-p2p-core`: existing tests must still pass after the orchestration move
   (the primitives are unchanged).
-- Build both feature configurations: `cargo build -p isekai-agent`
+- Build both feature configurations: `cargo build -p isekai-p2p-core`
   (msquic-free lib still compiles) and `-p isekai-p2p --features …`.
 - CI parity: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`.
 
