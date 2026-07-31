@@ -23,6 +23,7 @@ use std::{
         mpsc,
     },
     thread,
+    time::Duration,
 };
 use tokio::sync::oneshot;
 use tokio::{io::AsyncWriteExt, task::JoinSet};
@@ -333,16 +334,31 @@ async fn main() -> eframe::Result<()> {
     let res = eframe::run_native(
         "Camera Stream App",
         options,
-        Box::new(|_cc| Ok(Box::new(MyApp::new(reg, rx, is_streaming, mjpeg_tx_holder)))),
+        Box::new(|_cc| Ok(Box::new(MyApp::new(
+            Arc::clone(&reg),
+            rx,
+            is_streaming,
+            mjpeg_tx_holder,
+        )))),
     );
     tracing::debug!("eframe exited, stopping camera task");
     is_terminated.store(true, Ordering::Relaxed);
     camera_task_handle.await.unwrap().unwrap();
     tracing::debug!("camera task finished");
-    let metrics = tokio::runtime::Handle::current().metrics();
-    tracing::debug!("Tokio runtime alive tasks: {}", metrics.num_alive_tasks());
-    res
+
+    // `run_native` has returned, so the app — and with it the listener and any
+    // relay session it was running — is dropped. Give msquic a moment to close
+    // what those tasks held, then leave without running destructors: returning
+    // would drop the registration, and `RegistrationClose` blocks on anything
+    // still open.
+    if let Err(e) = &res {
+        tracing::error!("camera server exited with an error: {e}");
+    }
+    camera_core::shutdown_and_exit(&reg, MSQUIC_DRAIN_TIMEOUT, i32::from(res.is_err())).await
 }
+
+/// How long to wait for msquic handles to close before leaving anyway.
+const MSQUIC_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How the camera stream reaches clients.
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -706,6 +722,15 @@ impl MyApp {
                 self.bind_connection(connection);
             }
         }
+    }
+}
+
+impl Drop for MyApp {
+    fn drop(&mut self) {
+        // Closing the window drops the app, which is the only chance to stop
+        // whatever it was running. Without this the listener and relay sessions
+        // keep their msquic handles open and the drain in `main` times out.
+        self.close();
     }
 }
 

@@ -9,6 +9,7 @@ use std::{
     future::poll_fn,
     net::SocketAddr,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 use tokio::{io::AsyncReadExt, sync::mpsc};
 use tokio_util::sync::CancellationToken;
@@ -73,12 +74,24 @@ async fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default().with_inner_size([1400.0, 1000.0]),
         ..Default::default()
     };
-    eframe::run_native(
+    let res = eframe::run_native(
         "Camera Client App",
         options,
-        Box::new(|_cc| Ok(Box::new(MyApp::new(reg)))),
-    )
+        Box::new(|_cc| Ok(Box::new(MyApp::new(Arc::clone(&reg))))),
+    );
+
+    // `run_native` has returned, so the app — and with it every connection it
+    // was running — is dropped. Give msquic a moment to close what those tasks
+    // held, then leave without running destructors: returning would drop the
+    // registration, and `RegistrationClose` blocks on anything still open.
+    if let Err(e) = &res {
+        tracing::error!("camera client exited with an error: {e}");
+    }
+    camera_core::shutdown_and_exit(&reg, MSQUIC_DRAIN_TIMEOUT, i32::from(res.is_err())).await
 }
+
+/// How long to wait for msquic handles to close before leaving anyway.
+const MSQUIC_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Draw the rolling RTT history as a line plot (values in milliseconds).
 fn show_rtt_plot(ui: &mut egui::Ui, rtt_history: &VecDeque<f64>) {
@@ -620,6 +633,15 @@ impl MyApp {
                 ui.monospace(connection_id.as_str());
             });
         }
+    }
+}
+
+impl Drop for MyApp {
+    fn drop(&mut self) {
+        // Closing the window drops the app, which is the only chance to stop
+        // the connection task. Without this its msquic handles stay open and
+        // the drain in `main` times out.
+        self.disconnect();
     }
 }
 
