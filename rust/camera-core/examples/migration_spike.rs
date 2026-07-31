@@ -168,7 +168,7 @@ async fn spike() -> anyhow::Result<bool> {
         "6a",
         Required::No,
         "リレー型トポロジで直接経路が PathValidated されるか (listener は現行の設定のまま)",
-        run(check_direct_path_migration(&reg, false, ClientBinding::PinnedToLeg)).await,
+        run(check_direct_path_migration(&reg, false, ClientBinding::PinnedToLeg, false)).await,
     );
     // The NAT-traversal listener variant builds its configuration by hand and
     // loads it from PEM files, which is the Unix credential path; probe it
@@ -182,7 +182,7 @@ async fn spike() -> anyhow::Result<bool> {
                 id,
                 Required::No,
                 question,
-                run(check_direct_path_migration(&reg, true, ClientBinding::PinnedToLeg)).await,
+                run(check_direct_path_migration(&reg, true, ClientBinding::PinnedToLeg, false)).await,
             );
         }
         Ok(None) => report.skip(
@@ -198,7 +198,7 @@ async fn spike() -> anyhow::Result<bool> {
         "7a",
         Required::No,
         "映像接続を pin せず、MASQUE レグの (L_c, O_c) を add_candidate_addr に渡すだけで直接経路が張れるか",
-        run(check_direct_path_migration(&reg, false, ClientBinding::Unpinned)).await,
+        run(check_direct_path_migration(&reg, false, ClientBinding::Unpinned, false)).await,
     );
     // The adopted design (案C). This is the check that gates the build.
     report.record(
@@ -209,6 +209,19 @@ async fn spike() -> anyhow::Result<bool> {
             &reg,
             false,
             ClientBinding::UnpinnedSharedLoopback,
+            false,
+        ))
+        .await,
+    );
+    report.record(
+        "7c",
+        Required::No,
+        "同上 + 到達不能な観測アドレスも候補として広告した場合 (実アプリと同じ 2 候補構成)",
+        run(check_direct_path_migration(
+            &reg,
+            false,
+            ClientBinding::UnpinnedSharedLoopback,
+            true,
         ))
         .await,
     );
@@ -572,10 +585,19 @@ impl ClientBinding {
     }
 }
 
+/// A candidate that can never be reached (TEST-NET-3, RFC 5737).
+///
+/// Stands in for the *observed* address of a peer behind a NAT that does not
+/// hairpin: advertised, probed, and permanently dead. The real apps always
+/// advertise one of these alongside the host address, which the single-candidate
+/// checks above never reproduced.
+const UNREACHABLE: &str = "203.0.113.5";
+
 async fn check_direct_path_migration(
     reg: &Arc<Registration>,
     natt_listener: bool,
     binding: ClientBinding,
+    with_unreachable_candidate: bool,
 ) -> anyhow::Result<String> {
     let mut listener = spawn_listener_variant(reg, loopback(0), natt_listener)
         .await?
@@ -599,6 +621,11 @@ async fn check_direct_path_migration(
     // variants — that is the point.
     conn.add_candidate_addr(client_leg.addr, client_leg.addr)
         .context("add_candidate_addr with the relay leg's address")?;
+    if with_unreachable_candidate {
+        let dead: SocketAddr = format!("{UNREACHABLE}:{}", client_leg.addr.port()).parse()?;
+        conn.add_candidate_addr(client_leg.addr, dead)
+            .context("add_candidate_addr with an unreachable observed address")?;
+    }
     conn.start(&client_config(reg, true)?, "127.0.0.1", bridge.front_addr.port())
         .await
         .context("relay-path handshake")?;
@@ -608,6 +635,12 @@ async fn check_direct_path_migration(
     // The server half of 案A: advertise the address the client should punch to.
     let bound = describe(accepted.add_bound_addr(server_leg.addr));
     let observed = describe(accepted.add_observed_addr(server_leg.addr, server_leg.addr));
+    let unreachable = if with_unreachable_candidate {
+        let dead: SocketAddr = format!("{UNREACHABLE}:{}", server_leg.addr.port()).parse()?;
+        describe(accepted.add_observed_addr(server_leg.addr, dead))
+    } else {
+        "n/a".to_owned()
+    };
 
     // Wait for NAT-traversal probing to validate anything but the relay path.
     let direct = tokio::time::timeout(PATH_VALIDATION_TIMEOUT, async {
@@ -629,8 +662,9 @@ async fn check_direct_path_migration(
     // A run that never validates a direct path is a FAIL, not a PASS carrying
     // prose that says otherwise — the context below records what was in play.
     let context = format!(
-        "client={}, listener natt={natt_listener}; relay path {} -> {}; \
-         server leg {} / client leg {}; add_bound_addr {bound} / add_observed_addr {observed}",
+        "client={}, listener natt={natt_listener}, unreachable-candidate={with_unreachable_candidate}; \
+         relay path {} -> {}; server leg {} / client leg {}; \
+         add_bound_addr {bound} / add_observed_addr {observed} / unreachable {unreachable}",
         binding.label(),
         relay_path.0,
         relay_path.1,
