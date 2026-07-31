@@ -168,7 +168,7 @@ async fn spike() -> anyhow::Result<bool> {
         "6a",
         Required::No,
         "リレー型トポロジで直接経路が PathValidated されるか (listener は現行の設定のまま)",
-        run(check_direct_path_migration(&reg, false, ClientBinding::PinnedToLeg, false)).await,
+        run(check_direct_path_migration(&reg, false, ClientBinding::PinnedToLeg, false, false)).await,
     );
     // The NAT-traversal listener variant builds its configuration by hand and
     // loads it from PEM files, which is the Unix credential path; probe it
@@ -182,7 +182,7 @@ async fn spike() -> anyhow::Result<bool> {
                 id,
                 Required::No,
                 question,
-                run(check_direct_path_migration(&reg, true, ClientBinding::PinnedToLeg, false)).await,
+                run(check_direct_path_migration(&reg, true, ClientBinding::PinnedToLeg, false, false)).await,
             );
         }
         Ok(None) => report.skip(
@@ -198,7 +198,7 @@ async fn spike() -> anyhow::Result<bool> {
         "7a",
         Required::No,
         "映像接続を pin せず、MASQUE レグの (L_c, O_c) を add_candidate_addr に渡すだけで直接経路が張れるか",
-        run(check_direct_path_migration(&reg, false, ClientBinding::Unpinned, false)).await,
+        run(check_direct_path_migration(&reg, false, ClientBinding::Unpinned, false, false)).await,
     );
     // The adopted design (案C). This is the check that gates the build.
     report.record(
@@ -209,6 +209,7 @@ async fn spike() -> anyhow::Result<bool> {
             &reg,
             false,
             ClientBinding::UnpinnedSharedLoopback,
+            false,
             false,
         ))
         .await,
@@ -221,6 +222,20 @@ async fn spike() -> anyhow::Result<bool> {
             &reg,
             false,
             ClientBinding::UnpinnedSharedLoopback,
+            true,
+            false,
+        ))
+        .await,
+    );
+    report.record(
+        "7d",
+        Required::No,
+        "検証済みの直接経路の相手が消えた後 (サーバのリレーレグ張り替え) に切り替えるとどうなるか",
+        run(check_direct_path_migration(
+            &reg,
+            false,
+            ClientBinding::UnpinnedSharedLoopback,
+            false,
             true,
         ))
         .await,
@@ -598,6 +613,7 @@ async fn check_direct_path_migration(
     natt_listener: bool,
     binding: ClientBinding,
     with_unreachable_candidate: bool,
+    drop_server_leg_before_activating: bool,
 ) -> anyhow::Result<String> {
     let mut listener = spawn_listener_variant(reg, loopback(0), natt_listener)
         .await?
@@ -661,6 +677,7 @@ async fn check_direct_path_migration(
 
     // A run that never validates a direct path is a FAIL, not a PASS carrying
     // prose that says otherwise — the context below records what was in play.
+    let server_leg_addr = server_leg.addr;
     let context = format!(
         "client={}, listener natt={natt_listener}, unreachable-candidate={with_unreachable_candidate}; \
          relay path {} -> {}; server leg {} / client leg {}; \
@@ -668,9 +685,17 @@ async fn check_direct_path_migration(
         binding.label(),
         relay_path.0,
         relay_path.1,
-        server_leg.addr,
+        server_leg_addr,
         client_leg.addr
     );
+    // Reproduce a rebind: the server's relay leg is replaced, so the binding
+    // the client just validated a path to stops existing — while the client's
+    // notion of "the direct path" still points at it.
+    if drop_server_leg_before_activating {
+        drop(server_leg);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
     let outcome = match direct {
         Ok(Ok(direct)) => {
             conn.activate_path(direct.0, direct.1)
