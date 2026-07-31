@@ -29,12 +29,18 @@ pub const VIDEO_ALPN: &str = "sample";
 const VIDEO_CONNECT_DEADLINE: Duration = Duration::from_secs(120);
 /// Delay between video handshake attempts.
 const VIDEO_CONNECT_RETRY_DELAY: Duration = Duration::from_millis(500);
-/// How long to wait for the relay leg's observed address before dialing without
-/// it. The report normally lands within a round trip of the leg coming up; if
-/// it does not, streaming over the relay matters more than a direct path.
-const OBSERVED_ADDRESS_WAIT: Duration = Duration::from_secs(3);
 /// How often to sample the connection's RTT for [`VideoRecvOptions::rtt`].
 const RTT_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+/// How long to wait for the relay leg's observed address before dialing without
+/// it. The report normally lands within a round trip of the leg coming up; if it
+/// does not, streaming over the relay matters more than a direct path.
+const OBSERVED_ADDRESS_WAIT: Duration = Duration::from_secs(3);
+/// How long a migrated path may carry nothing before falling back to the relay.
+///
+/// Generous next to a frame interval, so a stutter never triggers it, and short
+/// enough to be well inside the 30 s idle timeout that would otherwise take the
+/// whole connection down.
+const MIGRATED_PATH_GRACE: Duration = Duration::from_secs(5);
 
 /// Bind a video QUIC listener on `addr`.
 ///
@@ -232,10 +238,32 @@ fn apply_direct_path(conn: &Connection, address: ObservedAddress) {
 }
 
 async fn push_frames(conn: Connection, mut rx: mpsc::Receiver<Bytes>) {
+    // Sample on a timer rather than per frame. Counting frames looks equivalent
+    // and is not: when the peer stops acknowledging, `push_one` blocks on flow
+    // control and the frame counter stops advancing — so the logging goes quiet
+    // exactly when something has gone wrong and the numbers matter most. A
+    // stalled server then leaves no record of which path it was using.
+    let stats = tokio::spawn(log_stats_until_closed(conn.clone()));
     while let Some(frame) = rx.recv().await {
         if let Err(e) = push_one(&conn, &frame).await {
             tracing::debug!("video push ended: {e}");
             break;
+        }
+    }
+    stats.abort();
+}
+
+/// Log a connection's counters once a second for as long as it lives.
+async fn log_stats_until_closed(conn: Connection) {
+    let mut interval = tokio::time::interval(RTT_SAMPLE_INTERVAL);
+    loop {
+        interval.tick().await;
+        match conn.get_stats() {
+            Ok(stats) => log_connection_stats(&conn, &stats, "serving"),
+            Err(e) => {
+                tracing::debug!("stopped sampling the video connection: {e}");
+                break;
+            }
         }
     }
 }
@@ -278,7 +306,8 @@ pub struct VideoRecvOptions {
     ///
     /// When set, that pair is offered as a direct-path candidate before the
     /// handshake, and the connection is put on a shared, unconnected socket so
-    /// the path can actually be opened. Without it the connection is relay-only.
+    /// the path can be opened from the leg's binding. Without it the connection
+    /// is relay-only.
     pub observed: Option<ObservedAddressWatch>,
     /// Where to report path changes.
     pub path_events: Option<mpsc::Sender<PathEvent>>,
@@ -344,7 +373,7 @@ pub async fn receive_frames_with(
         rtt,
     } = opts;
 
-    // Wait for the candidate before dialing: `add_candidate_addr` has to be in
+    // Resolve the candidate before dialing: `add_candidate_addr` has to be in
     // place before `start`, and a handshake here can take a minute (it rides
     // across the peer's relay-bind gap), so there is no useful "add it later".
     let candidate = match observed {
@@ -366,18 +395,55 @@ pub async fn receive_frames_with(
     .await;
 
     let mut rtt_interval = tokio::time::interval(RTT_SAMPLE_INTERVAL);
+    // Watchdog state for a migration that silently carries nothing. `None` while
+    // on the relay path; `Some(when)` records when we left it, and is pushed
+    // forward by every frame that arrives afterwards.
+    let mut migrated_since: Option<Instant> = None;
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
-            _ = rtt_interval.tick(), if rtt.is_some() => {
+            // The RTT sampler doubles as the watchdog tick, so it runs whether
+            // or not anyone asked for RTT.
+            _ = rtt_interval.tick() => {
                 match conn.get_stats() {
                     // Rtt is reported in microseconds.
                     Ok(stats) => {
                         if let Some(rtt) = &rtt {
                             let _ = rtt.try_send(stats.Rtt as f64 / 1000.0);
                         }
+                        log_connection_stats(&conn, &stats, "tick");
                     }
                     Err(e) => tracing::debug!("could not read connection stats: {e}"),
+                }
+                // A direct path that validates and then carries nothing takes
+                // the whole connection down with it: the peer never sees our
+                // packets, so it never follows the migration, and both ends sit
+                // there until the idle timeout fires. Go back to the path that
+                // was working rather than let that happen.
+                if let Some(since) = migrated_since {
+                    if since.elapsed() >= MIGRATED_PATH_GRACE {
+                        tracing::warn!(
+                            local = %relay_path.0,
+                            remote = %relay_path.1,
+                            "no frames for {MIGRATED_PATH_GRACE:?} since migrating; \
+                             falling back to the relay path",
+                        );
+                        match conn.activate_path(relay_path.0, relay_path.1) {
+                            Ok(()) => {
+                                migrated_since = None;
+                                report_path(&path_events, PathEvent::Activated {
+                                    local: relay_path.0,
+                                    remote: relay_path.1,
+                                }).await;
+                            }
+                            Err(e) => {
+                                // Nothing else to try; let the idle timeout end
+                                // it rather than spin on a failing call.
+                                tracing::error!("could not fall back to the relay path: {e}");
+                                migrated_since = None;
+                            }
+                        }
+                    }
                 }
             }
             event = poll_fn(|cx| conn.poll_event(cx)) => match event {
@@ -401,6 +467,16 @@ pub async fn receive_frames_with(
                     Some((local, remote)) => match conn.activate_path(local, remote) {
                         Ok(()) => {
                             tracing::info!(%local, %remote, "activated path");
+                            // Watch a move *away* from the relay; a move back to
+                            // it is the recovery, not something to time out.
+                            migrated_since = ((local, remote) != relay_path).then(Instant::now);
+                            // A snapshot on each side of the switch is what
+                            // tells a stalled migration apart from a broken
+                            // one: whether packets still leave, whether any
+                            // arrive, and what MTU the new path settled on.
+                            if let Ok(stats) = conn.get_stats() {
+                                log_connection_stats(&conn, &stats, "after activate_path");
+                            }
                             report_path(&path_events, PathEvent::Activated { local, remote }).await;
                         }
                         Err(e) => tracing::warn!(%local, %remote, "could not activate path: {e}"),
@@ -411,6 +487,9 @@ pub async fn receive_frames_with(
             }
             stream = conn.accept_inbound_uni_stream() => {
                 let mut stream = stream?;
+                // Traffic is arriving on whatever path is current, so restart
+                // the watchdog rather than count from the migration itself.
+                migrated_since = migrated_since.map(|_| Instant::now());
                 let seq = stream.id().unwrap_or(0);
                 let mut buf = Vec::new();
                 stream.read_to_end(&mut buf).await?;
@@ -422,50 +501,31 @@ pub async fn receive_frames_with(
     Ok(())
 }
 
+/// Log what the connection is actually doing, which is the difference between
+/// "the migration stalled" and "the migration broke the connection".
+///
+/// `Send.PathMtu` is worth watching in particular: a newly opened path has to
+/// size itself, and this connection is configured with a `MaximumMtu` below
+/// msquic's default `MinimumMtu`.
+fn log_connection_stats(conn: &Connection, stats: &msquic::ffi::QUIC_STATISTICS, when: &str) {
+    tracing::debug!(
+        when,
+        local = ?conn.get_local_addr().ok(),
+        remote = ?conn.get_remote_addr().ok(),
+        rtt_us = stats.Rtt,
+        send_path_mtu = stats.Send.PathMtu,
+        send_packets = stats.Send.TotalPackets,
+        send_lost = stats.Send.SuspectedLostPackets,
+        recv_packets = stats.Recv.TotalPackets,
+        recv_dropped = stats.Recv.DroppedPackets,
+        "video connection stats",
+    );
+}
+
 async fn report_path(events: &Option<mpsc::Sender<PathEvent>>, event: PathEvent) {
     tracing::info!("video path: {event:?}");
     if let Some(events) = events {
         let _ = events.send(event).await;
-    }
-}
-
-/// Wait briefly for the relay leg's observed address.
-///
-/// `None` means carry on relay-only: a missing report is a lost optimisation,
-/// not a failure, and blocking the stream on it would be the wrong trade.
-async fn wait_for_observed(
-    mut watch: ObservedAddressWatch,
-    shutdown: &CancellationToken,
-) -> Option<ObservedAddress> {
-    if let Some(address) = *watch.borrow_and_update() {
-        return Some(address);
-    }
-    let waited = tokio::time::timeout(OBSERVED_ADDRESS_WAIT, async {
-        loop {
-            tokio::select! {
-                _ = shutdown.cancelled() => return None,
-                changed = watch.changed() => {
-                    if changed.is_err() {
-                        return None;
-                    }
-                    if let Some(address) = *watch.borrow_and_update() {
-                        return Some(address);
-                    }
-                }
-            }
-        }
-    })
-    .await;
-    match waited {
-        Ok(Some(address)) => Some(address),
-        Ok(None) => None,
-        Err(_) => {
-            tracing::warn!(
-                "no observed address from the relay leg within {OBSERVED_ADDRESS_WAIT:?}; \
-                 streaming over the relay without a direct-path candidate",
-            );
-            None
-        }
     }
 }
 
@@ -534,6 +594,43 @@ async fn dial_video(
     }
 }
 
+/// Wait briefly for the relay leg's observed address.
+///
+/// `None` means carry on relay-only: a missing report costs a direct path, not
+/// the stream, and blocking on it would be the wrong trade.
+async fn wait_for_observed(
+    mut watch: ObservedAddressWatch,
+    shutdown: &CancellationToken,
+) -> Option<ObservedAddress> {
+    if let Some(address) = *watch.borrow_and_update() {
+        return Some(address);
+    }
+    let waited = tokio::time::timeout(OBSERVED_ADDRESS_WAIT, async {
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => return None,
+                changed = watch.changed() => {
+                    changed.ok()?;
+                    if let Some(address) = *watch.borrow_and_update() {
+                        return Some(address);
+                    }
+                }
+            }
+        }
+    })
+    .await;
+    match waited {
+        Ok(address) => address,
+        Err(_) => {
+            tracing::warn!(
+                "no observed address from the relay leg within {OBSERVED_ADDRESS_WAIT:?}; \
+                 streaming over the relay without a direct-path candidate",
+            );
+            None
+        }
+    }
+}
+
 /// Put a video connection on a shared, unconnected socket and offer the relay
 /// leg's address as a direct-path candidate. Must run before `start`.
 ///
@@ -546,6 +643,8 @@ async fn dial_video(
 /// yet — msquic opens the path from the relay leg's binding once the peer's
 /// ADD_ADDRESS arrives (`docs/p2p_mode_migration_plan.md` §2.2.3).
 fn prepare_for_migration(conn: &Connection, candidate: ObservedAddress) -> anyhow::Result<()> {
+    // All three are required for a direct path to be validated at all — without
+    // them msquic never raises `PathValidated`, whatever candidate is offered.
     conn.set_share_binding(true)
         .map_err(|e| anyhow::anyhow!("could not share the UDP binding: {e}"))?;
     conn.set_unconnected_socket(true)
