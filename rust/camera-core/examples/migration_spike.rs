@@ -1009,10 +1009,28 @@ fn client_config(reg: &Registration, enable_natt: bool) -> anyhow::Result<msquic
     let alpn = [msquic::BufferRef::from(ALPN)];
     let settings = msquic::Settings::new()
         .set_IdleTimeoutMs(30_000)
-        .set_DestCidUpdateIdleTimeoutMs(0)
         .set_PeerUnidiStreamCount(100)
         .set_StreamMultiReceiveEnabled()
         .set_ReceiveObservedAddressReports();
+    // Two settings differ between this spike (which migrates everywhere) and
+    // camera-core's `video_client_config` (which does not, in the field). Knobs
+    // rather than a guess, so each can be ruled in or out on its own.
+    //
+    // SPIKE_MAX_MTU: the real config pins MaximumMtu to 1200 to fit inside the
+    // relay tunnel. msquic's default MinimumMtu is 1248, so that leaves the
+    // range inverted — and a freshly opened path has to size itself.
+    let settings = match std::env::var("SPIKE_MAX_MTU").ok().and_then(|v| v.parse().ok()) {
+        Some(mtu) => settings.set_MaximumMtu(mtu),
+        None => settings,
+    };
+    // SPIKE_PIN_DCID=0 drops it. Every other client config in this repo sets it,
+    // including Direct mode's; `video_client_config` is the one that does not.
+    // Migrating to a new path needs a spare destination connection ID.
+    let settings = if std::env::var("SPIKE_PIN_DCID").as_deref() == Ok("0") {
+        settings
+    } else {
+        settings.set_DestCidUpdateIdleTimeoutMs(0)
+    };
     let settings = if enable_natt {
         settings.set_AddAddressMode(msquic::AddAddressMode::NatTraversal)
     } else {
