@@ -73,6 +73,24 @@ jobs:
         run: cargo run -q -p camera-core --example migration_spike | tee "$RUNNER_TEMP/spike-report.md"
         shell: bash
 
+      # Two processes, which is the one structural difference left between the
+      # single-process checks above and the camera apps as they actually run.
+      - name: Run the two-process spike
+        run: |
+          set -euo pipefail
+          SRV="$RUNNER_TEMP/spike-server.log"
+          cargo run -q -p camera-core --example migration_spike -- server > "$SRV" 2>&1 &
+          for _ in $(seq 1 60); do
+            if grep -q 'waiting for the client' "$SRV"; then break; fi
+            sleep 1
+          done
+          cargo run -q -p camera-core --example migration_spike -- client \
+            | tee "$RUNNER_TEMP/spike-two-process.log"
+          echo '--- server ---'
+          cat "$SRV" || true
+          grep -q '^PASS' "$RUNNER_TEMP/spike-two-process.log"
+        shell: bash
+
       # The example prints its report as a Markdown table, so it renders as-is.
       - name: Publish the report to the job summary
         if: always()
