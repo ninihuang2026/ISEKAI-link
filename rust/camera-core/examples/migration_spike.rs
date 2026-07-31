@@ -641,11 +641,18 @@ async fn check_direct_path_migration(
         Ok(Ok(direct)) => {
             conn.activate_path(direct.0, direct.1)
                 .context("activate_path onto the validated direct path")?;
-            // Application data must keep flowing across the switch.
+            // Application data must keep flowing across the switch — a small
+            // frame first, then a video-sized one. A migrated path that carries
+            // the former but not the latter is exactly the failure reported
+            // from a Windows field test.
             round_trip(&accepted, &conn).await?;
+            let big = round_trip_sized(&accepted, &conn, VIDEO_SIZED_PAYLOAD)
+                .await
+                .context("the migrated path did not carry a video-sized frame")?;
             let now = (conn.get_local_addr()?, conn.get_remote_addr()?);
             format!(
-                "直接経路 {} -> {} が検証され、activate_path 後も往復成立 (現在の経路 {} -> {})",
+                "直接経路 {} -> {} が検証され、activate_path 後も往復成立 \
+                 (小フレーム + {big} バイト; 現在の経路 {} -> {})",
                 direct.0, direct.1, now.0, now.1
             )
         }
@@ -938,14 +945,28 @@ impl Bridge {
     }
 }
 
+/// A camera JPEG at 640x480/q80 is tens of kilobytes, so a payload that fits in
+/// one QUIC packet proves nothing about a path that has to carry video. Checks
+/// that matter push this much instead.
+const VIDEO_SIZED_PAYLOAD: usize = 30_000;
+
 /// Push one unidirectional stream server -> client and read it back, proving
 /// the path carries application data. Returns the byte count.
 async fn round_trip(server: &Connection, client: &Connection) -> anyhow::Result<usize> {
-    const PAYLOAD: &[u8] = b"isekai-spike-frame";
+    round_trip_sized(server, client, b"isekai-spike-frame".len()).await
+}
+
+/// [`round_trip`] with an explicit payload size.
+async fn round_trip_sized(
+    server: &Connection,
+    client: &Connection,
+    size: usize,
+) -> anyhow::Result<usize> {
+    let payload: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
     let mut out = server
         .open_outbound_stream(StreamType::Unidirectional, false)
         .await?;
-    out.write_all(PAYLOAD).await?;
+    out.write_all(&payload).await?;
     poll_fn(|cx| out.poll_finish_write(cx)).await?;
 
     let mut inbound = tokio::time::timeout(
@@ -953,10 +974,14 @@ async fn round_trip(server: &Connection, client: &Connection) -> anyhow::Result<
         client.accept_inbound_uni_stream(),
     )
     .await
-    .context("no inbound stream arrived on the active path")??;
+    .with_context(|| format!("no inbound stream of {size} bytes arrived on the active path"))??;
     let mut got = Vec::new();
     inbound.read_to_end(&mut got).await?;
-    anyhow::ensure!(got == PAYLOAD, "payload mismatch across the path");
+    anyhow::ensure!(
+        got == payload,
+        "payload mismatch across the path ({} of {size} bytes)",
+        got.len()
+    );
     Ok(got.len())
 }
 
