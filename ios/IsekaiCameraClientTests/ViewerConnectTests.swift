@@ -42,7 +42,12 @@ final class ViewerConnectTests: XCTestCase {
             register: true,
             // Follow whatever the peer is talking to: a local stack needs this,
             // the live deployment must not have it.
-            insecureSkipVerify: peer["insecure"] == "1"
+            insecureSkipVerify: peer["insecure"] == "1",
+            // Both peers run on the CI host, so a direct path is between
+            // loopback-adjacent addresses and proves nothing the relay does
+            // not. Keep the test on the relay it is there to exercise.
+            enableMigration: false,
+            logFilter: ""
         )
 
         let sink = RecordingSink()
@@ -81,6 +86,13 @@ private final class RecordingSink: FrameSink {
     private var magic: [UInt8] = []
     private var state = "none"
     private var seenFrame = false
+    private var paths: PathStatus?
+
+    var lastPaths: PathStatus? {
+        lock.lock()
+        defer { lock.unlock() }
+        return paths
+    }
 
     var firstFrameMagic: [UInt8] {
         lock.lock()
@@ -111,4 +123,16 @@ private final class RecordingSink: FrameSink {
         self.state = detail.isEmpty ? "\(state)" : "\(state) (\(detail))"
         lock.unlock()
     }
+
+    /// Both peers are the same host here, so whether a direct path shows up is
+    /// not something this test asserts on — it only has to accept the callback.
+    func onPath(status: PathStatus) {
+        lock.lock()
+        paths = status
+        lock.unlock()
+    }
+
+    func onRtt(rttMs: Double) {}
+
+    func onLog(line: String) {}
 }

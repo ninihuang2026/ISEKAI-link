@@ -20,9 +20,15 @@ path = "src/bin/uniffi-bindgen.rs"
 anyhow = { workspace = true }
 bytes = { workspace = true }
 camera-core = { workspace = true }
+# Only for the `Registration` type in the session struct; it is opened through
+# `camera_core::new_registration`.
+msquic-async = { workspace = true }
 isekai-p2p-core = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
+# Routes the core's tracing output to the Swift sink. A phone has no console to
+# read RUST_LOG on, so without this the client is unobservable in the field.
+tracing-subscriber = { workspace = true }
 uniffi = { version = "0.28", features = ["cli"] }

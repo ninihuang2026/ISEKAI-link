@@ -16,6 +16,7 @@ struct ContentView: View {
                 authSection
                 manualTokenSection
                 developmentSection
+                logSection
             }
             .navigationTitle("ISEKAI Viewer")
         }
@@ -41,6 +42,25 @@ struct ContentView: View {
             .listRowInsets(EdgeInsets())
 
             LabeledContent("Frames", value: "\(model.frameCount)")
+            if let rtt = model.rttMs {
+                LabeledContent("RTT", value: String(format: "%.0f ms", rtt))
+            }
+            if let paths = model.paths {
+                PathRow(
+                    label: "Isekai Link",
+                    path: paths.relay,
+                    active: paths.onRelay
+                )
+                PathRow(
+                    label: "Direct",
+                    path: paths.direct,
+                    active: !paths.onRelay
+                )
+                Button(paths.onRelay ? "Switch to direct path" : "Switch to Isekai Link") {
+                    model.migrate()
+                }
+                .disabled(!paths.canMigrate)
+            }
         }
     }
 
@@ -162,10 +182,36 @@ struct ContentView: View {
     private var developmentSection: some View {
         Section {
             Toggle("Skip TLS verification", isOn: $model.settings.insecureSkipVerify)
+            Toggle("Direct path", isOn: $model.settings.enableMigration)
+                .disabled(model.isConnected)
+            TextField("Log filter", text: $model.settings.logFilter)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .font(.caption.monospaced())
         } header: {
             Text("Development")
         } footer: {
-            Text("Accepts self-signed proxy and Identity certificates. Never enable this against a real deployment.")
+            Text("Skip TLS verification accepts self-signed proxy and Identity certificates; never enable it against a real deployment. Turning off Direct path makes the session relay-only. The log filter takes RUST_LOG syntax — camera_core=debug,isekai_p2p_core=debug,channel_masque=debug covers the whole relay path; leave it empty for no logging. It applies from the next connect.")
+        }
+    }
+
+    @ViewBuilder
+    private var logSection: some View {
+        if !model.logLines.isEmpty {
+            Section {
+                ScrollView {
+                    Text(model.logText)
+                        .font(.caption2.monospaced())
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
+                }
+                .frame(maxHeight: 220)
+                ShareLink(item: model.logText) {
+                    Label("Share log", systemImage: "square.and.arrow.up")
+                }
+            } header: {
+                Text("Log")
+            }
         }
     }
 }
@@ -223,6 +269,27 @@ private struct LabeledField: View {
                 .keyboardType(keyboard)
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
+        }
+    }
+}
+
+/// One route the video can take, marked when it is the one in use.
+private struct PathRow: View {
+    let label: String
+    let path: PathInfo?
+    let active: Bool
+
+    var body: some View {
+        LabeledContent(active ? "▶ \(label)" : label) {
+            if let path {
+                Text("\(path.local) → \(path.remote)")
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("not available")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 }

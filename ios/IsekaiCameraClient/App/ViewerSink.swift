@@ -36,6 +36,24 @@ final class ViewerSink: FrameSink {
         }
     }
 
+    func onPath(status: PathStatus) {
+        Task { @MainActor [weak model] in
+            model?.apply(paths: status)
+        }
+    }
+
+    func onRtt(rttMs: Double) {
+        Task { @MainActor [weak model] in
+            model?.apply(rtt: rttMs)
+        }
+    }
+
+    func onLog(line: String) {
+        Task { @MainActor [weak model] in
+            model?.append(log: line)
+        }
+    }
+
     private func drain() {
         while true {
             lock.lock()

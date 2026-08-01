@@ -23,14 +23,28 @@ use crate::tls::dev_cert;
 /// ALPN for the camera video protocol.
 pub const VIDEO_ALPN: &str = "sample";
 
-/// How long to keep retrying the video handshake before giving up. This spans
-/// the gap between the initiator opening its relay leg and the peer binding
-/// *its* leg (e.g. a human pressing "bind relay" on the camera server).
-const VIDEO_CONNECT_DEADLINE: Duration = Duration::from_secs(120);
+/// How long to keep retrying the video handshake before giving up.
+///
+/// This spans an entirely manual gap: the initiator opens its relay leg, and the
+/// peer can only bind *its* leg once a human has carried the connection id
+/// across — reading it off a phone, typing it into the camera server, starting
+/// the camera, pressing bind. Two minutes looked generous and was not: every
+/// field failure we chased for a day ended at exactly this deadline, with the
+/// relay leg still healthy and the operator still typing.
+///
+/// So it is set to a span no operator will lose a race against. Waiting costs
+/// nothing here — the connection retransmits an Initial every few seconds — and
+/// the caller can stop it at any time by cancelling `shutdown`, which is what
+/// the disconnect button does.
+const VIDEO_CONNECT_DEADLINE: Duration = Duration::from_secs(900);
 /// Delay between video handshake attempts.
 const VIDEO_CONNECT_RETRY_DELAY: Duration = Duration::from_millis(500);
 /// How often to sample the connection's RTT for [`VideoRecvOptions::rtt`].
 const RTT_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+/// How often to report what the handshake is doing while it is still unanswered.
+const HANDSHAKE_PROBE_INTERVAL: Duration = Duration::from_secs(1);
+/// How often the heartbeat ticks. See [`spawn_heartbeat`].
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 /// How long to wait for the relay leg's observed address before dialing without
 /// it. The report normally lands within a round trip of the leg coming up; if it
 /// does not, streaming over the relay matters more than a direct path.
@@ -400,6 +414,12 @@ pub async fn receive_frames_with(
         rtt,
     } = opts;
 
+    // Runs for as long as this receive does, and ends with it: the guard cancels
+    // the child token on every exit path, including the `?`s below.
+    let heartbeat = shutdown.child_token();
+    let _heartbeat = heartbeat.clone().drop_guard();
+    spawn_heartbeat(heartbeat);
+
     // Resolve the candidate before dialing: `add_candidate_addr` has to be in
     // place before `start`, and a handshake here can take a minute (it rides
     // across the peer's relay-bind gap), so there is no useful "add it later".
@@ -561,6 +581,35 @@ fn log_connection_stats(conn: &Connection, stats: &msquic::ffi::QUIC_STATISTICS,
     );
 }
 
+/// Tick once a second, touching nothing but the clock.
+///
+/// Every other sampler here calls `get_stats`, which msquic serves by queueing
+/// an operation to the connection's worker and blocking until the worker runs
+/// it. So when those samplers go quiet, a wedged msquic worker and a stalled
+/// runtime look exactly the same from the log, and they are not the same bug.
+/// This task has no such dependency, and `tokio::time::interval` bursts its
+/// missed ticks on the way out, so the gap it leaves also measures itself:
+///
+/// - ticks continue while the samplers stop → the runtime is fine, the block is
+///   inside msquic
+/// - ticks stop too, then burst → the runtime itself was not scheduling this
+///   task, so the block is upstream of msquic
+fn spawn_heartbeat(shutdown: CancellationToken) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
+        let mut ticks = 0u64;
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                _ = interval.tick() => {
+                    ticks += 1;
+                    tracing::debug!(ticks, "heartbeat");
+                }
+            }
+        }
+    });
+}
+
 async fn report_path(events: &Option<mpsc::Sender<PathEvent>>, event: PathEvent) {
     tracing::info!("video path: {event:?}");
     if let Some(events) = events {
@@ -587,6 +636,18 @@ async fn report_path(events: &Option<mpsc::Sender<PathEvent>>, event: PathEvent)
 /// soon as the far leg comes up. The retry loop below is therefore a
 /// last-resort fallback for a genuinely failed handshake, not the mechanism
 /// that bridges the gap.
+///
+/// `host` is a *name*, never an address to look up. Every caller dials the relay
+/// bridge on loopback, and the name is the per-endpoint FQDN the listener's relay
+/// certificate is issued for — it exists so the certificate can be validated, and
+/// its only DNS record points back at `127.0.0.1`. Pinning the remote address
+/// below says that outright, and keeps msquic from resolving the name: msquic
+/// resolves with a blocking `getaddrinfo` on the connection's worker thread, and
+/// that worker also drives the relay leg, so a slow resolver takes the leg down
+/// with it. A loopback-only name is exactly what mobile resolvers are slowest
+/// about — DNS64 will not synthesise an AAAA for `127.0.0.0/8`, and resolvers
+/// with rebinding protection refuse to return it at all — which is why this
+/// showed up on iOS long before it would have anywhere else.
 async fn dial_video(
     reg: &Registration,
     config: &msquic::Configuration,
@@ -600,30 +661,70 @@ async fn dial_video(
     loop {
         attempt += 1;
         let conn = Connection::new(reg)?;
-        // Every attempt builds a fresh connection, so the migration setup has
-        // to be redone on each one.
+        // Every attempt builds a fresh connection, so the setup below has to be
+        // redone on each one.
+        conn.set_remote_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
+            .map_err(|e| anyhow::anyhow!("could not pin the relay bridge address: {e}"))?;
         if let Some(candidate) = candidate {
             prepare_for_migration(&conn, candidate)?;
         }
-        let result = tokio::select! {
-            _ = shutdown.cancelled() => anyhow::bail!("shut down while dialing video"),
-            r = conn.start(config, host, port) => r,
+        // The handshake can stay unanswered for a long time by design, and until
+        // it is answered there is nothing else to go on. Report what it is doing
+        // while it waits: whether our packets are still leaving tells a peer
+        // that has not bound its leg apart from a path that has stopped
+        // carrying anything, and those want opposite fixes.
+        let start = conn.start(config, host, port);
+        tokio::pin!(start);
+        let mut probe = tokio::time::interval(HANDSHAKE_PROBE_INTERVAL);
+        probe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Carried out of the loop because the failure below has to describe a
+        // connection it has already had to drop.
+        let mut last: Option<(u64, u64)> = None;
+        let result = loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => anyhow::bail!("shut down while dialing video"),
+                r = &mut start => break r,
+                _ = probe.tick() => match conn.get_stats() {
+                    Ok(stats) => {
+                        last = Some((stats.Send.TotalPackets, stats.Recv.TotalPackets));
+                        log_connection_stats(&conn, &stats, "handshake");
+                    }
+                    Err(e) => tracing::debug!("could not read handshake stats: {e}"),
+                },
+            }
         };
         match result {
             Ok(()) => return Ok(conn),
             Err(e) => {
+                let observed = conn
+                    .get_stats()
+                    .ok()
+                    .map(|s| (s.Send.TotalPackets, s.Recv.TotalPackets))
+                    .or(last);
                 drop(conn);
                 if Instant::now() >= deadline {
+                    // Say what was seen, not what it might mean. The old wording
+                    // asserted the peer had not bound its leg, and a day went
+                    // into chasing that assertion while it was wrong; the packet
+                    // counts distinguish the cases without guessing. Nothing
+                    // received at all is the peer never answering — a leg not
+                    // bridged yet, or an operator who has not finished carrying
+                    // the connection id across.
+                    let seen = match observed {
+                        Some((sent, received)) => {
+                            format!("{sent} packets sent, {received} received")
+                        }
+                        None => "no packet counts available".to_owned(),
+                    };
                     return Err(anyhow::Error::new(e).context(format!(
                         "video QUIC handshake to {host}:{port} did not complete within \
-                         {VIDEO_CONNECT_DEADLINE:?} ({attempt} attempts); the peer may not have \
-                         bound its relay leg"
+                         {VIDEO_CONNECT_DEADLINE:?} ({attempt} attempts, {seen})"
                     )));
                 }
-                tracing::debug!(
-                    "video handshake attempt {attempt} failed ({e}); retrying — the peer relay \
-                     leg may not be up yet"
-                );
+                // Debug, not Display: the transport status is what names the
+                // cause — an untrusted certificate and an unanswered handshake
+                // both read as "connection lost" otherwise.
+                tracing::debug!("video handshake attempt {attempt} failed: {e:?}");
                 tokio::select! {
                     _ = shutdown.cancelled() => anyhow::bail!("shut down while dialing video"),
                     _ = sleep(VIDEO_CONNECT_RETRY_DELAY) => {}
@@ -758,7 +859,19 @@ fn video_client_config(
     };
     let config = reg.open_configuration(&alpn, Some(&settings))?;
     let mut cred = msquic::CredentialConfig::new_client();
-    if !verify {
+    // The same dev-only opt-in the proxy and Identity connections honour
+    // (`isekai_p2p_core::transport`), which this one ignored — so the one switch
+    // an operator has did not cover the one connection that carries the video.
+    // It is only an escape hatch: iOS validates this certificate fine, contrary
+    // to what an earlier version of this comment claimed. Never set in
+    // production.
+    let skip_verify = std::env::var_os("ISEKAI_INSECURE_SKIP_VERIFY").is_some();
+    if verify && skip_verify {
+        tracing::warn!(
+            "ISEKAI_INSECURE_SKIP_VERIFY set: skipping video TLS certificate validation"
+        );
+    }
+    if !verify || skip_verify {
         cred = cred.set_credential_flags(msquic::CredentialFlags::NO_CERTIFICATE_VALIDATION);
     }
     config.load_credential(&cred)?;

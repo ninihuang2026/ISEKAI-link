@@ -11,10 +11,14 @@
 //! side; this crate is deliberately headless. See
 //! `docs/ios_camera_client_plan.md`.
 
-use std::sync::Arc;
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
-use camera_core::{receive_frames, InitiatorSession, P2pConfig};
+use camera_core::{
+    new_registration, receive_frames_with, InitiatorSession, P2pConfig, PathEvent, RelayOptions,
+    VideoRecvOptions,
+};
 use isekai_p2p_core::endpoint::EndpointKey;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
@@ -63,6 +67,97 @@ pub struct ClientConfig {
     /// **Dev only** — accept self-signed proxy/Identity certificates. Never true
     /// in production; leave the proxy's real certificate validation on.
     pub insecure_skip_verify: bool,
+    /// Offer a direct path and allow migrating off the relay.
+    ///
+    /// Turning this off makes the session relay-only: the leg goes on an
+    /// ordinary connected socket, no candidate is offered, and
+    /// [`ViewerSession::migrate`] has nothing to do. Useful when a network
+    /// cannot support a direct path, and as a way to tell a migration problem
+    /// apart from a relay one.
+    pub enable_migration: bool,
+    /// Log filter for the Rust core, in `RUST_LOG` syntax — e.g.
+    /// `camera_core=debug,isekai_p2p_core=debug`. Empty disables logging.
+    ///
+    /// Records go to [`FrameSink::on_log`]. A phone has no console to read
+    /// `RUST_LOG` on, so this is the only way to see what the core is doing.
+    pub log_filter: String,
+}
+
+/// One end-to-end route the video can take.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct PathInfo {
+    pub local: String,
+    pub remote: String,
+}
+
+impl PathInfo {
+    fn new(local: SocketAddr, remote: SocketAddr) -> Self {
+        Self {
+            local: local.to_string(),
+            remote: remote.to_string(),
+        }
+    }
+}
+
+/// Which route the video is on, and which one it could move to.
+///
+/// `direct` stays `None` where no direct path can be established — a symmetric
+/// NAT, say. That is not a failure: the stream runs over the relay and
+/// [`ViewerSession::migrate`] simply has nothing to switch to.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct PathStatus {
+    /// Over the Isekai Link relay. Present from the moment video starts.
+    pub relay: Option<PathInfo>,
+    /// Straight to the peer, once one has been validated.
+    pub direct: Option<PathInfo>,
+    /// Whether the traffic is on the relay right now.
+    pub on_relay: bool,
+    /// Whether [`ViewerSession::migrate`] would do anything.
+    pub can_migrate: bool,
+}
+
+/// The paths a session knows about, kept in step with what the connection
+/// reports rather than with what was last asked for — so a switch that fails
+/// does not leave the UI claiming a route the traffic is not on.
+#[derive(Default)]
+struct Paths {
+    relay: Option<(SocketAddr, SocketAddr)>,
+    direct: Option<(SocketAddr, SocketAddr)>,
+    on_relay: bool,
+}
+
+impl Paths {
+    fn apply(&mut self, event: PathEvent) {
+        match event {
+            PathEvent::Relay { local, remote } => {
+                self.relay = Some((local, remote));
+                self.on_relay = true;
+            }
+            PathEvent::DirectValidated { local, remote } => self.direct = Some((local, remote)),
+            PathEvent::Activated { local, remote } => {
+                self.on_relay = Some((local, remote)) == self.relay
+            }
+        }
+    }
+
+    fn status(&self) -> PathStatus {
+        PathStatus {
+            relay: self.relay.map(|(l, r)| PathInfo::new(l, r)),
+            direct: self.direct.map(|(l, r)| PathInfo::new(l, r)),
+            on_relay: self.on_relay,
+            can_migrate: self.relay.is_some() && self.direct.is_some(),
+        }
+    }
+
+    /// Where a migrate request should go: away from the relay if on it, back to
+    /// it otherwise.
+    fn migration_target(&self) -> Option<(SocketAddr, SocketAddr)> {
+        if self.on_relay {
+            self.direct
+        } else {
+            self.relay
+        }
+    }
 }
 
 /// Swift-implemented callback that receives frames and state changes.
@@ -75,6 +170,15 @@ pub trait FrameSink: Send + Sync {
     fn on_frame(&self, jpeg: Vec<u8>, seq: u64);
     /// A connection-state transition, with an optional human-readable detail.
     fn on_state(&self, state: ConnectionState, detail: String);
+    /// The set of paths changed: one appeared, or the traffic moved.
+    fn on_path(&self, status: PathStatus);
+    /// A round-trip time sample, in milliseconds, about once a second.
+    fn on_rtt(&self, rtt_ms: f64);
+    /// One formatted log line from the Rust core.
+    ///
+    /// Only called when [`ClientConfig::log_filter`] is non-empty. Arrives on
+    /// core threads and can be frequent — buffer it, do not block.
+    fn on_log(&self, line: String);
 }
 
 /// A live viewer session. Hold it for the duration of viewing; drop or
@@ -87,6 +191,13 @@ pub struct ViewerSession {
     runtime: Runtime,
     shutdown: CancellationToken,
     connection_id: String,
+    paths: Arc<Mutex<Paths>>,
+    migrate: mpsc::Sender<(SocketAddr, SocketAddr)>,
+    // The video connection and the relay leg share this, and a direct path is
+    // opened from the leg's binding — msquic looks bindings up per
+    // registration, so they have to be the same one. Held, not read.
+    #[allow(dead_code)]
+    registration: Arc<msquic_async::Registration>,
 }
 
 #[uniffi::export]
@@ -97,15 +208,127 @@ impl ViewerSession {
         self.connection_id.clone()
     }
 
+    /// The paths this session knows about right now.
+    pub fn path_status(&self) -> PathStatus {
+        self.paths.lock().expect("path mutex poisoned").status()
+    }
+
+    /// Switch between the relay path and a validated direct path.
+    ///
+    /// Returns whether a switch was requested — `false` when there is nothing to
+    /// switch to, which is the normal state until a direct path is validated and
+    /// the permanent state where none can be.
+    ///
+    /// The request is asynchronous: the switch has taken effect when
+    /// [`FrameSink::on_path`] reports it, not when this returns. If the new path
+    /// turns out to carry nothing, the session falls back to the relay on its
+    /// own after a few seconds.
+    pub fn migrate(&self) -> bool {
+        let target = self
+            .paths
+            .lock()
+            .expect("path mutex poisoned")
+            .migration_target();
+        match target {
+            Some(path) => self.migrate.try_send(path).is_ok(),
+            None => false,
+        }
+    }
+
     /// Tear down the session (idempotent).
     pub fn disconnect(&self) {
         self.shutdown.cancel();
+        // Stop logging into a sink whose session is gone.
+        *LOG_SINK.lock().expect("log sink mutex poisoned") = None;
     }
 }
 
 impl Drop for ViewerSession {
     fn drop(&mut self) {
         self.shutdown.cancel();
+    }
+}
+
+/// The sink the tracing bridge currently writes to.
+///
+/// A global because `tracing`'s subscriber is process-wide and can only be
+/// installed once, while sinks come and go with sessions. Cleared on
+/// disconnect so a dead session stops receiving.
+static LOG_SINK: Mutex<Option<Arc<dyn FrameSink>>> = Mutex::new(None);
+/// Guards the one-time subscriber installation.
+static LOG_INIT: std::sync::Once = std::sync::Once::new();
+/// Applies a new filter to the installed subscriber.
+///
+/// A subscriber can only be installed once per process, but the filter is the
+/// setting being adjusted — narrowing it down is how a field problem gets found,
+/// and on a phone the only way to try another one is to reconnect. Without this
+/// every filter after the first would be silently ignored, which is worse than
+/// not offering the setting at all.
+#[allow(clippy::type_complexity)]
+static LOG_FILTER: Mutex<Option<Box<dyn Fn(&str) + Send>>> = Mutex::new(None);
+
+/// Writes formatted log lines to whichever sink is current.
+struct SinkWriter;
+
+impl std::io::Write for SinkWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if let Some(sink) = LOG_SINK.lock().expect("log sink mutex poisoned").clone() {
+            sink.on_log(String::from_utf8_lossy(buf).trim_end().to_owned());
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SinkWriter {
+    type Writer = SinkWriter;
+    fn make_writer(&'a self) -> Self::Writer {
+        SinkWriter
+    }
+}
+
+/// Point the core's logging at `sink`, installing the subscriber on first use.
+///
+/// The filter cannot be changed afterwards — `tracing` allows one global
+/// subscriber per process — so the first session's `log_filter` is the one that
+/// applies for the life of the app.
+fn install_logging(filter: &str, sink: &Arc<dyn FrameSink>) {
+    if filter.is_empty() {
+        return;
+    }
+    *LOG_SINK.lock().expect("log sink mutex poisoned") = Some(Arc::clone(sink));
+    LOG_INIT.call_once(|| {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        use tracing_subscriber::util::SubscriberInitExt as _;
+
+        let (layer, handle) =
+            tracing_subscriber::reload::Layer::new(tracing_subscriber::EnvFilter::new(filter));
+        let installed = tracing_subscriber::registry()
+            .with(layer)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(SinkWriter)
+                    .with_ansi(false),
+            )
+            .try_init();
+        match installed {
+            Ok(()) => {
+                *LOG_FILTER.lock().expect("log filter mutex poisoned") =
+                    Some(Box::new(move |filter: &str| {
+                        let _ = handle.reload(tracing_subscriber::EnvFilter::new(filter));
+                    }));
+            }
+            // Something else already installed one; logging simply goes there.
+            Err(e) => sink.on_log(format!("could not install the log bridge: {e}")),
+        }
+    });
+    // Runs on every connect, so a filter changed in the app takes effect on the
+    // next one rather than needing the app restarted.
+    if let Some(reload) = LOG_FILTER.lock().expect("log filter mutex poisoned").as_ref() {
+        reload(filter);
     }
 }
 
@@ -146,6 +369,7 @@ pub fn connect(
     sink: Box<dyn FrameSink>,
 ) -> Result<Arc<ViewerSession>, ClientError> {
     let sink: Arc<dyn FrameSink> = Arc::from(sink);
+    install_logging(&config.log_filter, &sink);
 
     // Dev-only self-signed acceptance is read from this env var by the transport
     // layer. Production leaves it unset so real certificates are validated.
@@ -161,6 +385,11 @@ pub fn connect(
         .enable_all()
         .build()
         .map_err(|e| ClientError::Runtime(e.to_string()))?;
+
+    // One registration for the relay leg and the video connection: the direct
+    // path is opened from the leg's binding, and msquic looks bindings up per
+    // registration.
+    let registration = new_registration().map_err(|e| ClientError::Runtime(format!("{e:#}")))?;
 
     let shutdown = CancellationToken::new();
 
@@ -184,13 +413,24 @@ pub fn connect(
 
     // Establish the control plane + initiator relay leg (fast); this returns
     // before video flows.
+    // The leg goes on a shared, unconnected socket so a direct path can be
+    // opened from its binding, and reports the address to offer as a candidate.
+    //
+    // `unconnected` and the candidate below are a pair: the candidate names this
+    // leg's binding, so without the shared, unconnected socket there is nothing
+    // for a direct path to be opened from. They are switched together.
+    let relay_options = RelayOptions {
+        unconnected: config.enable_migration,
+        registration: Some(Arc::clone(&registration)),
+    };
     let session = runtime
-        .block_on(InitiatorSession::connect(
+        .block_on(InitiatorSession::connect_with_options(
             &cfg,
             &config.capability,
             &config.listener_id,
             &[],
             local_bind,
+            relay_options,
         ))
         .map_err(|e| ClientError::Connect(format!("{e:#}")))?;
 
@@ -205,17 +445,59 @@ pub fn connect(
 
     sink.on_state(ConnectionState::Connected, connection_id.clone());
 
-    // Frame channel: `receive_frames` produces (seq, jpeg); we bridge to `sink`.
+    // Frame channel: the receiver produces (seq, jpeg); we bridge to `sink`.
     let (frame_tx, mut frame_rx) = mpsc::channel::<(u64, Bytes)>(16);
+    let (path_tx, mut path_rx) = mpsc::channel::<PathEvent>(16);
+    let (rtt_tx, mut rtt_rx) = mpsc::channel::<f64>(16);
+    let (migrate_tx, migrate_rx) = mpsc::channel::<(SocketAddr, SocketAddr)>(4);
+    let paths = Arc::new(Mutex::new(Paths::default()));
+    let observed = config.enable_migration.then(|| session.observed_address());
 
     // Receiver: dials the video QUIC over the relay and delivers frames.
     let recv_shutdown = shutdown.clone();
     let recv_sink = Arc::clone(&sink);
+    let recv_registration = Arc::clone(&registration);
     runtime.spawn(async move {
-        if let Err(e) =
-            receive_frames(None, &video_host, video_port, verify, frame_tx, recv_shutdown).await
+        if let Err(e) = receive_frames_with(
+            &video_host,
+            video_port,
+            frame_tx,
+            recv_shutdown,
+            VideoRecvOptions {
+                registration: Some(recv_registration),
+                verify,
+                observed,
+                path_events: Some(path_tx),
+                migrate: Some(migrate_rx),
+                rtt: Some(rtt_tx),
+            },
+        )
+        .await
         {
             recv_sink.on_state(ConnectionState::Failed, format!("{e:#}"));
+        }
+    });
+
+    // Paths: keep the session's view in step with what the connection reports,
+    // and tell Swift each time it changes.
+    let path_paths = Arc::clone(&paths);
+    let path_sink = Arc::clone(&sink);
+    runtime.spawn(async move {
+        while let Some(event) = path_rx.recv().await {
+            let status = {
+                let mut paths = path_paths.lock().expect("path mutex poisoned");
+                paths.apply(event);
+                paths.status()
+            };
+            path_sink.on_path(status);
+        }
+    });
+
+    // RTT samples, for whatever the app wants to show.
+    let rtt_sink = Arc::clone(&sink);
+    runtime.spawn(async move {
+        while let Some(rtt_ms) = rtt_rx.recv().await {
+            rtt_sink.on_rtt(rtt_ms);
         }
     });
 
@@ -245,5 +527,89 @@ pub fn connect(
         runtime,
         shutdown,
         connection_id,
+        paths,
+        migrate: migrate_tx,
+        registration,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn addr(port: u16) -> SocketAddr {
+        SocketAddr::from(([192, 168, 1, 10], port))
+    }
+
+    fn loopback(port: u16) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    /// Nothing to offer until both paths are known, so the button stays inert
+    /// rather than sending a request that cannot go anywhere.
+    #[test]
+    fn cannot_migrate_before_a_direct_path_exists() {
+        let mut paths = Paths::default();
+        assert!(!paths.status().can_migrate);
+
+        paths.apply(PathEvent::Relay {
+            local: loopback(1),
+            remote: loopback(2),
+        });
+        let status = paths.status();
+        assert!(status.on_relay);
+        assert!(!status.can_migrate, "only the relay is known");
+        assert_eq!(paths.migration_target(), None);
+    }
+
+    /// Once a direct path is validated, migrating means leaving the relay — and
+    /// once on it, migrating means going back.
+    #[test]
+    fn migration_target_flips_with_the_active_path() {
+        let mut paths = Paths::default();
+        paths.apply(PathEvent::Relay {
+            local: loopback(1),
+            remote: loopback(2),
+        });
+        paths.apply(PathEvent::DirectValidated {
+            local: addr(3),
+            remote: addr(4),
+        });
+        assert!(paths.status().can_migrate);
+        assert_eq!(paths.migration_target(), Some((addr(3), addr(4))));
+
+        paths.apply(PathEvent::Activated {
+            local: addr(3),
+            remote: addr(4),
+        });
+        assert!(!paths.status().on_relay);
+        assert_eq!(paths.migration_target(), Some((loopback(1), loopback(2))));
+    }
+
+    /// `on_relay` follows what was actually activated, not what was asked for,
+    /// so the automatic fallback to the relay is reflected without the app
+    /// having to ask.
+    #[test]
+    fn falling_back_to_the_relay_is_reported_as_such() {
+        let mut paths = Paths::default();
+        paths.apply(PathEvent::Relay {
+            local: loopback(1),
+            remote: loopback(2),
+        });
+        paths.apply(PathEvent::DirectValidated {
+            local: addr(3),
+            remote: addr(4),
+        });
+        paths.apply(PathEvent::Activated {
+            local: addr(3),
+            remote: addr(4),
+        });
+        assert!(!paths.status().on_relay);
+
+        paths.apply(PathEvent::Activated {
+            local: loopback(1),
+            remote: loopback(2),
+        });
+        assert!(paths.status().on_relay, "the fallback put us back on the relay");
+    }
 }
