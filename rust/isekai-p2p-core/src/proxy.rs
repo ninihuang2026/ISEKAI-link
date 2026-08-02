@@ -138,14 +138,145 @@ pub struct CertBundle {
     pub pkcs12: String,
 }
 
+/// A standing authorization for one Endpoint to reach one listener (spec §8.8).
+///
+/// Where a [`Capability`] is a one-shot token the owner has to carry to the
+/// initiator, a grant is a record the owner keeps: it authorizes the same
+/// Endpoint repeatedly and is revoked by deleting it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Grant {
+    pub grant_id: String,
+    pub listener_id: String,
+    pub owner_endpoint: String,
+    pub allowed_endpoint: String,
+    pub protocol: String,
+    /// `manual`, `pairing` or `owner_match` — how this grant came to exist.
+    pub origin: String,
+    #[serde(default)]
+    pub label: Option<String>,
+    pub created_at: String,
+    /// Absent means it stands until revoked.
+    #[serde(default)]
+    pub expires_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GrantList {
+    grants: Vec<Grant>,
+}
+
+/// A pairing code to display (spec §8.9.1). Returned once and not re-fetchable.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PairingCode {
+    /// Eight characters, shown as `XXXX-XXXX`.
+    pub code: String,
+    pub listener_id: String,
+    pub protocol: String,
+    pub expires_at: String,
+}
+
+/// A connection state to filter a listing by (spec §8.5.2).
+///
+/// Typed rather than a string because the proxy answers `400` to anything it
+/// does not recognise — a set fixed by the spec is better spelled out than
+/// spelled wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionStateFilter {
+    Relay,
+    HolePunching,
+    Direct,
+    Closed,
+    Failed,
+}
+
+impl ConnectionStateFilter {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Relay => "relay",
+            Self::HolePunching => "hole_punching",
+            Self::Direct => "direct",
+            Self::Closed => "closed",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// A listener this Endpoint can reach or enrol on (spec §8.10).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReachableListener {
+    pub listener_id: String,
+    pub protocol: String,
+    /// Whatever the owner put there — typically a display name.
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
+    pub expires_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ReachableListenerList {
+    listeners: Vec<ReachableListener>,
+}
+
+impl PeerConnection {
+    /// Who is on the other end, from `caller`'s point of view.
+    ///
+    /// Which field carries it depends on which call produced this: the connect
+    /// response names the peer directly, while the reads name both parties and
+    /// leave it to the reader to work out which one it is not. Asking here
+    /// keeps callers from having to know that.
+    pub fn other_party(&self, caller: &str) -> Option<&str> {
+        if let Some(peer) = self.peer_endpoint.as_deref() {
+            return Some(peer);
+        }
+        match (
+            self.initiator_endpoint.as_deref(),
+            self.target_endpoint.as_deref(),
+        ) {
+            (Some(initiator), Some(target)) if initiator == caller => Some(target),
+            (Some(initiator), Some(_)) => Some(initiator),
+            (Some(initiator), None) => Some(initiator),
+            (None, other) => other,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ConnectionList {
+    connections: Vec<PeerConnection>,
+    /// Set when the proxy cut the list short (spec §8.5.3).
+    #[serde(default)]
+    truncated: bool,
+}
+
+/// What listing a listener's connections found.
+#[derive(Debug, Clone)]
+pub struct ListenerConnections {
+    pub connections: Vec<PeerConnection>,
+    /// The proxy had more than it would return. Whoever is waiting beyond the
+    /// cut is not in `connections`, so this must not be treated as "all of
+    /// them" (spec §8.5.3).
+    pub truncated: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerConnection {
     pub connection_id: String,
     pub state: String,
     pub listener_id: String,
     pub protocol: String,
+    /// The other party, as `POST /v1/peer/connect` names it. **Only that
+    /// response carries it** — the connection reads (`GET /v1/peer/connections/{id}`
+    /// and the listener's listing) name both parties explicitly instead, so
+    /// this is `None` there. Use [`Self::other_party`] rather than reaching for
+    /// it directly.
     #[serde(default)]
     pub peer_endpoint: Option<String>,
+    /// Present on the connection reads (spec §8.5.1, §8.5.3).
+    #[serde(default)]
+    pub initiator_endpoint: Option<String>,
+    /// Present on the connection reads (spec §8.5.1, §8.5.3).
+    #[serde(default)]
+    pub target_endpoint: Option<String>,
     #[serde(default)]
     pub relay: Option<RelayInfo>,
     #[serde(default)]
@@ -280,6 +411,162 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
             to_vec(&body),
         )
         .await
+    }
+
+
+    /// `POST /v1/peer-listeners/{id}/grants` (spec §8.8.1).
+    ///
+    /// `ttl` omitted means the grant stands until revoked, which is the usual
+    /// case — a dated grant is closer to a capability.
+    pub async fn create_grant(
+        &self,
+        listener_id: &str,
+        allowed_endpoint: &str,
+        protocol: &str,
+        ttl: Option<u64>,
+        label: Option<&str>,
+    ) -> Result<Grant, ProxyError> {
+        let body = serde_json::json!({
+            "allowed_endpoint": allowed_endpoint,
+            "protocol": protocol,
+            "ttl": ttl,
+            "label": label,
+        });
+        self.request_json(
+            "POST",
+            &format!("/v1/peer-listeners/{listener_id}/grants"),
+            to_vec(&body),
+        )
+        .await
+    }
+
+    /// `GET /v1/peer-listeners/{id}/grants` (spec §8.8.2).
+    pub async fn list_grants(&self, listener_id: &str) -> Result<Vec<Grant>, ProxyError> {
+        let list: GrantList = self
+            .request_json(
+                "GET",
+                &format!("/v1/peer-listeners/{listener_id}/grants"),
+                Vec::new(),
+            )
+            .await?;
+        Ok(list.grants)
+    }
+
+    /// `DELETE /v1/peer-listeners/{id}/grants/{grant_id}` (spec §8.8.3).
+    ///
+    /// Takes effect on the peer's next connect; anything already established
+    /// stays up.
+    pub async fn revoke_grant(
+        &self,
+        listener_id: &str,
+        grant_id: &str,
+    ) -> Result<(), ProxyError> {
+        self.request_empty(
+            "DELETE",
+            &format!("/v1/peer-listeners/{listener_id}/grants/{grant_id}"),
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// `POST /v1/peer-listeners/{id}/pairing-codes` (spec §8.9.1).
+    ///
+    /// Issuing one invalidates the listener's previous code — there is only
+    /// ever one, because the owner is showing it on one screen.
+    pub async fn create_pairing_code(
+        &self,
+        listener_id: &str,
+        ttl: Option<u64>,
+    ) -> Result<PairingCode, ProxyError> {
+        let body = serde_json::json!({ "ttl": ttl });
+        self.request_json(
+            "POST",
+            &format!("/v1/peer-listeners/{listener_id}/pairing-codes"),
+            to_vec(&body),
+        )
+        .await
+    }
+
+    /// `GET /v1/peer-listeners/{id}/connections` (spec §8.5.3).
+    ///
+    /// How a listener finds out someone is waiting for it. `state` filters to
+    /// one of the connection states; `Some("relay")` is what a listener that
+    /// wants to bind is looking for.
+    pub async fn list_listener_connections(
+        &self,
+        listener_id: &str,
+        state: Option<ConnectionStateFilter>,
+    ) -> Result<ListenerConnections, ProxyError> {
+        let path = match state {
+            Some(state) => format!(
+                "/v1/peer-listeners/{listener_id}/connections?state={}",
+                state.as_str()
+            ),
+            None => format!("/v1/peer-listeners/{listener_id}/connections"),
+        };
+        let list: ConnectionList = self.request_json("GET", &path, Vec::new()).await?;
+        Ok(ListenerConnections {
+            connections: list.connections,
+            truncated: list.truncated,
+        })
+    }
+
+    /// `POST /v1/peer/pair` with a code the owner displayed (spec §8.9.2).
+    pub async fn pair_with_code(
+        &self,
+        code: &str,
+        label: Option<&str>,
+    ) -> Result<Grant, ProxyError> {
+        let body = serde_json::json!({ "code": code, "label": label });
+        self.request_json("POST", "/v1/peer/pair", to_vec(&body)).await
+    }
+
+    /// `POST /v1/peer/pair` on a listener of this Endpoint's own account
+    /// (spec §8.9.3). Only listeners the owner opened to self-enrolment accept
+    /// this, and they are the ones [`Self::list_enrollable_listeners`] returns.
+    pub async fn pair_with_listener(
+        &self,
+        listener_id: &str,
+        label: Option<&str>,
+    ) -> Result<Grant, ProxyError> {
+        let body = serde_json::json!({ "listener_id": listener_id, "label": label });
+        self.request_json("POST", "/v1/peer/pair", to_vec(&body)).await
+    }
+
+    /// `GET /v1/peer/listeners` — what this Endpoint may connect to now.
+    pub async fn list_reachable_listeners(&self) -> Result<Vec<ReachableListener>, ProxyError> {
+        let list: ReachableListenerList = self
+            .request_json("GET", "/v1/peer/listeners", Vec::new())
+            .await?;
+        Ok(list.listeners)
+    }
+
+    /// `GET /v1/peer/listeners?scope=owned` — what it may *enrol on*.
+    ///
+    /// Being in this list is not permission to connect: pairing with one
+    /// produces the grant that is (spec §8.10).
+    pub async fn list_enrollable_listeners(&self) -> Result<Vec<ReachableListener>, ProxyError> {
+        let list: ReachableListenerList = self
+            .request_json("GET", "/v1/peer/listeners?scope=owned", Vec::new())
+            .await?;
+        Ok(list.listeners)
+    }
+
+    /// `POST /v1/peer/connect` authorized by a grant rather than a capability
+    /// (spec §8.4). Nothing has to be carried to the initiator for this.
+    pub async fn peer_connect_with_grant(
+        &self,
+        listener_id: &str,
+        protocol: &str,
+        candidates: &[Candidate],
+    ) -> Result<PeerConnection, ProxyError> {
+        let body = serde_json::json!({
+            "listener_id": listener_id,
+            "protocol": protocol,
+            "candidates": candidates,
+        });
+        self.request_json("POST", "/v1/peer/connect", to_vec(&body))
+            .await
     }
 
     /// `GET /v1/peer/certificate` — download this Endpoint's per-endpoint relay
