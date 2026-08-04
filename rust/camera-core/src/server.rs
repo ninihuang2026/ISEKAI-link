@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use isekai_p2p::agent::ListenerEvent;
 use isekai_p2p::agent::{Grant, ObservedAddressWatch, PairingCode, RelayOptions};
 use isekai_p2p::{
     fetch_relay_certificate, issue_endpoint_token, AcceptPolicy, ListenerSession, P2pConfig,
@@ -211,6 +212,31 @@ const SIGNALING_POLL_INTERVAL: Duration = Duration::from_secs(3);
 /// to the video going the other way.
 const CONNECTION_RENEW_INTERVAL: Duration = Duration::from_secs(60);
 
+/// How often the listener reads its connections while an event stream is up.
+///
+/// The stream says when to look, so this is not how a peer is noticed any more
+/// — it is the backstop for the case where the stream is healthy and wrong,
+/// which is the case its own design cannot rule out (spec §8.11: nothing is
+/// replayed). Far apart, because being wrong for a minute is the cost and
+/// asking every three seconds was the thing worth removing.
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How long to wait before opening the stream again after it ends.
+///
+/// Ending is ordinary — the proxy restarting, a connection dropping, a
+/// subscriber cut off for falling behind — and the listener keeps working from
+/// the poll while it is away, so this only has to be short enough not to
+/// matter.
+const RESUBSCRIBE_DELAY: Duration = Duration::from_secs(3);
+
+/// The longest gap between attempts once they keep failing.
+///
+/// A proxy that does not serve this route refuses every time, and retrying it
+/// every few seconds would double this camera's request rate forever and burn a
+/// nonce on the proxy for each attempt — the store those go in is capped. So
+/// the gap grows until it reaches this, and drops back the moment one succeeds.
+const RESUBSCRIBE_MAX_DELAY: Duration = Duration::from_secs(300);
+
 async fn command_loop(
     mut session: ListenerSession,
     mut cmd_rx: mpsc::Receiver<ServerCommand>,
@@ -219,13 +245,74 @@ async fn command_loop(
     shutdown: CancellationToken,
 ) {
     let mut signaling = SignalingState::default();
+    // Two rates for the same read. While a stream is up it is a backstop and
+    // runs a minute apart; without one it is how a waiting peer is noticed at
+    // all, and runs every few seconds. Which one applies is decided by whether
+    // `stream` holds anything.
     let mut poll = tokio::time::interval(SIGNALING_POLL_INTERVAL);
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut renew = tokio::time::interval(CONNECTION_RENEW_INTERVAL);
     renew.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Opened below rather than here, so a proxy that cannot stream costs a
+    // refused request rather than a failed startup.
+    let mut stream: Option<mpsc::Receiver<ListenerEvent>> = None;
+    let mut resubscribe_delay = RESUBSCRIBE_DELAY;
+    let mut resubscribe_at = tokio::time::Instant::now();
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
+            // Open, or re-open, the event stream. Nothing else waits on this:
+            // the poll keeps the listener working while there is no stream, so
+            // failing here is a slower camera and not a stopped one.
+            _ = tokio::time::sleep_until(resubscribe_at),
+                    if stream.is_none() && policy != AcceptPolicy::Manual => {
+                match session.subscribe().await {
+                    Ok(events) => {
+                        tracing::info!("signaling: event stream open");
+                        stream = Some(events);
+                        resubscribe_delay = RESUBSCRIBE_DELAY;
+                        // Rebuilding the interval is what makes the next line
+                        // matter: `interval` completes its first tick at once,
+                        // so a reconcile runs now and picks up anything that
+                        // happened before the stream was listening. Anyone
+                        // changing this to `interval_at(now + period, ..)`
+                        // opens a gap of one whole period right here.
+                        poll = tokio::time::interval(RECONCILE_INTERVAL);
+                        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            "no event stream, polling instead (retrying in {resubscribe_delay:?}): {e:#}"
+                        );
+                        resubscribe_delay = (resubscribe_delay * 2).min(RESUBSCRIBE_MAX_DELAY);
+                        resubscribe_at = tokio::time::Instant::now() + resubscribe_delay;
+                    }
+                }
+            }
+            // An event says something changed; the listing says what. Keeping
+            // the decision in one place is what makes it safe for the stream to
+            // be best effort — a missed event costs latency until the next
+            // reconcile and never a wrong decision (spec §8.11).
+            event = async { stream.as_mut().expect("guarded").recv().await },
+                    if stream.is_some() => {
+                match event {
+                    Some(ListenerEvent::Keepalive) => {}
+                    Some(_) => poll.reset_immediately(),
+                    None => {
+                        tracing::info!("signaling: event stream ended; polling until it returns");
+                        stream = None;
+                        // A stream that worked and then ended is worth trying
+                        // again straight away — the usual reason is the proxy
+                        // restarting. Only repeated failures back off.
+                        resubscribe_at = tokio::time::Instant::now();
+                        // And, as above, the first tick of a fresh interval is
+                        // immediate: the listener goes back to reading rather
+                        // than waiting out a period it has no reason to.
+                        poll = tokio::time::interval(SIGNALING_POLL_INTERVAL);
+                        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    }
+                }
+            }
             // Renewing is not conditioned on the policy: a connection bound by
             // hand under `Manual` is being served just as much as one bound
             // automatically, and would otherwise lapse under the operator.
