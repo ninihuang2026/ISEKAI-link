@@ -70,6 +70,29 @@ pub fn make_msquic_async_client_config(
     Ok((registration, Arc::new(configuration)))
 }
 
+/// How long a path may go without sending before it gets a PING.
+///
+/// Matches the video client's `DIRECT_PATH_KEEPALIVE`, which documents why this
+/// is `PathKeepAliveIntervalMs` and not the connection keepalive next to it.
+const PATH_KEEP_ALIVE_INTERVAL_MS: u32 = 10_000;
+
+/// Listener settings that only some callers want.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ListenerOptions {
+    /// Offer the multipath transport parameter.
+    ///
+    /// Both ends have to offer it for it to be negotiated, and a peer that does
+    /// not simply gets the connection it always got — so this is safe to turn on
+    /// before the other side has it. What it buys is that a validated path
+    /// becomes an *additional* active path rather than somewhere to migrate to,
+    /// which is how a direct path stops decaying while it waits
+    /// (`docs/p2p_mode_migration_plan.md` risk #24).
+    ///
+    /// Off by default: the legacy direct mode already migrates the way it always
+    /// has, and this is not the change that fixes anything there.
+    pub multipath: bool,
+}
+
 pub fn make_msquic_async_listener(
     registration: Option<Arc<msquic_async::Registration>>,
     alpn: &str,
@@ -77,6 +100,26 @@ pub fn make_msquic_async_listener(
     cert_pem: &str,
     key_pem: &str,
     pkcs12: Option<&str>,
+) -> anyhow::Result<(Arc<msquic_async::Registration>, msquic_async::Listener)> {
+    make_msquic_async_listener_with(
+        registration,
+        alpn,
+        addr,
+        cert_pem,
+        key_pem,
+        pkcs12,
+        ListenerOptions::default(),
+    )
+}
+
+pub fn make_msquic_async_listener_with(
+    registration: Option<Arc<msquic_async::Registration>>,
+    alpn: &str,
+    addr: Option<SocketAddr>,
+    cert_pem: &str,
+    key_pem: &str,
+    pkcs12: Option<&str>,
+    options: ListenerOptions,
 ) -> anyhow::Result<(Arc<msquic_async::Registration>, msquic_async::Listener)> {
     let registration = if let Some(registration) = registration {
         registration
@@ -86,25 +129,36 @@ pub fn make_msquic_async_listener(
         )?)
     };
     let alpn = [msquic::BufferRef::from(alpn)];
-    let configuration = registration.open_configuration(
-        &alpn,
-        Some(
-            &&&msquic::Settings::new()
-                .set_IdleTimeoutMs(30_000)
-                // 1248 is msquic's floor (QUIC_DPLPMTUD_MIN_MTU); a smaller
-                // request is silently clamped up to it. Stated explicitly so
-                // the cap the listener applies is the one it appears to apply.
-                // Matches the video client (see `camera_core::video`), so the
-                // relay tunnel carries the same packet size in both directions.
-                .set_MaximumMtu(1248)
-                .set_KeepAliveIntervalMs(10_000)
-                .set_DestCidUpdateIdleTimeoutMs(0)
-                .set_PeerBidiStreamCount(100)
-                .set_PeerUnidiStreamCount(100)
-                .set_DatagramReceiveEnabled()
-                .set_StreamMultiReceiveEnabled(),
-        ),
-    )?;
+    let settings = msquic::Settings::new()
+        .set_IdleTimeoutMs(30_000)
+        // 1248 is msquic's floor (QUIC_DPLPMTUD_MIN_MTU); a smaller
+        // request is silently clamped up to it. Stated explicitly so
+        // the cap the listener applies is the one it appears to apply.
+        // Matches the video client (see `camera_core::video`), so the
+        // relay tunnel carries the same packet size in both directions.
+        .set_MaximumMtu(1248)
+        // Keeps the *connection* from going idle. It does not keep a path warm:
+        // it is re-armed by any activity anywhere on the connection, so on a
+        // connection that is carrying traffic it never fires at all. Keeping an
+        // idle path alive is `PathKeepAliveIntervalMs` below.
+        .set_KeepAliveIntervalMs(10_000)
+        .set_DestCidUpdateIdleTimeoutMs(0)
+        .set_PeerBidiStreamCount(100)
+        .set_PeerUnidiStreamCount(100)
+        .set_DatagramReceiveEnabled()
+        .set_StreamMultiReceiveEnabled();
+    let settings = if options.multipath {
+        settings
+            .set_MultipathEnabled()
+            // How long a path may go without sending before it gets a PING,
+            // counted per path and reset by nothing. Both ends have to set it —
+            // each connection's timer runs off its own settings, and the default
+            // is 0, which sends no PING at all.
+            .set_PathKeepAliveIntervalMs(PATH_KEEP_ALIVE_INTERVAL_MS)
+    } else {
+        settings
+    };
+    let configuration = registration.open_configuration(&alpn, Some(&settings))?;
 
     #[cfg(not(windows))]
     {
