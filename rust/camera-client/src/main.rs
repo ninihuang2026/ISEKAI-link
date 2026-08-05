@@ -74,7 +74,13 @@ async fn main() -> eframe::Result<()> {
     let res = eframe::run_native(
         "Camera Client App",
         options,
-        Box::new(|_cc| Ok(Box::new(MyApp::new(Arc::clone(&reg))))),
+        // Before the first frame: egui ships no CJK faces, so without this
+        // every Japanese character in the interface — the privacy policy above
+        // all — draws as a blank box.
+        Box::new(|cc| {
+            let japanese = camera_ui::install_japanese(&cc.egui_ctx);
+            Ok(Box::new(MyApp::new(Arc::clone(&reg), japanese)))
+        }),
     );
 
     // `run_native` has returned, so the app — and with it every connection it
@@ -233,10 +239,14 @@ struct MyApp {
     path_rx: Option<mpsc::Receiver<PathEvent>>,
     /// Requests the connection task migrate to the given (local, remote) path.
     migrate_tx: Option<mpsc::Sender<(SocketAddr, SocketAddr)>>,
+
+    /// The privacy policy, until it has been agreed to. Nothing else in the
+    /// window is reachable while it has not been.
+    consent: camera_ui::ConsentGate,
 }
 
 impl MyApp {
-    fn new(reg: Arc<msquic_async::Registration>) -> Self {
+    fn new(reg: Arc<msquic_async::Registration>, japanese: bool) -> Self {
         Self {
             reg,
             mode: Mode::Direct,
@@ -274,6 +284,7 @@ impl MyApp {
             p2p_path: None,
             path_rx: None,
             migrate_tx: None,
+            consent: camera_ui::ConsentGate::new("camera-client", japanese),
         }
         .with_stored_auth0()
     }
@@ -1028,6 +1039,12 @@ impl Drop for MyApp {
 
 impl eframe::App for MyApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Before anything else, including the frame plumbing below: using the
+        // service means an account and personal information, so this is the
+        // first thing a new installation sees and the only thing it can act on.
+        if !self.consent.show(ui) {
+            return;
+        }
         let ctx = ui.ctx().clone();
         // 新しいフレーム受信（最新のみ使う）
         // Drain first, decode once: decoding inside the drain loop livelocks

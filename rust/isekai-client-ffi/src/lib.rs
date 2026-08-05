@@ -188,6 +188,39 @@ pub trait FrameSink: Send + Sync {
     fn on_log(&self, line: String);
 }
 
+/// The privacy policy this build carries, for the screen shown before anything
+/// else.
+///
+/// Comes from the core rather than a copy in the app bundle so the three
+/// applications cannot end up asking agreement to three slightly different
+/// documents.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct PrivacyPolicy {
+    /// What was agreed to. Store it with the answer: agreement to one text is
+    /// not agreement to the next, and comparing this is how a revised policy
+    /// gets asked again.
+    pub version: String,
+    /// The canonical, always-current copy of each rendering. The text below is
+    /// what is shown and what works with no network; these stay current, and
+    /// are per language so the link matches what is on screen.
+    pub url_ja: String,
+    pub url_en: String,
+    pub text_ja: String,
+    pub text_en: String,
+}
+
+/// The policy to show, and the version to record alongside the answer.
+#[uniffi::export]
+pub fn privacy_policy() -> PrivacyPolicy {
+    PrivacyPolicy {
+        version: camera_core::privacy::VERSION.to_owned(),
+        url_ja: camera_core::privacy::URL_JA.to_owned(),
+        url_en: camera_core::privacy::URL_EN.to_owned(),
+        text_ja: camera_core::privacy::TEXT_JA.to_owned(),
+        text_en: camera_core::privacy::TEXT_EN.to_owned(),
+    }
+}
+
 /// Where the core gets a *current* Auth0 access token.
 ///
 /// The one handed to [`connect`] is a snapshot, and it stops working after a few
