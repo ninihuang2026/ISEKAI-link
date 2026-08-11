@@ -210,6 +210,12 @@ const SIGNALING_POLL_INTERVAL: Duration = Duration::from_secs(3);
 /// this side does not know that number and losing every viewer at once is what
 /// happens if the guess is wrong. A request per peer per minute is nothing next
 /// to the video going the other way.
+///
+/// It is also the window each leg is judged over: only legs that have carried
+/// something since the last tick are renewed. Anything comfortably longer than
+/// the path keepalive works — a peer that is there is heard from every ten
+/// seconds — and a pass that skips a leg costs nothing, since several fit
+/// inside one TTL.
 const CONNECTION_RENEW_INTERVAL: Duration = Duration::from_secs(60);
 
 /// How often the listener reads its connections while an event stream is up.
@@ -313,9 +319,16 @@ async fn command_loop(
                     }
                 }
             }
-            // Renewing is not conditioned on the policy: a connection bound by
-            // hand under `Manual` is being served just as much as one bound
-            // automatically, and would otherwise lapse under the operator.
+            // Not conditioned on the policy — but conditioned on traffic, by
+            // `renew_connections`, which renews only the legs something is
+            // arriving on.
+            //
+            // Under `Manual` it renews nothing at all, and always has: this
+            // walks what `poll_signaling` recorded, and `Manual` is the policy
+            // that never polls. A connection bound by hand is served until it
+            // lapses on the proxy's TTL. Nothing here has changed that; it is
+            // written down because the comment that used to be here said the
+            // opposite.
             _ = renew.tick() => {
                 for event in session.renew_connections(&signaling).await {
                     tracing::warn!("signaling: {event:?}");
