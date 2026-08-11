@@ -12,8 +12,12 @@ use std::time::Duration;
 use anyhow::Context as _;
 use isekai_p2p_core::bind::{open_connect_relay, ConnectRelay, RelayOptions};
 use isekai_p2p_core::observed::ObservedAddressWatch;
-use isekai_p2p_core::proxy::{Candidate, Grant, PeerConnection, ProxyClient, ReachableListener};
+use isekai_p2p_core::proxy::{
+    Candidate, Grant, PeerConnection, ProxyClient, ProxyError, ReachableListener,
+};
 use isekai_p2p_core::transport::MasqueH3Transport;
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
 
 use crate::config::{issue_endpoint_token, spawn_token_renewal, P2pConfig, TokenRenewal};
 
@@ -27,12 +31,95 @@ pub struct InitiatorSession {
     pub connection: PeerConnection,
     relay: ConnectRelay,
     /// Kept so [`close`](Self::close) can tell the proxy the connection is
-    /// over. Nothing else here needs the control plane once the leg is up.
+    /// over, and so the lease below can be renewed.
     proxy: ProxyClient<MasqueH3Transport>,
+    /// Keeps the Peer Connection's lease alive while this session exists.
+    ///
+    /// **Held here, on the side that is using the connection.** A renewal is a
+    /// claim that somebody is still there (spec §8.5.4), and this is the only
+    /// side that can make it honestly — the listener cannot see whether its
+    /// viewer is still watching. Because the claim stops when this value is
+    /// dropped, it also stops when the process is killed, which is what lets
+    /// the proxy expire the connection and the camera release its relay leg.
+    lease: ConnectionLease,
     /// Replaces the Endpoint Token before it expires. Shared with the
     /// [`PeerDirectory`] this was opened over, when there was one, so there is
     /// one renewal loop however many handles are holding the same client.
     _renewal: Arc<TokenRenewal>,
+}
+
+/// What fraction of the remaining lease to let pass before renewing.
+///
+/// A third, so two renewals can fail before the lease lapses.
+const LEASE_RENEW_DIVISOR: u32 = 3;
+/// Never renew more often than this, whatever a deadline works out to.
+const LEASE_RENEW_MIN: Duration = Duration::from_secs(10);
+/// Nor less often, and this is also what an unreadable or missing deadline
+/// falls back to. Under the five minutes the proxy's connect TTL defaults to,
+/// so a lease of unknown length is still renewed in time.
+const LEASE_RENEW_MAX: Duration = Duration::from_secs(60);
+
+/// When to renew next, from the deadline the proxy just gave.
+///
+/// **Measured rather than assumed.** Every connection read and every renewal
+/// answers with `expires_at` (spec §8.5.1), so the interval can come from the
+/// lease itself instead of from a copy of the server's default sitting in this
+/// file. A constant here would be a second place that number lives, and the
+/// kind that breaks silently on the day the proxy's `--p2p-connect-ttl-secs`
+/// moves.
+///
+/// **And measured on the proxy's clock, not this one.** The same response
+/// carries `updated_at`, the moment the deadline was set from, so subtracting
+/// one server timestamp from the other gives the lease's length without this
+/// side's clock entering into it. Reading it against a local `now` instead
+/// would mean a device running fast sees every fresh lease as already lapsed
+/// and renews at the floor forever — six times the requests, and an `info` line
+/// nowhere to say why. The local clock is only the fallback, for a response
+/// that carries no `updated_at`.
+fn renew_delay(
+    expires_at: Option<&str>,
+    updated_at: Option<&str>,
+    now: OffsetDateTime,
+) -> Duration {
+    let timestamp = |s: Option<&str>| s.and_then(|s| OffsetDateTime::parse(s, &Rfc3339).ok());
+    let Some(deadline) = timestamp(expires_at) else {
+        return LEASE_RENEW_MAX;
+    };
+    // The answer just arrived, so the lease's whole length is what is left of it.
+    let remaining = deadline - timestamp(updated_at).unwrap_or(now);
+    if !remaining.is_positive() {
+        // Already lapsed as far as this side can tell. Renewing at once is the
+        // only thing that might still save it, and the floor keeps that from
+        // becoming a spin.
+        return LEASE_RENEW_MIN;
+    }
+    Duration::from_secs_f64(remaining.as_seconds_f64() / f64::from(LEASE_RENEW_DIVISOR))
+        .clamp(LEASE_RENEW_MIN, LEASE_RENEW_MAX)
+}
+
+/// Whether a failed renewal can ever succeed.
+///
+/// `connection-not-found` means the lease is gone, and `invalid-request` is what
+/// a report against a terminal state gets — the peer closed it. Neither
+/// improves by asking again, and a task that keeps asking every minute for the
+/// life of the process is a warning a minute about something nobody can act on.
+/// Anything else — a transport failure, a 5xx — is worth retrying.
+///
+/// **`invalid-request` is a shared code, so this rests on a premise:** the only
+/// other reasons `POST /v1/peer/connections/{id}/state` returns it are a bad
+/// candidate address and an unknown state, and [`ProxyClient::renew_connection`]
+/// sends neither — its body is `{}`. If that endpoint gains a reason to refuse a
+/// bare renewal, this stops renewing and the symptom is video ending one TTL in,
+/// with a single `info` line to find it by. A dedicated kind would settle it and
+/// is asked for in `ISEKAI-link-server#217`; until then, the premise is here.
+fn renewal_is_over(error: &ProxyError) -> bool {
+    match error {
+        ProxyError::Problem { problem, .. } => matches!(
+            problem.as_ref().map(|p| p.kind()),
+            Some("connection-not-found" | "invalid-request")
+        ),
+        _ => false,
+    }
 }
 
 /// How long [`InitiatorSession::close`] waits to report the connection closed.
@@ -41,6 +128,82 @@ pub struct InitiatorSession {
 /// is lost by giving up is that the listener holds its relay leg for this
 /// connection until the proxy expires it.
 const REPORT_CLOSED_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Renews one Peer Connection's lease until dropped.
+///
+/// Dropping stops the claim, which is the point: a viewer that goes away —
+/// closed, killed, crashed, off the network — stops asserting it is there, and
+/// the proxy expires the connection on its own. Nothing has to notice the
+/// difference between those, and nothing has to be reported for it to work.
+struct ConnectionLease(tokio::task::JoinHandle<()>);
+
+impl ConnectionLease {
+    /// Takes the `connect` response itself, so the first renewal is timed off
+    /// the real lease exactly like every one after it.
+    fn spawn(proxy: ProxyClient<MasqueH3Transport>, connection: &PeerConnection) -> Self {
+        let connection_id = connection.connection_id.clone();
+        let mut delay = renew_delay(
+            connection.expires_at.as_deref(),
+            connection.updated_at.as_deref(),
+            OffsetDateTime::now_utc(),
+        );
+        Self(tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(delay).await;
+                match proxy.renew_connection(&connection_id).await {
+                    Ok(connection) => {
+                        delay = renew_delay(
+                            connection.expires_at.as_deref(),
+                            connection.updated_at.as_deref(),
+                            OffsetDateTime::now_utc(),
+                        );
+                        tracing::trace!(
+                            connection_id = %connection_id,
+                            next = ?delay,
+                            "renewed the peer connection's lease",
+                        );
+                    }
+                    Err(e) if renewal_is_over(&e) => {
+                        // The connection is gone or the peer closed it. Said
+                        // once, and then this stops rather than asking a
+                        // question that now has a permanent answer.
+                        tracing::info!(
+                            connection_id = %connection_id,
+                            "the peer connection is over; no longer renewing it: {e}",
+                        );
+                        return;
+                    }
+                    Err(e) => {
+                        // Not fatal on its own: the lease outlives several of
+                        // these, so a proxy that is briefly unreachable costs
+                        // nothing. Worth saying, because the visible consequence
+                        // of it continuing is the video stopping partway through.
+                        tracing::warn!(
+                            connection_id = %connection_id,
+                            retry_in = ?delay,
+                            "could not renew the peer connection's lease: {e}",
+                        );
+                    }
+                }
+            }
+        }))
+    }
+
+    /// Stop claiming, without waiting for the drop.
+    ///
+    /// Used before reporting the connection closed: `closed` is terminal, and a
+    /// renewal racing behind it would be refused with `400 invalid-request` and
+    /// logged as a failure that is really just bad timing.
+    fn stop(&self) {
+        self.0.abort();
+    }
+}
+
+impl Drop for ConnectionLease {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 /// What lets an initiator open a connection.
 ///
@@ -372,11 +535,13 @@ impl InitiatorSession {
         .await?;
         let renewal = renewal
             .unwrap_or_else(|| Arc::new(spawn_token_renewal(cfg.clone(), proxy.clone(), None)));
+        let lease = ConnectionLease::spawn(proxy.clone(), &connection);
         Ok(Self {
             local_addr: handle.local_addr,
             connection,
             relay: handle,
             proxy: proxy.clone(),
+            lease,
             _renewal: renewal,
         })
     }
@@ -424,6 +589,9 @@ impl InitiatorSession {
     /// runs on the way out, the connection expires on its own either way, and
     /// there is nothing a disconnecting application could do with the error.
     pub async fn close(self) {
+        // Before the report: `closed` is terminal, so a renewal arriving behind
+        // it is refused and logged as a failure that is only bad timing.
+        self.lease.stop();
         let reported = tokio::time::timeout(
             REPORT_CLOSED_TIMEOUT,
             self.proxy
@@ -447,5 +615,158 @@ impl InitiatorSession {
             ),
         }
         self.relay.close().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SERVER_NOW: i64 = 1_800_000_000;
+
+    fn stamp(unix_secs: i64) -> OffsetDateTime {
+        OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(unix_secs)
+    }
+
+    /// A lease of `secs` the proxy just handed out: both timestamps on its clock.
+    fn lease(secs: i64) -> (Option<String>, Option<String>) {
+        let format = |t: OffsetDateTime| Some(t.format(&Rfc3339).unwrap());
+        (format(stamp(SERVER_NOW + secs)), format(stamp(SERVER_NOW)))
+    }
+
+    /// This side's clock, `skew` seconds off the proxy's.
+    fn local_clock(skew: i64) -> OffsetDateTime {
+        stamp(SERVER_NOW + skew)
+    }
+
+    /// The interval comes from the lease the proxy just handed back, so a proxy
+    /// configured differently from the default is followed rather than guessed
+    /// at. A third of what is left leaves room for two failures.
+    #[test]
+    fn the_interval_is_measured_from_the_deadline() {
+        let (expires_at, updated_at) = lease(150);
+        assert_eq!(
+            renew_delay(expires_at.as_deref(), updated_at.as_deref(), local_clock(0)),
+            Duration::from_secs(50)
+        );
+        let (expires_at, updated_at) = lease(90);
+        assert_eq!(
+            renew_delay(expires_at.as_deref(), updated_at.as_deref(), local_clock(0)),
+            Duration::from_secs(30)
+        );
+    }
+
+    /// Both timestamps come from the proxy, so what this device thinks the time
+    /// is cannot move the interval. Without that, a clock running an hour fast
+    /// reads every fresh lease as lapsed and renews at the floor for as long as
+    /// the app runs — six times the requests, and nothing said about it.
+    #[test]
+    fn a_wrong_local_clock_does_not_change_the_interval() {
+        let (expires_at, updated_at) = lease(150);
+        for skew in [0, 3_600, -3_600] {
+            assert_eq!(
+                renew_delay(
+                    expires_at.as_deref(),
+                    updated_at.as_deref(),
+                    local_clock(skew)
+                ),
+                Duration::from_secs(50),
+                "a clock {skew}s off should not have mattered",
+            );
+        }
+        // And that is what the local clock alone would have made of it.
+        assert_eq!(
+            renew_delay(expires_at.as_deref(), None, local_clock(3_600)),
+            LEASE_RENEW_MIN
+        );
+    }
+
+    /// A deadline that is missing or in a shape this cannot read must not turn
+    /// into "never renew". The fallback is under the shortest lease the proxy
+    /// is likely to hand out.
+    #[test]
+    fn an_unreadable_deadline_still_renews_in_time() {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        assert_eq!(renew_delay(None, None, now), LEASE_RENEW_MAX);
+        assert_eq!(renew_delay(Some("soon"), None, now), LEASE_RENEW_MAX);
+        assert!(LEASE_RENEW_MAX < Duration::from_secs(300));
+    }
+
+    /// An unreadable `updated_at` is not fatal — it falls back to the local
+    /// clock, which is what this did before the proxy's own was available.
+    #[test]
+    fn an_unreadable_issue_time_falls_back_to_the_local_clock() {
+        let (expires_at, _) = lease(150);
+        assert_eq!(
+            renew_delay(expires_at.as_deref(), Some("just now"), local_clock(0)),
+            Duration::from_secs(50)
+        );
+    }
+
+    /// A long lease must not push the renewal past the fallback, and a lapsed
+    /// or absurdly short one must not turn into a spin.
+    #[test]
+    fn the_interval_stays_between_its_bounds() {
+        for (secs, expected) in [
+            (86_400, LEASE_RENEW_MAX),
+            (1, LEASE_RENEW_MIN),
+            (-60, LEASE_RENEW_MIN),
+        ] {
+            let (expires_at, updated_at) = lease(secs);
+            assert_eq!(
+                renew_delay(expires_at.as_deref(), updated_at.as_deref(), local_clock(0)),
+                expected,
+                "a lease of {secs}s",
+            );
+        }
+    }
+
+    fn problem(kind: &str) -> ProxyError {
+        ProxyError::Problem {
+            status: 404,
+            problem: Some(
+                serde_json::from_value(serde_json::json!({
+                    "type": format!("https://isekai.link/problems/{kind}"),
+                    "title": kind,
+                    "status": 404,
+                }))
+                .expect("problem parses"),
+            ),
+        }
+    }
+
+    /// A connection that is gone, or one the peer has closed, will not come
+    /// back — and a renewal task that keeps asking produces a warning a minute
+    /// about something nobody can act on.
+    #[test]
+    fn a_permanent_answer_ends_the_renewal() {
+        assert!(renewal_is_over(&problem("connection-not-found")));
+        assert!(renewal_is_over(&problem("invalid-request")));
+    }
+
+    /// Anything that might work next time keeps the loop alive: the lease
+    /// outlives several failures, so a proxy that is briefly unreachable must
+    /// not end a session that is streaming fine.
+    #[test]
+    fn a_transient_failure_does_not() {
+        assert!(!renewal_is_over(&problem("internal")));
+        assert!(!renewal_is_over(&ProxyError::Transport(anyhow::anyhow!(
+            "connection reset"
+        ))));
+    }
+
+    /// Dropping the session stops the claim. This is what makes a viewer that
+    /// was killed — Ctrl+C, a crash, a lost network — release the camera's
+    /// relay leg without reporting anything.
+    #[tokio::test]
+    async fn dropping_the_lease_stops_renewing() {
+        let lease = ConnectionLease(tokio::spawn(async {
+            std::future::pending::<()>().await;
+        }));
+        let handle = lease.0.abort_handle();
+        assert!(!handle.is_finished());
+        drop(lease);
+        tokio::task::yield_now().await;
+        assert!(handle.is_finished(), "the renewal outlived the session");
     }
 }
