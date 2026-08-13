@@ -221,6 +221,18 @@ pub fn privacy_policy() -> PrivacyPolicy {
     }
 }
 
+/// How long a connection this app is not watching survives, in seconds.
+///
+/// For the one question a suspended app can answer about a connection it could
+/// not observe: it knows how long it was away, and longer than this means the
+/// connection is gone whatever handle is still held. Read from `camera-core`
+/// rather than written down again on the Swift side — the same number in two
+/// places is the same number until somebody moves one of them.
+#[uniffi::export]
+pub fn video_idle_timeout_seconds() -> u32 {
+    camera_core::VIDEO_IDLE_TIMEOUT.as_secs() as u32
+}
+
 /// Where the core gets a *current* Auth0 access token.
 ///
 /// The one handed to [`connect`] is a snapshot, and it stops working after a few

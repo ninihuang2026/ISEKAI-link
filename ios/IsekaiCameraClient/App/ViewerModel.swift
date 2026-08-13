@@ -338,12 +338,96 @@ final class ViewerModel: ObservableObject {
 
     func disconnect() {
         session?.disconnect()
+        releaseSession()
+        phase = .closed
+    }
+
+    /// Let go of a session that has already ended.
+    ///
+    /// Ending it and letting go of it are two things, and only the first was
+    /// being done when a connection stopped on its own. `connect()` refuses
+    /// while a session is held, and `isConnected` — which is just "a session is
+    /// held" — disables the whole settings form and shows a Disconnect button.
+    /// So a connection that died left the app offering to end something already
+    /// over, and the way back was to press that and *then* Connect: two actions
+    /// for something nobody chose.
+    ///
+    /// Nothing is reported to the proxy here, unlike `disconnect()`. The state
+    /// that brought us here is terminal, so there is nothing left to say — and
+    /// dropping the session is what stops it renewing that connection's lease,
+    /// which is the part that matters.
+    ///
+    /// The phase and any error are left alone: what happened is still worth
+    /// showing.
+    private func releaseSession() {
         session = nil
         sink = nil
-        phase = .closed
         paths = nil
         rttMs = nil
     }
+
+    // MARK: - App lifecycle
+
+    /// When the app was last put into the background, if it still is.
+    ///
+    /// `ContinuousClock` rather than `Date`, because this is a measurement and
+    /// not a time. A wall clock steps backwards when the network corrects it or
+    /// somebody sets it, and a negative interval reads as "barely away" — which
+    /// puts the app straight back into the stuck state this exists to prevent,
+    /// occasionally and for no visible reason. `ContinuousClock` only goes
+    /// forwards and keeps counting while the device sleeps, which is exactly
+    /// the span being asked about.
+    private var backgroundedAt: ContinuousClock.Instant?
+
+    /// The app went away. Remember when, because that is the only thing it will
+    /// know on the way back.
+    ///
+    /// This is when it was *backgrounded*, which is a little before it was
+    /// suspended and the connection actually went quiet — so a long enough
+    /// background can be declared lost while the connection was in fact still
+    /// alive. That way round on purpose: being early costs a needless "lost"
+    /// and one press of Connect, being late costs the stuck state, and nobody
+    /// should tighten this without knowing which side to err on.
+    func didEnterBackground() {
+        backgroundedAt = ContinuousClock.now
+    }
+
+    /// The app came back.
+    ///
+    /// **A suspended app is told nothing while it is away, and is not told
+    /// promptly on return either.** The connection is closed by its idle
+    /// timeout, but this app only hears about it when the core's receive loop
+    /// next gets to run and errors out — some moment after the foreground, not
+    /// at it. Until then the app still believes it is connected: Disconnect
+    /// where Connect should be, and the settings form locked.
+    ///
+    /// That window is what a person walks into. Two returns after the same two
+    /// minutes away behaved differently on device, purely by whether the report
+    /// had landed yet.
+    ///
+    /// So this does not wait to be told. Away for longer than the idle timeout
+    /// means the connection is gone, and that much the app can work out for
+    /// itself. It stops there rather than reconnecting: coming back to a phone
+    /// in a pocket should not open a camera and spend data on it.
+    func willEnterForeground() {
+        guard let since = backgroundedAt else { return }
+        backgroundedAt = nil
+        let away = ContinuousClock.now - since
+        guard session != nil, away >= Self.idleTimeout else { return }
+
+        releaseSession()
+        phase = .failed
+        statusDetail =
+            "Connection lost while the app was in the background (\(away.components.seconds)s)."
+        errorMessage = statusDetail
+    }
+
+    /// How long a connection survives with nothing watching it.
+    ///
+    /// Asked of the core rather than written down here. It is the video
+    /// connection's own idle timeout, and the same number in two places is the
+    /// same number only until somebody moves one of them.
+    private static let idleTimeout = Duration.seconds(videoIdleTimeoutSeconds())
 
     /// Forget the Endpoint key and mint a new identity. Any capability the
     /// camera server issued for the old Endpoint ID stops matching.
@@ -360,7 +444,19 @@ final class ViewerModel: ObservableObject {
 
     // MARK: - Called by ViewerSink
 
-    func apply(state: ConnectionState, detail: String) {
+    func apply(state: ConnectionState, detail: String, from sink: ViewerSink) {
+        // A report from a sink this model is no longer listening to. The core's
+        // loop unwinds after the session is dropped, so a `.closed` can arrive
+        // *after* `willEnterForeground` has already said what happened — and it
+        // would blank that message and walk `.failed` back to `.closed`. Worse,
+        // if the person has reconnected in between, it would be describing the
+        // old connection over the new one's state.
+        //
+        // Identity, because the sink is set at the top of `connect()` and stays
+        // for the whole attempt: this holds during connecting, when there is a
+        // sink and not yet a session. Only state is guarded — frames, paths and
+        // RTT are display values that the next real one replaces.
+        guard sink === self.sink else { return }
         switch state {
         case .connecting:
             phase = .connecting
@@ -374,13 +470,18 @@ final class ViewerModel: ObservableObject {
         case .streaming:
             phase = .streaming
             statusDetail = ""
+        // Both terminal, and both have to let go of the session. The camera
+        // stopping, the network going, or this app being suspended past the
+        // video connection's 30s idle timeout all arrive here.
         case .closed:
             phase = .closed
             statusDetail = ""
+            releaseSession()
         case .failed:
             phase = .failed
             statusDetail = detail
             errorMessage = detail
+            releaseSession()
         }
     }
 
@@ -437,10 +538,7 @@ final class ViewerModel: ObservableObject {
     private func fail(_ message: String) {
         errorMessage = message
         phase = .failed
-        session = nil
-        sink = nil
-        paths = nil
-        rttMs = nil
+        releaseSession()
     }
 }
 
