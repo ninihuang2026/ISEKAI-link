@@ -17,11 +17,14 @@
 //! 3. the initiator connects and reveals its `connection_id`;
 //! 4. this side [`bind`](ListenerSession::bind)s that `connection_id`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use isekai_p2p_core::bind::{open_bind_session, BindSession, InboundActivity, RelayOptions};
+use isekai_p2p_core::bind::{
+    open_bind_session, BindSession, InboundActivity, MasqueClientEvent, RelayOptions,
+};
 use isekai_p2p_core::endpoint::EndpointKey;
 use isekai_p2p_core::observed::{ObservedAddress, ObservedAddressWatch};
 use isekai_p2p_core::proxy::{
@@ -64,6 +67,9 @@ pub struct ListenerSession {
     /// hand — must keep seeing updates across rebinds. So the leg's watch is
     /// forwarded into this one rather than handed out directly.
     observed_tx: watch::Sender<Option<ObservedAddress>>,
+    /// Which leg each accepted local connection came in on, for a caller that
+    /// serves more than one peer at a time. See [`LegDirectory`].
+    legs: LegDirectory,
     /// Replaces the Endpoint Token before it expires, for as long as this
     /// session lives. Held, not read.
     _renewal: TokenRenewal,
@@ -157,6 +163,100 @@ impl SignalingState {
     /// The connections currently bound.
     pub fn bound(&self) -> impl Iterator<Item = &str> {
         self.bound.iter().map(String::as_str)
+    }
+}
+
+/// Which relay leg a local connection arrived on.
+///
+/// **The problem this solves is that legs are indistinguishable from inside.**
+/// Every leg delivers to the same local listener, and each has its own binding
+/// out on the network — so a connection has to be given *its own* leg's
+/// address, and until now nothing could say which that was. What was done
+/// instead was to take the first address offered and keep it, which is right
+/// only while legs come up in the order their peers connect.
+///
+/// A leg forwards what it receives from a socket of its own
+/// ([`MasqueClientEvent::NewRemoteHost`] reports that socket's address), so the
+/// address the local listener sees a connection coming *from* names the leg it
+/// came in *on*. That is the whole mechanism: this holds the mapping, and the
+/// listener asks.
+///
+/// One leg can appear more than once — a peer that changes address gets another
+/// forwarding socket — which is why this is keyed by address rather than by leg.
+///
+/// **This rests on the forwarding socket being connected before its address is
+/// read.** It is bound to the wildcard, so what makes `local_addr` report
+/// `127.0.0.1:p` rather than `0.0.0.0:p` is the `connect` to the local listener
+/// that precedes it (`channel-masque`'s `from_quic_to_udp`). Were that to go —
+/// a leg fanning out to several destinations, say — nothing here would ever
+/// match, and every connection would fall back to relay-only in silence. There
+/// is a note at the other end saying the same thing.
+#[derive(Clone, Default)]
+pub struct LegDirectory {
+    forwarding: Arc<Mutex<HashMap<SocketAddr, ObservedAddressWatch>>>,
+}
+
+impl LegDirectory {
+    /// The observed-address watch of the leg a connection from `peer` arrived
+    /// on, or `None` while nothing has come in on a leg from that address.
+    ///
+    /// `None` is a real answer and not only a race: it is also what a
+    /// connection that did not come through a relay leg at all gets.
+    pub fn leg_for(&self, peer: SocketAddr) -> Option<ObservedAddressWatch> {
+        self.forwarding.lock().unwrap().get(&peer).cloned()
+    }
+
+    fn attach(&self, forwarding: SocketAddr, leg: ObservedAddressWatch) {
+        self.forwarding.lock().unwrap().insert(forwarding, leg);
+    }
+
+    /// Forget a leg's addresses. Called from [`AttachedLeg`]'s `Drop`, which is
+    /// what makes the map bounded by the legs that exist.
+    fn detach(&self, forwarding: &[SocketAddr]) {
+        let mut map = self.forwarding.lock().unwrap();
+        for addr in forwarding {
+            map.remove(addr);
+        }
+    }
+
+    /// How many addresses are claimed. Zero and non-zero mean different things
+    /// to a connection nothing claims — see `camera-core`'s `leg_of`.
+    pub fn claimed(&self) -> usize {
+        self.forwarding.lock().unwrap().len()
+    }
+}
+
+/// One leg's entries in a [`LegDirectory`], removed when the leg's task ends.
+///
+/// **`Drop` and not a line after the loop**, because legs are normally taken
+/// down by aborting that task — [`ListenerSession::unbind`] when a peer goes,
+/// and `close` on the way out — and an aborted task does not run what follows
+/// its last await. Left in the map, a dead leg's entry keeps its watch alive
+/// and, once the operating system hands that ephemeral port to a new leg's
+/// forwarding socket, answers for it: a connection advertised somebody else's
+/// binding, which is the fault this whole mechanism exists to remove.
+struct AttachedLeg {
+    legs: LegDirectory,
+    forwarding: Vec<SocketAddr>,
+}
+
+impl AttachedLeg {
+    fn new(legs: LegDirectory) -> Self {
+        Self {
+            legs,
+            forwarding: Vec::new(),
+        }
+    }
+
+    fn attach(&mut self, forwarding: SocketAddr, leg: ObservedAddressWatch) {
+        self.legs.attach(forwarding, leg);
+        self.forwarding.push(forwarding);
+    }
+}
+
+impl Drop for AttachedLeg {
+    fn drop(&mut self) {
+        self.legs.detach(&self.forwarding);
     }
 }
 
@@ -284,6 +384,7 @@ impl ListenerSession {
             binds: std::collections::HashMap::new(),
             opts,
             observed_tx: watch::channel(None).0,
+            legs: LegDirectory::default(),
             _renewal: renewal,
         })
     }
@@ -301,6 +402,16 @@ impl ListenerSession {
     /// socket has no binding a direct path could use.
     pub fn observed_address(&self) -> ObservedAddressWatch {
         self.observed_tx.subscribe()
+    }
+
+    /// Which leg each local connection arrived on (see [`LegDirectory`]).
+    ///
+    /// This is what [`observed_address`](Self::observed_address) cannot answer:
+    /// that watch carries whichever leg reported last, which is one peer's
+    /// binding handed to whoever asks. A listener serving more than one viewer
+    /// needs each connection told about the leg it actually came in on.
+    pub fn legs(&self) -> LegDirectory {
+        self.legs.clone()
     }
 
     /// Mint a capability authorizing `allowed_endpoint` (the initiator's
@@ -328,8 +439,14 @@ impl ListenerSession {
     /// Binding a connection that already has a leg does nothing — tearing down
     /// a working leg to rebuild it would interrupt the peer being served.
     ///
-    /// All legs share one binding, so they report the same observed address;
-    /// they all feed the one watch and the repeats are ignored downstream.
+    /// **Each leg gets a binding of its own**, so they report different
+    /// observed addresses — the connector binds a fresh ephemeral socket per
+    /// leg. They all feed the session's one watch, which therefore holds
+    /// whichever reported last and is only good for showing an operator;
+    /// [`legs`](Self::legs) is what says which address belongs to whom.
+    ///
+    /// This used to say the opposite, and believing it is what let a second
+    /// viewer's leg be advertised to the first viewer's connection.
     pub async fn bind(&mut self, connection_id: &str) -> anyhow::Result<()> {
         if self.binds.contains_key(connection_id) {
             return Ok(());
@@ -349,7 +466,11 @@ impl ListenerSession {
         // Own the session in a task that drains its notifications, so an unread
         // events channel can never stall the underlying MASQUE loop. Dropping
         // the task (on close) drops the session, whose Drop cancels the relay.
-        let handle = tokio::spawn(drive_bind_session(session, self.observed_tx.clone()));
+        let handle = tokio::spawn(drive_bind_session(
+            session,
+            self.observed_tx.clone(),
+            self.legs.clone(),
+        ));
         self.binds.insert(
             connection_id.to_owned(),
             BindGuard {
@@ -637,15 +758,33 @@ impl ListenerSession {
 async fn drive_bind_session(
     mut session: BindSession,
     observed_tx: watch::Sender<Option<ObservedAddress>>,
+    legs: LegDirectory,
 ) {
     let mut leg = session.observed();
+    // The addresses this leg has been reached at, so they can be forgotten with
+    // it however it ends. Kept here rather than looked up in the directory,
+    // which cannot say whose an entry is.
+    let mut attached = AttachedLeg::new(legs);
     // The leg's watch ends when its connection does; keep draining events after
     // that rather than spinning on a closed channel.
     let mut leg_open = true;
     loop {
         tokio::select! {
             event = session.events.recv() => match event {
-                Some(event) => tracing::debug!("bind session event: {event:?}"),
+                Some(event) => {
+                    // The one event that says something about *this* leg rather
+                    // than about the session: a forwarding socket was created,
+                    // and everything arriving at the local listener from its
+                    // address arrived on this leg.
+                    if let MasqueClientEvent::NewRemoteHost(peer, socket) = event {
+                        tracing::debug!(
+                            %peer, forwarding = %socket, "a peer is reaching this leg",
+                        );
+                        attached.attach(socket, session.observed());
+                    } else {
+                        tracing::debug!("bind session event: {event:?}");
+                    }
+                }
                 None => break,
             },
             changed = leg.changed(), if leg_open => {
@@ -875,6 +1014,86 @@ mod tests {
 
         forget_gone(&mut state, &[conn("conn_a")]);
         assert!(state.spent.is_empty());
+    }
+
+    /// A leg that has already reported the binding `port` names.
+    fn leg_watch(port: u16) -> ObservedAddressWatch {
+        watch::channel(Some(observed(port))).0.subscribe()
+    }
+
+    /// Where a leg's forwarding socket delivers from — loopback, because that
+    /// is where the video listener is.
+    fn forwarding(port: u16) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    /// The whole point: two legs, two answers. Before this, a connection was
+    /// handed whichever address had arrived first, and a second viewer's leg
+    /// could be advertised to the first viewer's connection.
+    #[test]
+    fn a_connection_is_answered_with_its_own_leg() {
+        let legs = LegDirectory::default();
+        legs.attach(forwarding(40001), leg_watch(1));
+        legs.attach(forwarding(40002), leg_watch(2));
+
+        let first = legs.leg_for(forwarding(40001)).expect("the first leg");
+        let second = legs.leg_for(forwarding(40002)).expect("the second leg");
+
+        assert_eq!(first.borrow().expect("reported").local, addr(1));
+        assert_eq!(second.borrow().expect("reported").local, addr(2));
+    }
+
+    /// An address no leg forwards from is not this listener's to answer for —
+    /// something that dialled the video listener directly, or a leg that has
+    /// not reported yet. Both get no direct path rather than somebody else's.
+    #[test]
+    fn an_unknown_address_gets_no_leg() {
+        let legs = LegDirectory::default();
+        legs.attach(forwarding(40001), leg_watch(1));
+        assert!(legs.leg_for(forwarding(40009)).is_none());
+    }
+
+    /// One leg can be reached at more than one address — a peer that changes
+    /// address gets another forwarding socket — and both name the same leg.
+    #[test]
+    fn one_leg_can_answer_to_several_addresses() {
+        let legs = LegDirectory::default();
+        legs.attach(forwarding(40001), leg_watch(7));
+        legs.attach(forwarding(40002), leg_watch(7));
+
+        for port in [40001, 40002] {
+            let leg = legs.leg_for(forwarding(port)).expect("the leg");
+            assert_eq!(leg.borrow().expect("reported").local, addr(7));
+        }
+    }
+
+    /// A leg that ends takes its addresses with it, so the map is bounded by
+    /// the legs that exist rather than by every leg this session ever had.
+    ///
+    /// **Through `Drop`, which is the only path that runs.** Legs are normally
+    /// taken down by aborting their task, and an aborted task does not reach
+    /// anything after its loop — so cleaning up there left every leg a peer had
+    /// left behind still answering, its watch alive, ready to be handed to
+    /// whichever new leg the operating system gave that port to next.
+    #[test]
+    fn a_leg_that_ends_stops_answering() {
+        let legs = LegDirectory::default();
+        let other = {
+            let mut ending = AttachedLeg::new(legs.clone());
+            ending.attach(forwarding(40001), leg_watch(1));
+            let mut other = AttachedLeg::new(legs.clone());
+            other.attach(forwarding(40002), leg_watch(2));
+            assert_eq!(legs.claimed(), 2);
+            other
+        };
+
+        assert!(legs.leg_for(forwarding(40001)).is_none(), "it ended");
+        assert!(
+            legs.leg_for(forwarding(40002)).is_some(),
+            "the other leg is untouched",
+        );
+        drop(other);
+        assert_eq!(legs.claimed(), 0);
     }
 
     /// A guard over a leg that has received `datagrams` so far.
