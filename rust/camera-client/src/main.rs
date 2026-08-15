@@ -590,6 +590,22 @@ impl MyApp {
                 Some(host) => (host.to_string(), true),
                 None => ("127.0.0.1".to_string(), false),
             };
+            // What the peer signed about its own key, if it has said anything.
+            // Absent is ordinary and changes nothing; present means the
+            // handshake has to produce that key (§8.6.5).
+            let pin = match camera_core::AttestedPeer::from_connection(&session.connection) {
+                Ok(pin) => {
+                    tracing::info!(
+                        peer = %pin.peer_endpoint,
+                        "the peer signed for its video key; the handshake has to present it",
+                    );
+                    Some(pin)
+                }
+                Err(why) => {
+                    tracing::info!("{why}");
+                    None
+                }
+            };
             {
                 let mut s = shared.lock().unwrap();
                 s.connection_id = Some(session.connection_id().to_string());
@@ -612,6 +628,7 @@ impl MyApp {
                 VideoRecvOptions {
                     registration: Some(reg),
                     verify,
+                    pin,
                     observed: Some(session.observed_address()),
                     path_events: Some(path_tx),
                     migrate: Some(migrate_rx),

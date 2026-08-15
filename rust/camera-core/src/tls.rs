@@ -50,8 +50,7 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use isekai_p2p::agent::{
-    attest, Attestation, CertificateParameters, EndpointKey, IssuedCertificate, MasqueH3Transport,
-    ProxyClient, ProxyError,
+    attest, Attestation, EndpointKey, IssuedCertificate, MasqueH3Transport, ProxyClient, ProxyError,
 };
 use isekai_p2p::secret::write_secret;
 use rcgen::{CertificateParams, KeyPair};
@@ -353,6 +352,24 @@ pub fn spki_sha256(key: &KeyPair) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
 }
 
+/// The SPKI digest of a certificate, in the form the attestation names.
+///
+/// The same value [`spki_sha256`] computes for a key, arrived at from the other
+/// side: a certificate presented in a handshake. Comparing the two is what
+/// makes a statement about a key into a statement about *this connection*.
+///
+/// `None` for anything that will not parse — a certificate that cannot be read
+/// is not one that matched.
+pub fn spki_sha256_of_certificate(der: &[u8]) -> Option<String> {
+    use base64::Engine as _;
+    use sha2::{Digest as _, Sha256};
+    use x509_parser::prelude::*;
+
+    let (_, certificate) = X509Certificate::from_der(der).ok()?;
+    let digest = Sha256::digest(certificate.tbs_certificate.subject_pki.raw);
+    Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest))
+}
+
 /// Assemble what the listener needs from an issued chain and the local key.
 ///
 /// The PKCS#12 is built here because this is the only side that can: the
@@ -473,6 +490,49 @@ mod key_tests {
         let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "the video TLS key must be 0600");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The two sides of the same value. A statement names a key by the digest
+    /// of its SPKI; a handshake presents a certificate. If those did not agree
+    /// for the same key, pinning would refuse every honest connection.
+    #[test]
+    fn a_certificate_digests_to_the_same_value_as_its_key() {
+        let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("key");
+        let mut params =
+            CertificateParams::new(vec!["e4f9c3.p2p.isekai.tools".to_owned()]).expect("params");
+        params.distinguished_name = {
+            let mut dn = rcgen::DistinguishedName::new();
+            dn.push(rcgen::DnType::CommonName, "e4f9c3.p2p.isekai.tools");
+            dn
+        };
+        let certificate = params.self_signed(&key).expect("self-signed");
+
+        assert_eq!(
+            spki_sha256_of_certificate(certificate.der()),
+            Some(spki_sha256(&key)),
+        );
+    }
+
+    /// A certificate for a different key digests differently — which is the
+    /// whole of the pin.
+    #[test]
+    fn another_key_gives_another_digest() {
+        let mine = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("mine");
+        let theirs = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("theirs");
+        let params = CertificateParams::new(vec!["host".to_owned()]).expect("params");
+        let certificate = params.self_signed(&theirs).expect("self-signed");
+
+        assert_ne!(
+            spki_sha256_of_certificate(certificate.der()),
+            Some(spki_sha256(&mine)),
+        );
+    }
+
+    /// Anything unreadable is not a match, rather than an error to handle in
+    /// the middle of a handshake.
+    #[test]
+    fn a_certificate_that_will_not_parse_is_not_a_match() {
+        assert_eq!(spki_sha256_of_certificate(b"not a certificate"), None);
     }
 
     /// A key file that is there but unreadable is not a reason to make a new

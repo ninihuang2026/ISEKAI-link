@@ -53,6 +53,13 @@ sha2 = "0.10"
 thiserror = "2.0.16"
 time = { version = "0.3", features = ["parsing", "formatting"] }
 rcgen = "0.13"
+# Reading the SubjectPublicKeyInfo out of a certificate the peer presented, so
+# it can be checked against what that peer signed for (`camera-core::tls`).
+# 0.16 rather than 0.18 to match what `rcgen` already pulls in: the two do not
+# unify, and a second copy drags another `asn1-rs`/`der-parser`/`oid-registry`
+# into every camera binary and the iOS xcframework. Same `from_der`, same
+# `subject_pki.raw`.
+x509-parser = "0.16"
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["full"] }

@@ -28,7 +28,8 @@ pub use server::{spawn_p2p_server, ServerCommand, ServerHandle, ServerInfo};
 pub use shutdown::{drain_registration, shutdown_and_exit};
 pub use video::{
     bind_video_listener, receive_frames, receive_frames_with, serve_frames, serve_frames_with,
-    PathEvent, RelayLegs, ServeOptions, VideoRecvOptions, VIDEO_ALPN, VIDEO_IDLE_TIMEOUT,
+    AttestedPeer, PathEvent, RelayLegs, ServeOptions, VideoRecvOptions, VIDEO_ALPN,
+    VIDEO_IDLE_TIMEOUT,
 };
 
 /// Re-exports of the P2P types the camera apps build on.
