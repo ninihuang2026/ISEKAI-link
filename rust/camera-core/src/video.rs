@@ -1118,9 +1118,13 @@ fn install_pin(conn: &Connection, pin: AttestedPeer) {
         };
         match verdict {
             Ok(()) => {
-                tracing::debug!(
+                // Said at `info`, and once per handshake. "We are going to
+                // check" and "it held" are different facts, and only the second
+                // one is the protection — an operator who sees the first and
+                // then silence cannot tell which of them happened.
+                tracing::info!(
                     peer = %pin.peer_endpoint,
-                    "the peer presented the key it signed for",
+                    "the peer presented the key it signed for; the connection is pinned to it",
                 );
                 Ok(())
             }
