@@ -179,29 +179,36 @@ fn consent_path(app: &str) -> anyhow::Result<PathBuf> {
 }
 
 /// The per-user configuration directory, by each platform's own convention.
-fn config_dir() -> anyhow::Result<PathBuf> {
+///
+/// Shared with [`crate::paired`], so what it says when there is nowhere to
+/// write names no one caller.
+pub(crate) fn config_dir() -> anyhow::Result<PathBuf> {
     #[cfg(target_os = "windows")]
     {
         let base = std::env::var_os("APPDATA")
-            .context("APPDATA is not set, so there is nowhere to record consent")?;
+            .context("APPDATA is not set, so there is nowhere to keep settings")?;
         return Ok(Path::new(&base).join("ISEKAI link"));
     }
-    #[cfg(target_os = "macos")]
+    // iOS alongside macOS, and not with the XDG branch below: an app container's
+    // root is not writable, so `$HOME/.config` cannot even be created there —
+    // `failed to create …/.config/isekai-link: Operation not permitted (os error
+    // 1)`, seen on a device. `Library` is one of the three places that are.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
         let home = std::env::var_os("HOME")
-            .context("HOME is not set, so there is nowhere to record consent")?;
+            .context("HOME is not set, so there is nowhere to keep settings")?;
         return Ok(Path::new(&home)
             .join("Library/Application Support")
             .join("ISEKAI link"));
     }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "ios")))]
     {
         if let Some(base) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
             return Ok(Path::new(&base).join("isekai-link"));
         }
         let home = std::env::var_os("HOME").context(
             "neither XDG_CONFIG_HOME nor HOME is set, so there is nowhere to \
-                      record consent",
+                      keep settings",
         )?;
         Ok(Path::new(&home).join(".config").join("isekai-link"))
     }

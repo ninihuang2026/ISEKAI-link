@@ -35,6 +35,13 @@ pub enum ClientError {
     InvalidArgument(String),
     #[error("connect failed: {0}")]
     Connect(String),
+    /// The camera answered as an Endpoint other than the one it was paired as.
+    ///
+    /// Apart from [`Self::Connect`] because it is not a transient failure and
+    /// retrying it is wrong: it says the introduction changed, and it will say
+    /// so again every time until the pairing is redone.
+    #[error("{0}")]
+    WrongPeer(String),
     #[error("runtime error: {0}")]
     Runtime(String),
 }
@@ -65,6 +72,13 @@ pub struct ClientConfig {
     pub capability: String,
     /// The camera to reach, from [`list_cameras`] or typed in by hand.
     pub listener_id: String,
+    /// The Endpoint that camera is expected to be, from [`list_cameras`].
+    ///
+    /// Checked against the Endpoint the proxy answers with, but only when this
+    /// device paired with it — see [`camera_core::paired`]. Empty for a camera
+    /// reached by a hand-carried capability, which brings no pairing to check
+    /// against.
+    pub expected_endpoint: String,
     /// Register the Endpoint with the Identity API before issuing a token.
     pub register: bool,
     /// **Dev only** — accept self-signed proxy/Identity certificates. Never true
@@ -80,6 +94,10 @@ pub struct ClientConfig {
     pub enable_migration: bool,
     /// Log filter for the Rust core, in `RUST_LOG` syntax — e.g.
     /// `camera_core=debug,isekai_p2p_core=debug`. Empty disables logging.
+    ///
+    /// This crate's own records are added at `info` unless the filter names it,
+    /// because what says whether the pairing check ran and whether the key was
+    /// pinned comes from here — see [`with_own_records`].
     ///
     /// Records go to [`FrameSink::on_log`]. A phone has no console to read
     /// `RUST_LOG` on, so this is the only way to see what the core is doing.
@@ -401,6 +419,23 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SinkWriter {
     }
 }
 
+/// This crate's own records, added to a filter that does not mention it.
+///
+/// What says whether the pairing check ran and whether the peer's key was
+/// pinned is emitted from here, while the equivalent on the desktop comes from
+/// `camera_client` — so a filter carried over from there, or the example in
+/// [`ClientConfig::log_filter`], leaves exactly the two lines worth reading
+/// invisible, and a connection with no protection looks like one with it.
+///
+/// A filter that names this crate is left alone: someone who asked for
+/// `isekai_client_ffi=warn` meant it.
+fn with_own_records(filter: &str) -> String {
+    if filter.contains("isekai_client_ffi") {
+        return filter.to_owned();
+    }
+    format!("{filter},isekai_client_ffi=info")
+}
+
 /// Point the core's logging at `sink`, installing the subscriber on first use.
 ///
 /// The filter cannot be changed afterwards — `tracing` allows one global
@@ -410,6 +445,7 @@ fn install_logging(filter: &str, sink: &Arc<dyn FrameSink>) {
     if filter.is_empty() {
         return;
     }
+    let filter = &with_own_records(filter);
     *LOG_SINK.lock().expect("log sink mutex poisoned") = Some(Arc::clone(sink));
     LOG_INIT.call_once(|| {
         use tracing_subscriber::layer::SubscriberExt as _;
@@ -437,7 +473,8 @@ fn install_logging(filter: &str, sink: &Arc<dyn FrameSink>) {
         }
     });
     // Runs on every connect, so a filter changed in the app takes effect on the
-    // next one rather than needing the app restarted.
+    // next one rather than needing the app restarted. Through the same addition,
+    // or editing the field would be a way to switch those records back off.
     if let Some(reload) = LOG_FILTER
         .lock()
         .expect("log filter mutex poisoned")
@@ -493,6 +530,14 @@ pub struct Paired {
     pub owner_endpoint: String,
     /// Everything reachable as of the pairing, this one included.
     pub cameras: Vec<Camera>,
+    /// Why the Endpoint could not be written down, when it could not be.
+    ///
+    /// Pairing still succeeded — the grant stands — but every later connection
+    /// to this camera will report itself unchecked, so the reason has to reach
+    /// somebody. It cannot do that through the log: [`install_logging`] runs on
+    /// connect, so at pairing time there may be no subscriber at all, and on a
+    /// phone there is no console behind it either.
+    pub not_remembered: Option<String>,
 }
 
 /// Turn on dev-only certificate acceptance, at most once in a process.
@@ -615,6 +660,21 @@ pub fn pair_with_code(
             .pair(&code, label.as_deref())
             .await
             .map_err(|e| ClientError::Connect(format!("{e:#}")))?;
+        // Pairing is the one moment an Endpoint ID arrives from outside the
+        // proxy — it was read off the camera and typed in here. Remembered now
+        // because there is no later chance to learn it the same way.
+        //
+        // A device that cannot write the list still pairs: refusing would turn
+        // a check that was not there yesterday into a reason pairing fails.
+        let not_remembered = camera_core::paired::remember(&grant.owner_endpoint)
+            .err()
+            .map(|e| {
+                tracing::warn!(
+                    "paired, but could not remember which Endpoint: {e:#}; later \
+                     connections to this camera cannot be checked against it",
+                );
+                format!("{e:#}")
+            });
         // The grant names the Endpoint, not a listener, so the camera to offer
         // comes from reading the list back — which is also where its name is,
         // and which the caller wants anyway.
@@ -633,6 +693,7 @@ pub fn pair_with_code(
                 .cloned(),
             owner_endpoint: grant.owner_endpoint,
             cameras,
+            not_remembered,
         })
     })
 }
@@ -778,6 +839,31 @@ pub fn connect(
         })
         .map_err(|e| ClientError::Connect(format!("{e:#}")))?;
 
+    // Who answered, against who was meant. The pin below proves the peer holds
+    // the key its Endpoint signed for; this is what says that Endpoint is the
+    // camera the user paired with, and the proxy names both.
+    match camera_core::paired::check(
+        &config.expected_endpoint,
+        session.connection.peer_endpoint.as_deref(),
+    ) {
+        // Said either way. A connection that was held against a pairing and one
+        // that had nothing to be held against both go on to stream, and only
+        // one of them is protected.
+        Ok(outcome @ camera_core::paired::Checked::AgainstPairing) => {
+            tracing::info!(peer = %config.expected_endpoint, "{outcome}")
+        }
+        Ok(outcome) => tracing::info!("{outcome}"),
+        Err(e) => {
+            // Tell the proxy the connection is over before returning. The task
+            // that owns the only other `close` is not spawned yet, and dropping
+            // the session does not close it — so the camera would go on holding
+            // a relay
+            // leg for a viewer that has already refused it, on every retry.
+            runtime.block_on(session.close());
+            return Err(ClientError::WrongPeer(e.to_string()));
+        }
+    }
+
     let connection_id = session.connection_id().to_owned();
     let video_port = session.local_addr.port();
     // Dial the per-endpoint relay FQDN with validation when the proxy issued a
@@ -903,6 +989,25 @@ mod tests {
 
     fn loopback(port: u16) -> SocketAddr {
         SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    /// The example filter in the field's own documentation hides this crate,
+    /// which is where the pairing check and the pin report themselves.
+    #[test]
+    fn a_filter_that_does_not_mention_this_crate_gains_its_records() {
+        assert_eq!(
+            with_own_records("camera_core=debug,isekai_p2p_core=debug"),
+            "camera_core=debug,isekai_p2p_core=debug,isekai_client_ffi=info",
+        );
+    }
+
+    /// Someone who asked for less than `info` from here meant it.
+    #[test]
+    fn a_filter_that_mentions_this_crate_is_left_alone() {
+        assert_eq!(
+            with_own_records("isekai_client_ffi=warn"),
+            "isekai_client_ffi=warn",
+        );
     }
 
     /// Nothing to offer until both paths are known, so the button stays inert

@@ -95,6 +95,7 @@ final class ViewerModel: ObservableObject {
                 // a selection that is not on the list.
                 if !found.contains(where: { $0.listenerId == model.settings.listenerID }) {
                     model.settings.listenerID = ""
+                    model.settings.expectedEndpoint = ""
                     model.settings.save()
                 }
             }
@@ -118,28 +119,51 @@ final class ViewerModel: ObservableObject {
             )
             return { model in
                 model.cameras = paired.cameras
+                // Pairing worked and the grant stands either way, but if
+                // nothing was written down then every later connection to this
+                // camera reports itself unchecked — and this is the only place
+                // that can say why, so it is carried onto whatever is shown.
+                let unchecked = paired.notRemembered.map {
+                    " This device could not remember which Endpoint (\($0)), so connections "
+                    + "to it cannot be checked against the pairing."
+                } ?? ""
                 guard let camera = paired.camera else {
                     // Paired with a camera that is not running. The code is
                     // spent and the grant stands; it appears here when it is
                     // next up. Saying "failed" would invite trying the code
                     // again, and a code works once.
                     model.cameraStatus = "Paired with \(paired.ownerEndpoint), which is not "
-                        + "running right now. It will appear here when it is."
+                        + "running right now. It will appear here when it is." + unchecked
                     return
                 }
-                model.cameraStatus = "Paired with \(camera.label)."
+                model.cameraStatus = "Paired with \(camera.label)." + unchecked
                 // Select it, and clear any capability: a grant is what
                 // authorizes this now, and a stale capability would be carried
                 // instead of it.
                 model.settings.listenerID = camera.listenerId
+                model.settings.expectedEndpoint = camera.ownerEndpoint
                 model.settings.capability = ""
                 model.settings.save()
             }
         }
     }
 
+    /// A listener typed in by hand, which is not the camera that was picked
+    /// from the list.
+    ///
+    /// The Endpoint that came with that pick no longer describes it, and left
+    /// standing it would refuse a perfectly good hand-carried connection while
+    /// naming a camera the user is not asking for.
+    func enterListenerByHand(_ id: String) {
+        settings.listenerID = id
+        settings.expectedEndpoint = ""
+    }
+
     func select(camera: Camera) {
         settings.listenerID = camera.listenerId
+        // Which Endpoint that listener is said to belong to, kept so connecting
+        // can hold the proxy's answer against it.
+        settings.expectedEndpoint = camera.ownerEndpoint
         settings.capability = ""
         settings.save()
     }
@@ -282,6 +306,7 @@ final class ViewerModel: ObservableObject {
             protocol: settings.protocolName.trimmed,
             capability: settings.capability.trimmed,
             listenerId: settings.listenerID.trimmed,
+            expectedEndpoint: settings.expectedEndpoint.trimmed,
             register: settings.register,
             insecureSkipVerify: settings.insecureSkipVerify,
             enableMigration: settings.enableMigration,
