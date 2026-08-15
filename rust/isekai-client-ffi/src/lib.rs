@@ -782,6 +782,13 @@ pub fn connect(
     let video_port = session.local_addr.port();
     // Dial the per-endpoint relay FQDN with validation when the proxy issued a
     // relay certificate; otherwise fall back to 127.0.0.1 unvalidated (dev).
+    let pin = camera_core::AttestedPeer::from_connection(&session.connection);
+    if pin.is_none() {
+        tracing::info!(
+            "the peer published no statement about its key; \
+             trusting the proxy about which certificate is right",
+        );
+    }
     let (video_host, verify) = match session.video_host() {
         Some(host) => (host.to_string(), true),
         None => ("127.0.0.1".to_string(), false),
@@ -810,6 +817,7 @@ pub fn connect(
             VideoRecvOptions {
                 registration: Some(recv_registration),
                 verify,
+                pin,
                 observed,
                 path_events: Some(path_tx),
                 migrate: Some(migrate_rx),

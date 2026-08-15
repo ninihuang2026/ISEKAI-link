@@ -369,6 +369,8 @@ async fn role_client_prod(reg: &Arc<Registration>) -> anyhow::Result<String> {
             frame_tx,
             recv_shutdown,
             camera_core::VideoRecvOptions {
+                // A harness dialling a synthetic server, which signs for nothing.
+                pin: None,
                 registration: Some(recv_reg),
                 verify: false,
                 observed: Some(observed_rx),

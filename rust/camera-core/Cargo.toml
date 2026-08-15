@@ -21,6 +21,7 @@ rcgen = { workspace = true }
 # the PKCS#12 blob Windows loads credentials from (`tls`).
 base64 = { workspace = true }
 sha2 = { workspace = true }
+x509-parser = { workspace = true }
 # The privacy policy and the record of agreeing to it (`privacy`).
 serde = { workspace = true }
 serde_json = { workspace = true }
