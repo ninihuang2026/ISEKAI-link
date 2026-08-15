@@ -593,17 +593,19 @@ impl MyApp {
             // What the peer signed about its own key, if it has said anything.
             // Absent is ordinary and changes nothing; present means the
             // handshake has to produce that key (§8.6.5).
-            let pin = camera_core::AttestedPeer::from_connection(&session.connection);
-            match &pin {
-                Some(pin) => tracing::info!(
-                    peer = %pin.peer_endpoint,
-                    "the peer signed for its video key; the handshake has to present it",
-                ),
-                None => tracing::info!(
-                    "the peer published no statement about its key; \
-                     trusting the proxy about which certificate is right",
-                ),
-            }
+            let pin = match camera_core::AttestedPeer::from_connection(&session.connection) {
+                Ok(pin) => {
+                    tracing::info!(
+                        peer = %pin.peer_endpoint,
+                        "the peer signed for its video key; the handshake has to present it",
+                    );
+                    Some(pin)
+                }
+                Err(why) => {
+                    tracing::info!("{why}");
+                    None
+                }
+            };
             {
                 let mut s = shared.lock().unwrap();
                 s.connection_id = Some(session.connection_id().to_string());
