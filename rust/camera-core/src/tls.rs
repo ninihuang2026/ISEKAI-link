@@ -49,9 +49,14 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::Context as _;
-use isekai_p2p::agent::{IssuedCertificate, MasqueH3Transport, ProxyClient, ProxyError};
+use isekai_p2p::agent::{
+    attest, Attestation, CertificateParameters, EndpointKey, IssuedCertificate, MasqueH3Transport,
+    ProxyClient, ProxyError,
+};
 use isekai_p2p::secret::write_secret;
 use rcgen::{CertificateParams, KeyPair};
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
 
 /// What the video listener needs to present a certificate: the chain the proxy
 /// issued, and the key this device kept.
@@ -88,6 +93,7 @@ pub struct VideoCert {
 /// as it did before any of this existed.
 pub async fn issue_video_cert(
     proxy: &ProxyClient<MasqueH3Transport>,
+    endpoint_key: &EndpointKey,
     key: &KeyPair,
 ) -> anyhow::Result<Option<VideoCert>> {
     let Some(params) = proxy.certificate_parameters().await? else {
@@ -133,7 +139,34 @@ pub async fn issue_video_cert(
     }
 
     let csr = certificate_request(key, &params.hostname)?;
-    let Some(issued) = issue_with_retries(proxy, &csr).await? else {
+
+    // Say, in this Endpoint's own hand, which key the certificate is for.
+    //
+    // **This is what the proxy cannot forge.** It can obtain a second valid
+    // certificate for the same name — it owns the name and the ACME account —
+    // but it cannot sign as this Endpoint, so an initiator that checks this
+    // statement and then pins the key it names is talking to this device or to
+    // nobody (spec §8.6.5).
+    //
+    // Published on the issuance request, so a certificate and the statement
+    // about it are settled together and a cached re-issue carries a fresh one.
+    // Optional, and ignored by a proxy that does not know the field, so sending
+    // it costs nothing where it is not yet understood.
+    //
+    // The expiry is this side's to choose — it is one of the signed lines, so
+    // nothing downstream can shorten it without breaking the signature, and the
+    // proxy checks only that it is in the future. Deliberately *not* the
+    // `not_after` of whatever certificate the proxy happens to be holding: that
+    // is the expiry of the certificate being replaced, so on every renewal the
+    // statement would expire with the old one, and on a camera that has been
+    // off past it the statement would arrive already expired and be refused
+    // before the CA was even asked.
+    let expires_at = (OffsetDateTime::now_utc() + ATTESTATION_LIFETIME)
+        .format(&Rfc3339)
+        .context("failed to format the attestation's expiry")?;
+    let attestation = attest(endpoint_key, &params.hostname, &local, &expires_at);
+
+    let Some(issued) = issue_with_retries(proxy, &csr, Some(&attestation)).await? else {
         // `parameters` answered and this did not. They arrived in the same
         // change, so this is not a version this proxy can be — something is
         // answering for the route that should be issuing.
@@ -143,6 +176,16 @@ pub async fn issue_video_cert(
     // Checked rather than trusted. A certificate for a different key is one
     // this listener cannot present, and finding that out at the TLS handshake
     // would say nothing about why.
+    // Signed over `params.hostname`, presented as `issued.hostname`. They are
+    // the same name in every case the proxy produces, and if they ever were not
+    // the statement would fail to verify at every initiator — which reads as an
+    // attack rather than as the disagreement it is.
+    anyhow::ensure!(
+        issued.hostname == params.hostname,
+        "the proxy issued a certificate for {}, but the statement is about {}",
+        issued.hostname,
+        params.hostname,
+    );
     anyhow::ensure!(
         issued.spki_sha256 == local,
         "the proxy issued a certificate for another key (issued {}, local {})",
@@ -156,6 +199,15 @@ pub async fn issue_video_cert(
     );
     video_cert(&issued.hostname, &issued.cert_pem, key).map(Some)
 }
+
+/// How long a statement stands.
+///
+/// It bounds the *statement*, not the certificate. What is vouched for is a
+/// key, and the key is reused across issuances, so a statement outliving any
+/// one certificate is not a statement about something that stopped being true.
+/// A fresh one goes out with every issuance, so this only has to outlast the
+/// gap between them.
+const ATTESTATION_LIFETIME: time::Duration = time::Duration::days(90);
 
 /// How long to wait between attempts when the proxy says to come back.
 ///
@@ -183,10 +235,11 @@ const ISSUANCE_RETRY_DELAYS: [Duration; 3] = [
 async fn issue_with_retries(
     proxy: &ProxyClient<MasqueH3Transport>,
     csr: &str,
+    attestation: Option<&Attestation>,
 ) -> Result<Option<IssuedCertificate>, ProxyError> {
     let mut delays = ISSUANCE_RETRY_DELAYS.iter();
     loop {
-        let error = match proxy.issue_certificate(csr).await {
+        let error = match proxy.issue_certificate(csr, attestation).await {
             Ok(issued) => return Ok(issued),
             Err(e) => e,
         };
