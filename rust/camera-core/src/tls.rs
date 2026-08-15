@@ -50,8 +50,7 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use isekai_p2p::agent::{
-    attest, Attestation, CertificateParameters, EndpointKey, IssuedCertificate, MasqueH3Transport,
-    ProxyClient, ProxyError,
+    attest, Attestation, EndpointKey, IssuedCertificate, MasqueH3Transport, ProxyClient, ProxyError,
 };
 use isekai_p2p::secret::write_secret;
 use rcgen::{CertificateParams, KeyPair};
