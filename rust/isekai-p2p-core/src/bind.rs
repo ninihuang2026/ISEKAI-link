@@ -292,6 +292,16 @@ impl ConnectRelay {
         self.observed.clone()
     }
 
+    /// The token that winds this leg down, for a holder that has to end the
+    /// session from somewhere else.
+    ///
+    /// Cancelling it is the local half of a teardown: the leg stops, the video
+    /// connection riding it fails, and the application sees the session end.
+    /// [`close`](Self::close) does the same and then waits.
+    pub fn shutdown_token(&self) -> CancellationToken {
+        self.shutdown.clone()
+    }
+
     /// Cancel the relay and wait for it to wind down.
     pub async fn close(mut self) {
         self.shutdown.cancel();
