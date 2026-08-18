@@ -1461,7 +1461,23 @@ fn video_client_config(
         settings
     };
     let config = reg.open_configuration(&alpn, Some(&settings))?;
-    let mut cred = msquic::CredentialConfig::new_client();
+    // Same fix as `isekai_p2p_core::transport::make_client_config`: without
+    // `USE_TLS_BUILTIN_CERTIFICATE_VALIDATION`, msquic's OpenSSL/quictls
+    // backend never calls `SSL_CTX_set_default_verify_paths()`
+    // (`tls_quictls.c`), so `SSL_VERIFY_PEER` -- requested unconditionally for
+    // clients -- is checked against an empty trust store and every real
+    // certificate fails. This is the video connection's *own*, independent
+    // `CredentialConfig` (a separate QUIC connection from the control/relay
+    // one `transport.rs` covers), so it needed the identical fix, not just a
+    // shared one: fixing `transport.rs` alone left this connection's non-
+    // insecure path unable to complete a real handshake.
+    let mut cred = msquic::CredentialConfig::new_client().set_credential_flags(
+        msquic::CredentialFlags::CLIENT
+            | msquic::CredentialFlags::USE_TLS_BUILTIN_CERTIFICATE_VALIDATION,
+    );
+    if let Ok(ca_file) = std::env::var("SSL_CERT_FILE") {
+        cred = cred.set_ca_certificate_file(ca_file);
+    }
     // The same dev-only opt-in the proxy and Identity connections honour
     // (`isekai_p2p_core::transport`), which this one ignored — so the one switch
     // an operator has did not cover the one connection that carries the video.

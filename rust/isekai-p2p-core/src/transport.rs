@@ -362,7 +362,29 @@ pub(crate) fn make_client_config(
                 .set_ReceiveObservedAddressReports(),
         ),
     )?;
-    let mut credential = msquic::CredentialConfig::new_client();
+    // `USE_TLS_BUILTIN_CERTIFICATE_VALIDATION` is what makes msquic's OpenSSL/
+    // quictls backend call `SSL_CTX_set_default_verify_paths()` at all
+    // (`tls_quictls.c`) -- without it, `SSL_CTX_set_verify(SSL_VERIFY_PEER)`
+    // is still requested for the client, but against an empty trust store, so
+    // every real certificate fails and the connection drops. Not gated on any
+    // platform; this was previously never set at all, so a non-insecure
+    // connection could not succeed anywhere, not just on Android.
+    let mut credential = msquic::CredentialConfig::new_client().set_credential_flags(
+        msquic::CredentialFlags::CLIENT
+            | msquic::CredentialFlags::USE_TLS_BUILTIN_CERTIFICATE_VALIDATION,
+    );
+    // Belt and suspenders alongside USE_TLS_BUILTIN_CERTIFICATE_VALIDATION
+    // above: that flag only makes tls_quictls.c call
+    // `SSL_CTX_set_default_verify_paths()`, which *should* honor
+    // `SSL_CERT_FILE`/`SSL_CERT_DIR` per normal OpenSSL behaviour, but
+    // whether it actually does depends on details of this exact quictls
+    // build/platform this project has not independently verified. Setting
+    // `CaCertificateFile` explicitly instead drives
+    // `SSL_CTX_load_verify_locations()` directly -- unambiguous, and not
+    // dependent on default-path env var lookup working as documented.
+    if let Ok(ca_file) = std::env::var("SSL_CERT_FILE") {
+        credential = credential.set_ca_certificate_file(ca_file);
+    }
     // Dev/testing only: accept a self-signed proxy certificate when the operator
     // explicitly opts in via `ISEKAI_INSECURE_SKIP_VERIFY`. Never set in prod.
     if std::env::var_os("ISEKAI_INSECURE_SKIP_VERIFY").is_some() {
