@@ -1,0 +1,108 @@
+name: Android client
+
+# The Android viewer and the Rust core underneath it. Neither half is built by
+# any other job: `camera-apps.yml` builds the desktop apps and `ios-ffi.yml` the
+# Apple ones, so without this the first thing to notice a broken Android build
+# is a person.
+#
+# Two jobs, split by what they need. `bindings` needs only a host toolchain and
+# proves the Kotlin bindings still generate from the Rust interface — the check
+# that replaces having them committed. `app` adds the NDK, cross-compiles the
+# core and assembles the APK, and is the slower half.
+
+on:
+  push:
+    paths:
+      - 'rust/isekai-client-ffi/**'
+      - 'rust/camera-core/**'
+      - 'rust/Cargo.toml'
+      - '.cargo/config.toml'
+      - 'android/**'
+      - 'submodules/msquic-async-rs'
+      - '.github/workflows/android.yml'
+  pull_request:
+    paths:
+      - 'rust/isekai-client-ffi/**'
+      - 'rust/camera-core/**'
+      - 'rust/Cargo.toml'
+      - '.cargo/config.toml'
+      - 'android/**'
+      - 'submodules/msquic-async-rs'
+      - '.github/workflows/android.yml'
+  workflow_dispatch:
+
+jobs:
+  bindings:
+    name: Generate the Kotlin bindings
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Prepare machine for seera-msquic
+        run: scripts/prepare-machine.ps1 -Tls openssl -ForBuild
+        shell: pwsh
+        working-directory: submodules/msquic-async-rs/seera-msquic
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build isekai-client-ffi (host)
+        run: cargo build -p isekai-client-ffi
+      # The same shape as the Swift half in ios-ffi.yml: the interface is read
+      # out of a built library, so what is published cannot disagree with what
+      # the crate exposes.
+      - name: Generate the bindings from the built library
+        run: |
+          set -euo pipefail
+          LIB=$(ls target/debug/libisekai_client_ffi.so)
+          ./target/debug/uniffi-bindgen generate \
+            --library "$LIB" --language kotlin --out-dir target/kotlin-bindings
+          ls -R target/kotlin-bindings
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kotlin-bindings
+          path: rust/target/kotlin-bindings/
+
+  app:
+    name: Build the app
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      # Deliberately not installing one: the runner ships an NDK and points
+      # ANDROID_NDK_ROOT at it, so adding a second leaves cargo-ndk compiling
+      # with one while quictls configures against the other -- which it says
+      # out loud and then fails obscurely. The API level the build rests on is
+      # `ANDROID_PLATFORM=android-29` in seera-msquic's build script, not the
+      # NDK version.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+      # No `env:` mapping for the NDK on purpose. The `env` context only holds
+      # what a workflow defines, so `${{ env.ANDROID_NDK_ROOT }}` is empty and
+      # sets ANDROID_NDK_HOME to nothing — which cargo-ndk reports as "Error
+      # detecting NDK version for path ". The runner exports ANDROID_NDK_ROOT
+      # into the process environment, where cargo-ndk and seera-msquic's build
+      # script both find it.
+      - name: Cross-compile the core
+        run: ./gradlew --no-daemon :app:generateJniLibs
+        working-directory: android
+      # Assembling runs `generateUniFfiBindings` on the way, so a Kotlin file
+      # that no longer matches the Rust interface fails here rather than on a
+      # phone.
+      - name: Assemble
+        run: ./gradlew --no-daemon assembleDebug
+        working-directory: android
+      - uses: actions/upload-artifact@v4
+        with:
+          name: IsekaiCameraClient-debug-apk
+          path: android/app/build/outputs/apk/debug/*.apk

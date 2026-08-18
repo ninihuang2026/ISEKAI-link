@@ -362,7 +362,38 @@ pub(crate) fn make_client_config(
                 .set_ReceiveObservedAddressReports(),
         ),
     )?;
+    // **`USE_TLS_BUILTIN_CERTIFICATE_VALIDATION` is deliberately not set here.**
+    // It was, briefly, and it is wrong on three of the four platforms:
+    //
+    // * Windows builds msquic with schannel (`CMakeLists.txt`), and
+    //   `tls_schannel.c` answers `QUIC_STATUS_INVALID_PARAMETER` to any
+    //   credential carrying this flag -- so `load_credential` fails and *every*
+    //   client connection stops being possible, insecure escape hatch included.
+    // * Linux and Android are `CX_PLATFORM_LINUX`, where `tls_quictls.c` ORs
+    //   the flag in itself. Setting it changes nothing.
+    // * Darwin is the one platform where it does something, and what it does is
+    //   a regression: it replaces msquic's `CxPlatCertVerifyRawCertificate`
+    //   (SecTrust, with the dialed name) with a bare `X509_verify_cert` against
+    //   `SSL_CTX_set_default_verify_paths()` -- an empty store on iOS.
+    //
+    // What Android actually needed is below: a CA file, because it has no
+    // system PEM for the default paths to find.
     let mut credential = msquic::CredentialConfig::new_client();
+    // Android ships no system PEM file, so the default verify paths find
+    // nothing; the app copies a bundle out of its assets and points
+    // `SSL_CERT_FILE` at it. Setting `CaCertificateFile` drives
+    // `SSL_CTX_load_verify_locations()` directly rather than depending on the
+    // environment variable being honoured by this quictls build.
+    //
+    // An unset variable leaves the platform's own defaults alone, which is what
+    // every other platform wants. An empty one is ignored rather than passed
+    // on: `load_verify_locations` failing is fatal to the whole credential.
+    if let Some(ca_file) = std::env::var("SSL_CERT_FILE")
+        .ok()
+        .filter(|p| !p.is_empty())
+    {
+        credential = credential.set_ca_certificate_file(ca_file);
+    }
     // Dev/testing only: accept a self-signed proxy certificate when the operator
     // explicitly opts in via `ISEKAI_INSECURE_SKIP_VERIFY`. Never set in prod.
     if std::env::var_os("ISEKAI_INSECURE_SKIP_VERIFY").is_some() {
