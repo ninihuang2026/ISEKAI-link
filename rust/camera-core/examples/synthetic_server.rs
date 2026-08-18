@@ -12,9 +12,16 @@
 //! ```text
 //! hello                  -> ok listener=… endpoint=… identity=… proxy=… protocol=… insecure=… token=…
 //! issue <endpoint_id>    -> ok capability=…
+//! pair                   -> ok code=…
 //! bind <connection_id>   -> ok
 //! quit                   -> ok
 //! ```
+//!
+//! `pair` mints a real pairing code via the proxy's grant flow
+//! (`ServerCommand::ShowPairingCode`) — the currently-supported way to
+//! authorize a viewer, now that a bare `issue`-minted capability alone is no
+//! longer honoured by `POST /v1/peer/connect` (`grant-invalid`). Redeem it
+//! through the viewer's own real `pair_with_code`, the same as scanning a QR.
 //!
 //! `hello` hands out the Auth0 token so an automated client needs no
 //! configuration of its own beyond the port. That is only tolerable because the
@@ -106,6 +113,10 @@ impl Control {
                 },
                 None => "err usage: issue <endpoint_id>".to_owned(),
             },
+            Some("pair") => match self.pair().await {
+                Ok(code) => format!("ok code={code}"),
+                Err(e) => format!("err {e:#}"),
+            },
             Some("bind") => match parts.next() {
                 Some(connection) => match self.bind(connection).await {
                     Ok(()) => "ok".to_owned(),
@@ -132,6 +143,15 @@ impl Control {
             .await
             .map_err(|_| anyhow::anyhow!("server stopped"))?;
         rx.await?
+    }
+
+    async fn pair(&self) -> anyhow::Result<String> {
+        let (reply, rx) = oneshot::channel();
+        self.commands
+            .send(ServerCommand::ShowPairingCode { ttl: None, reply })
+            .await
+            .map_err(|_| anyhow::anyhow!("server stopped"))?;
+        rx.await?.map(|code| code.code)
     }
 
     async fn bind(&self, connection_id: &str) -> anyhow::Result<()> {
