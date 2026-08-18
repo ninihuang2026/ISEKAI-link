@@ -52,21 +52,30 @@ val generateJniLibs by tasks.registering(Exec::class) {
     group = "build"
     description = "Cross-compile isekai-client-ffi into app/src/main/jniLibs"
     workingDir = rustDir
+    val jniLibsDir = file("src/main/jniLibs")
+    // msquic builds as a shared object on Android (seera-msquic's `static`
+    // feature panics on this target -- it was never wired up for it, unlike
+    // the static .a iOS's build-rust.sh folds into its archive). cargo-ndk
+    // only copies isekai-client-ffi's own .so into jniLibs, not the
+    // libmsquic.so it dynamically depends on, so the app installed but died
+    // on first launch: "dlopen failed: library libmsquic.so not found".
+    // Copy it alongside by hand instead of trying to avoid needing it.
     commandLine(
-        "cargo", "ndk",
-        "-t", "arm64-v8a",
-        // The same API level as `minSdk` above, and as the `ANDROID_PLATFORM`
-        // seera-msquic's build script passes to CMake. cargo-ndk defaults to
-        // 21, which puts `--target=aarch64-linux-android21` in the CFLAGS
-        // CMake inherits — and msquic's selfsign_openssl.c calls `glob()`,
-        // which bionic only declares from 28. The two halves of the same
-        // native build have to agree on this number.
-        //
-        // Spelled out: `-p` is cargo's `--package`, and cargo-ndk passes it
-        // straight through ("unknown package: 29").
-        "--platform", "29",
-        "-o", file("src/main/jniLibs").absolutePath,
-        "build", "-p", "isekai-client-ffi",
+        "sh", "-c",
+        listOf(
+            "set -eu",
+            // `--platform 29` matches `minSdk` above and the `ANDROID_PLATFORM`
+            // seera-msquic's build script passes to CMake. cargo-ndk defaults
+            // to 21, which puts `--target=aarch64-linux-android21` in the
+            // CFLAGS CMake inherits -- and msquic's selfsign_openssl.c calls
+            // `glob()`, which bionic only declares from 28. The two halves of
+            // the same native build have to agree on this number.
+            "cargo ndk -t arm64-v8a --platform 29 -o '${jniLibsDir.absolutePath}' " +
+                "build -p isekai-client-ffi",
+            "MSQUIC_LIB=\$(find target/aarch64-linux-android -path '*/out/lib/libmsquic.so' | head -1)",
+            "test -n \"\$MSQUIC_LIB\"",
+            "cp \"\$MSQUIC_LIB\" '${jniLibsDir.absolutePath}/arm64-v8a/'",
+        ).joinToString("\n"),
     )
 }
 
