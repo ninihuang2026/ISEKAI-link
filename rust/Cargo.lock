@@ -4374,6 +4374,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "portal-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "isekai-link-utils",
+ "msquic-async",
+ "portal-core",
+ "rcgen",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "potential_utf"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
