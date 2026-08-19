@@ -47,6 +47,8 @@ data class ViewerUiState(
     val endpointId: String = "",
     val frame: Bitmap? = null,
     val frameCount: Int = 0,
+    /** Which route the video is taking, and whether it could take another. */
+    val paths: PathStatus? = null,
     val errorMessage: String? = null,
 ) {
     val statusText: String
@@ -445,7 +447,23 @@ class ViewerModel(application: Application) : AndroidViewModel(application) {
         sessionGeneration++
         session?.disconnect()
         session = null
-        _uiState.value = _uiState.value.copy(phase = Phase.CLOSED, statusDetail = "")
+        _uiState.value = _uiState.value.copy(phase = Phase.CLOSED, statusDetail = "", paths = null)
+    }
+
+    /**
+     * Switch between the Isekai Link relay and a direct path. Mirrors iOS's
+     * `ViewerModel.migrate()`.
+     *
+     * The switch is asynchronous -- `uiState.paths` updates when the
+     * connection reports it (see [ModelFrameSink.onPath]), not here -- and if
+     * the new path turns out to carry nothing the core returns to the relay
+     * by itself after a few seconds.
+     */
+    fun migrate() {
+        val current = session ?: return
+        if (!current.migrate()) {
+            _uiState.value = _uiState.value.copy(errorMessage = "No direct path is available yet.")
+        }
     }
 
     /**
@@ -468,7 +486,11 @@ class ViewerModel(application: Application) : AndroidViewModel(application) {
         session?.disconnect()
         session = null
         _uiState.value =
-            _uiState.value.copy(phase = Phase.CLOSED, statusDetail = "Paused in background")
+            _uiState.value.copy(
+                phase = Phase.CLOSED,
+                statusDetail = "Paused in background",
+                paths = null,
+            )
     }
 
     private fun resumeFromForeground() {
@@ -483,7 +505,12 @@ class ViewerModel(application: Application) : AndroidViewModel(application) {
     ) {
         session = null
         _uiState.value =
-            _uiState.value.copy(phase = Phase.FAILED, errorMessage = message, statusDetail = message)
+            _uiState.value.copy(
+                phase = Phase.FAILED,
+                errorMessage = message,
+                statusDetail = message,
+                paths = null,
+            )
         if (retryable) scheduleReconnect()
     }
 
@@ -500,6 +527,7 @@ class ViewerModel(application: Application) : AndroidViewModel(application) {
                 ConnectionState.CLOSED -> Phase.CLOSED
                 ConnectionState.FAILED -> Phase.FAILED
             }
+        val terminal = state == ConnectionState.CLOSED || state == ConnectionState.FAILED
         val current = _uiState.value
         _uiState.value =
             current.copy(
@@ -507,6 +535,10 @@ class ViewerModel(application: Application) : AndroidViewModel(application) {
                 statusDetail = detail,
                 connectionId = if (state == ConnectionState.CONNECTED && detail.isNotEmpty()) detail else current.connectionId,
                 errorMessage = if (state == ConnectionState.FAILED) detail else current.errorMessage,
+                // The paths a session reported are that session's, not a
+                // fact about the camera in general -- the next real
+                // connection is what gets to say what they are next.
+                paths = if (terminal) null else current.paths,
             )
         // A connection healthy enough to reach here proves the backoff no
         // longer applies.
@@ -517,7 +549,7 @@ class ViewerModel(application: Application) : AndroidViewModel(application) {
         // disconnect() -- leaves `session` pointing at a dead session unless
         // cleared here, which would otherwise permanently block every future
         // connect() via its `session != null` guard.
-        if (state == ConnectionState.CLOSED || state == ConnectionState.FAILED) {
+        if (terminal) {
             session = null
             scheduleReconnect()
         }
@@ -592,7 +624,8 @@ class ViewerModel(application: Application) : AndroidViewModel(application) {
         }
 
         override fun onPath(status: PathStatus) {
-            // Not surfaced in the UI yet -- task 7 territory (migration).
+            if (!isCurrent()) return
+            _uiState.value = _uiState.value.copy(paths = status)
         }
 
         override fun onRtt(rttMs: Double) {

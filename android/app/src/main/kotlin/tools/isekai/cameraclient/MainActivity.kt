@@ -40,6 +40,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
+import uniffi.isekai_client_ffi.PathInfo
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -157,6 +158,19 @@ private fun ViewerScreen(model: ViewerModel = viewModel()) {
         if (uiState.connectionId.isNotEmpty()) {
             Text("Connection ID: ${uiState.connectionId}", style = MaterialTheme.typography.bodySmall)
         }
+
+        // --- Path (relay vs. direct) --------------------------------------
+        // Both entries are live once both are known; `onRelay` says where the
+        // traffic actually is, not just which paths exist. Mirrors iOS's
+        // `streamSection` path rows and its "Switch to..." button.
+        uiState.paths?.let { paths ->
+            PathRow(label = "Isekai Link", path = paths.relay, active = paths.onRelay)
+            PathRow(label = "Direct", path = paths.direct, active = !paths.onRelay)
+            Button(onClick = { model.migrate() }, enabled = paths.canMigrate) {
+                Text(if (paths.onRelay) "Switch to direct path" else "Switch to Isekai Link")
+            }
+        }
+
         uiState.errorMessage?.let {
             Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
         }
@@ -284,6 +298,26 @@ private fun LabeledField(
         modifier = Modifier.fillMaxWidth(),
         singleLine = true,
     )
+}
+
+/** One end-to-end route the video can take. Mirrors iOS's `PathRow`. */
+@Composable
+private fun PathRow(
+    label: String,
+    path: PathInfo?,
+    active: Boolean,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+    ) {
+        Text(if (active) "▶ $label" else label, style = MaterialTheme.typography.bodySmall)
+        Text(
+            path?.let { "${it.local} → ${it.remote}" } ?: "not available",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
 }
 
 @Composable
