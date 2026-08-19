@@ -3029,6 +3029,7 @@ dependencies = [
  "http",
  "http-body",
  "http-body-util",
+ "isekai-p2p-core",
  "rcgen",
  "schannel",
  "serde",
