@@ -20,6 +20,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import uniffi.isekai_client_ffi.Camera
 import uniffi.isekai_client_ffi.ClientConfig
 import uniffi.isekai_client_ffi.ClientException
@@ -625,7 +626,7 @@ class ViewerModel(application: Application) : AndroidViewModel(application) {
 
         override fun onPath(status: PathStatus) {
             if (!isCurrent()) return
-            _uiState.value = _uiState.value.copy(paths = status)
+            _uiState.update { it.copy(paths = status) }
         }
 
         override fun onRtt(rttMs: Double) {
