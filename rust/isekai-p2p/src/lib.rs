@@ -31,6 +31,9 @@ pub use listener::{
     AcceptPolicy, LegDirectory, ListenerSession, SignalingEvent, SignalingState,
     MAX_CONCURRENT_PEERS,
 };
+/// Holding a peer QUIC connection: the rules that are not about what it
+/// carries. See [`peer::Dialed`] and [`peer::drain_registration`].
+pub mod peer;
 
 /// Re-exports of the `isekai-p2p-core` items that appear in this crate's API.
 pub mod agent {
