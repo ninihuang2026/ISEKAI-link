@@ -200,6 +200,14 @@ peer QUIC rather than of video — which is exactly the argument for the layer:
    none of them ever ran and the test hung with nothing to say. One unbounded
    await makes every other bound decorative.
 
+**And one about the moving itself, from 1b.** The comments in these functions
+are the reasoning, so they get extracted and substituted rather than retyped.
+The one constant typed by hand in 1b went in as `from_secs(15)` where the
+original says `from_secs(10)` — a path keepalive whose whole point is that it is
+the only thing still crossing the relay leg once the video is direct, so halving
+it would have cut viewers off a connect TTL into watching. Reading the original
+back is what caught it. **1c hand-moves three more functions.**
+
 And one for the tests rather than the layer, which took three goes to get right:
 **a `Registration` dropped with any live handle blocks in `RegistrationClose`
 forever.** Every one of these hangs a test binary with no message —
@@ -286,7 +294,7 @@ having before anyone asks.
 | --- | --- | --- |
 | **0** | Spike: TCP only, one hard-coded service, no config, no UI. Proves the framing and the stream mapping | **done** — `portal-core`, loopback. Against a real proxy is phase 1, which is where the session comes from |
 | **1a** | The rules: `Dialed` and `drain_registration` into `isekai_p2p::peer`; `camera-core` and the spike onto them | **done** |
-| **1b** | `video_client_config` → the layer, ALPN as a parameter | `camera-core` unchanged in behaviour, portal builds its own connection |
+| **1b** | `video_client_config` → the layer, ALPN as a parameter | **done** — the settings and their reasoning moved verbatim; `camera-core` delegates |
 | **1c** | `dial_video`, `install_certificate_check` and `AttestedPeer` → the layer; delete `spike.rs`; portal on a real `InitiatorSession` | the camera apps still pass their tests and run on hardware, and portal forwards over a proxy |
 | **2** | The catalogue, the config file, refusals | phase 0 with a file instead of a constant |
 | **3** | UDP: datagrams, session table, idle sweep, size and queue bounds | a DNS query answers over the forward |
