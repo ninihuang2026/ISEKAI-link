@@ -267,6 +267,36 @@ Check the command-line arguments of each binary with `-- --help`:
 cargo run -p camera-server -- --help
 ```
 
+### 5a. Running `camera-server` headlessly
+
+`scripts/run-camera-server.sh` launches `camera-server` with no GUI
+interaction needed for capture to start: it picks up a previously-restored
+Auth0 sign-in and sets `CAMERA_AUTOSTART=1`, which is the same as clicking
+**Start**.
+
+**It does not open the P2P listener automatically.** That still needs a
+human to click **Open** at least once — this is deliberate, not a missing
+feature. An earlier version tried to automate that too and opened the P2P
+listener (and, combined with `CAMERA_AUTOSTART`, started publishing to
+peers) before the privacy-consent gate had ever been shown to anyone.
+`CAMERA_AUTOSTART` alone never touches the network, so it doesn't have that
+problem — requiring the click for **Open** is what keeps consent genuinely
+interactive.
+
+`scripts/camera-server.service` is a systemd unit that runs the script under
+a virtual display (`xvfb-run`), restarting it if it exits. It expects
+`camera-server` already built (`cargo build [--release] -p camera-server`
+from `rust/`) and `OPENCV_LIB_DIR` set for your machine — edit the
+`Environment=` line, and `User=`/`SupplementaryGroups=` if your setup
+differs from a single desktop user in the `video` group. Install and enable
+it with:
+
+```sh
+sudo cp scripts/camera-server.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now camera-server.service
+```
+
 ---
 
 ## 6. Connecting, and path migration
