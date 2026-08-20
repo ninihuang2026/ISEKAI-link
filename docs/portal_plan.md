@@ -50,8 +50,8 @@ Almost all of it. This section is the argument for the shape of §4.
 | Pairing, Grants, the camera list | `isekai-p2p-core::proxy`, `isekai-p2p::initiator` | yes |
 | Peer Connect, relay legs, lease renewal | `isekai-p2p::{initiator,listener}` | yes |
 | Direct-path candidates and migration | `isekai-p2p-core::observed`, `camera-core::video` | **extract** (§4.4) |
-| Endpoint certificate by CSR | `camera-core::tls`, `isekai-link-utils::cert` | yes |
-| Key attestation and pinning | `isekai-p2p-core::attestation`, `camera-core::video` | **extract** |
+| Endpoint certificate by CSR | `isekai-p2p::endpoint_cert` | yes — extracted in 1c-iii-a |
+| Key attestation and pinning | `isekai-p2p-core::attestation`, `isekai-p2p::peer` | yes — extracted in 1c-i |
 | The paired-Endpoint check | `camera-core::paired` | yes |
 | Hostname checking | `isekai-p2p-core::hostname` | yes |
 | Privacy consent | `camera-core::privacy` | **no** — see §8 |
@@ -123,6 +123,18 @@ key this device holds, the CSR that gets it signed, the bundle the listener
 presents, the dev fallback, the PKCS#12 Windows needs — is 550 lines of which
 *nothing* is about video except the names. `portal-server` needs all of it, so
 it moved to `isekai_p2p::endpoint_cert`.
+
+**And 1c-iii keeps finding more of the same.** The certificate was the first
+(1c-iii-a); the loop that drives a `ListenerSession` is the second. `command_loop`
+was 135 lines in `camera-core::server` of which the only camera was two words in
+comments — two poll rates, a reconcile that closes the gap a fresh event stream
+leaves, a resubscribe backoff, and the renewal that is the only thing keeping a
+served peer's lease from lapsing. A portal server needs every one of them, and a
+second copy would fork exactly the parts nobody would think to check.
+
+That this row split three ways and then one of those split again is the phase's
+own finding: "portal on a real session" is not one change, because the camera
+had absorbed the whole of what a session needs.
 
 It also costs something, and the cost is stated rather than hidden: on Windows a
 crate that packages a certificate needs OpenSSL, so every `isekai-p2p` dependent
@@ -323,7 +335,8 @@ having before anyone asks.
 | **1c-ii** | `dial_video` → the layer, with the rules from 1a enforced rather than stated: a session handle whose `Drop` releases everything, a drain that takes ownership, and the certificate check installed by the dial rather than by the caller. #141 is classified here | **done** — `peer::dial` returns a `PeerSession`; #141 classified off the transport status. Run on Windows hardware: video as before, and the switch to the direct path |
 | **1c-iii-a** | the Endpoint's relay certificate → the layer | **done** — `isekai_p2p::endpoint_cert`; `camera-core::tls` re-exports the names its apps spell |
 | **1c-iii-b** | `spike.rs` → `transport.rs`: portal binds and dials with the connection layer, not its own copy | **done** — the loopback test runs over `peer::dial`, on Linux and macOS; Windows compiles it (#155) |
-| **1c-iii-c** | the session: a `ListenerSession` that relays to the portal listener, an `InitiatorSession` that dials it, and the two binaries | portal forwards over a proxy |
+| **1c-iii-c-i** | the loop that drives a `ListenerSession` → the layer | **done** — `isekai_p2p::listener::run`; `camera-core` calls it and keeps the command type's name |
+| **1c-iii-c-ii** | the session both ways, and `portal-server` / `portal-client` | portal forwards over a proxy |
 | **2** | The catalogue, the config file, refusals | phase 0 with a file instead of a constant |
 | **3** | UDP: datagrams, session table, idle sweep, size and queue bounds | a DNS query answers over the forward |
 | **4** | Direct-path migration and the RTT/path reporting the camera apps have | a transfer survives the switch |
