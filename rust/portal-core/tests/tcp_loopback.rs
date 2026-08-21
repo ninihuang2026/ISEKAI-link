@@ -10,6 +10,26 @@
 //! `camera-core/tests/video_loopback.rs` documents at length: `RegistrationClose`
 //! is a synchronous, uninterruptible wait on every handle derived from it, so
 //! dropping one while a connection is live hangs the process with no way out.
+//!
+//! # Why these are current-thread tests
+//!
+//! They were `multi_thread`, and on `windows-latest` whichever of the two ran
+//! second had a dial that never completed — #155. The mechanism is one this
+//! repository had already written down somewhere else: `get_stats` is served by
+//! queueing an operation to msquic's connection worker and **blocking the
+//! calling thread** until it runs (`camera_core::video::spawn_heartbeat` says
+//! so), and `peer::dial`'s handshake probe calls it every second *while the
+//! handshake is in flight*.
+//!
+//! `receive_frames` samples the same way but only after its dial has returned,
+//! which is why `video_loopback.rs` never met this. Two multi-threaded runtimes
+//! on a two-core runner, each making a blocking call into a different
+//! registration's worker once a second, is enough to starve the future being
+//! reported on.
+//!
+//! A current-thread runtime is what `video_loopback.rs` uses, and there is
+//! nothing here that wants worker threads: every task in the forward is async
+//! all the way down.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -163,14 +183,28 @@ async fn connected(catalogue: Catalogue) -> Halves {
         }
     });
 
-    // `localhost` is the TLS name only — the dial pins the remote address
-    // itself — and validation is off because the listener above is presenting
-    // the self-signed fallback.
+    // **`127.0.0.1`, not `localhost`** — this is #155. The listener above is
+    // bound on `127.0.0.1`, and on Windows `localhost` resolves to `::1` first;
+    // a handshake that goes there completes never rather than slowly, which is
+    // the shape this failed in. `spike.rs` carried a comment predicting exactly
+    // that and was only ever run on Linux, so it was never tested.
+    //
+    // A literal cannot be resolved, so nothing here depends on whether
+    // `set_remote_addr` is enough to stop msquic trying. `video_loopback.rs`
+    // dials a literal for the same reason and has never failed on Windows.
+    //
+    // Validation is off because the listener is presenting the self-signed
+    // fallback, so the name is not doing anything else here either.
+    // Timed, because #155 turned on a distinction the budget alone cannot make.
+    // Three times I called this failure "binary -- milliseconds or never", and
+    // that was an inference from three numbers that were all just the budget.
+    // What the log says is only "longer than the budget". So: print it.
+    let began = std::time::Instant::now();
     let session = tokio::time::timeout(
         DIAL_BUDGET,
         transport::connect(
             Some(reg.clone()),
-            "localhost",
+            "127.0.0.1",
             bound.port(),
             transport::ConnectOptions::default(),
             &shutdown,
@@ -179,13 +213,14 @@ async fn connected(catalogue: Catalogue) -> Halves {
     .await
     .expect("the loopback handshake completed inside its budget")
     .expect("dial the portal");
+    eprintln!("#155: the dial took {:?}", began.elapsed());
     Halves {
         session: Some(session),
         teardown,
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn bytes_reach_the_service_and_come_back() {
     let target = shouting_service().await;
     let halves = connected(Catalogue::new().with("db", target)).await;
@@ -213,7 +248,7 @@ async fn bytes_reach_the_service_and_come_back() {
     drain(halves).await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn a_service_that_is_not_offered_gets_no_connection() {
     let target = shouting_service().await;
     // The catalogue offers `db`, and the forward below asks for something else.

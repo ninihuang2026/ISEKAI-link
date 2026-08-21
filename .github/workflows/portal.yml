@@ -5,22 +5,29 @@ name: ISEKAI portal
 # binaries, and the mobile workflows build the FFI crate. So the crate's green
 # checks said nothing about the crate. This is #144.
 #
-# **Linux and macOS run the tests; Windows compiles them**, and the Windows
-# half is a known failure rather than a decision — see #155.
+# **Linux and macOS run the tests; Windows compiles them** — #155, which is
+# understood now and is not this repository's.
 #
-# It used to be a decision. Running them needed `spike.rs`, which handed msquic a
-# PEM and no PKCS#12, and on Windows the credential path's no-PFX fallback goes
-# through an RSA provider that cannot take rcgen's ECDSA P-256 key, so the
-# listener could not start at all. Phase 1c-iii-b replaced that with
-# `isekai_p2p::endpoint_cert`, which packages the bundle -- the same path
-# `camera-core`'s video listener takes on Windows, exercised there by
-# `video_loopback.rs`.
+# On a GitHub-hosted windows-latest runner, the first parallel run after a build
+# has one of the two dials complete in ~11ms and the other not complete at all:
+# it was given three minutes and used all of them. The twenty runs immediately
+# after, on the same machine in the same job, all pass — serial and parallel
+# alike.
 #
-# That removed the reason, and macOS went from compiling the tests to running
-# them. Windows did not: whichever of the two integration tests runs second has
-# a dial that never completes, and raising its budget only lengthens the wait.
-# #155 has the evidence. Until it is understood, asking Windows to run them
-# would be asking for a red check that says nothing new.
+# It does not reproduce on real Windows hardware. `cargo clean -p portal-core`
+# and a single run, which is exactly the failing condition, gives two dials at
+# 24.7ms and two passes; twenty repeats also pass. So it is the hosted image,
+# and the tests and the product are fine — the camera apps and portal both run
+# on Windows.
+#
+# The dial is timed and the number printed, which is what finally separated
+# "slow" from "never" after three wrong answers built on the budget alone. If
+# this recurs, that line is the first thing to read.
+#
+# Before that it was the certificate: `spike.rs` handed msquic a PEM and no
+# PKCS#12, and the Windows credential path's no-PFX fallback cannot take an
+# ECDSA P-256 key, so the listener could not start at all. Phase 1c-iii-b
+# replaced that with `isekai_p2p::endpoint_cert`, which packages the bundle.
 #
 # The Windows job also builds vendored OpenSSL, which is what packaging that
 # bundle costs. Making it optional was considered and rejected: with the feature
@@ -98,7 +105,7 @@ jobs:
       # camera-core/tests/video_loopback.rs and the four ways portal-core's own
       # tests found — so the timeout above is the backstop, not the plan.
       - name: Test
-        run: cargo test -p portal-core
+        run: cargo test -p portal-core -- --nocapture
       # The binaries are not covered by the tests -- there is nothing to test
       # about them without a proxy -- so this is what says they still build.
       - name: Build the binaries
