@@ -68,6 +68,8 @@ tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["full"] }
 tokio-tungstenite = "0.29"
 tokio-util = { version = "0.7", features = ["rt"] }
+# The portal server's service catalogue (`portal-core::config`).
+toml = "1"
 tower = { version = "0.5", default-features = false }
 tower-http = { version = "0.6.8", features = ["full"] }
 tower-jwt = { git = "https://github.com/masa-koz/tower-jwt.git", branch = "masa-koz/use-latest" }
