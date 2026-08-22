@@ -37,6 +37,17 @@ name: ISEKAI portal
 
 on:
   push:
+    # **`branches` has to be spelled out now that `tags` is here.** Naming
+    # either one narrows the trigger to it, so `tags` on its own would have
+    # turned every branch push into no run at all — the ordinary CI for this
+    # crate, switched off in passing while adding a release.
+    branches: ['**']
+    tags: ['v*']
+    # And the two are ANDed with the paths below, so a tag whose commits touch
+    # nothing here does not start this workflow. `camera-apps.yml` has the same
+    # shape and has fired for a tag, which is the evidence this is built on; a
+    # release cut from a commit that changed only `docs/` would need a
+    # `workflow_dispatch` run instead.
     paths:
       - 'rust/portal-core/**'
       - 'rust/portal-server/**'
@@ -135,3 +146,134 @@ jobs:
       # worth catching here. Running them is #155.
       - name: Check
         run: cargo check -p portal-core -p portal-server -p portal-client --all-targets
+
+  # ------------------------------------------------------------------ Release
+  #
+  # **Only on a tag**, which is the opposite of what `camera-apps.yml` does, and
+  # the reason is what each run costs. That workflow bundles on every push
+  # because the camera apps take twenty minutes to build anyway; this one's
+  # ordinary loop is a four-minute test job, and a release build on three
+  # platforms — Windows compiling vendored OpenSSL among them — would be most of
+  # a portal PR's CI for an artifact nobody looks at.
+  #
+  # What that costs is that a broken bundle is found at release time. Mitigated
+  # rather than accepted: both halves of the bundling are `scripts/bundle-apps.*`
+  # and `camera-apps.yml` runs them on every push, on all three platforms. What
+  # is tag-only here is the app list, not the machinery.
+  #
+  # `workflow_dispatch` above is how to exercise it without cutting a tag.
+  bundle:
+    name: Bundle (${{ matrix.os }})
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      # **Not Windows-only**, however much it looks it: on Linux this installs
+      # `liblttng-ust-dev` and `libnuma-dev`, which the ubuntu image does not
+      # carry and msquic's CMake stops without. The `test` job above runs it
+      # unconditionally for the same reason.
+      - name: Prepare machine for seera-msquic
+        run: scripts/prepare-machine.ps1 -Tls openssl -ForBuild
+        shell: pwsh
+        working-directory: submodules/msquic-async-rs/seera-msquic
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: Build
+        run: cargo build --release -p portal-server -p portal-client
+        working-directory: rust
+
+      # `libmsquic` lives only inside cargo's build-script output, under a path
+      # with a build hash in it, and nothing installs it. So a binary on its own
+      # fails at startup with `error while loading shared libraries` — #167, and
+      # what this exists to answer.
+      - name: Bundle with the libraries (Linux, macOS)
+        if: runner.os != 'Windows'
+        run: scripts/bundle-apps.sh rust/target/release dist portal-${{ matrix.os }} portal-server portal-client
+
+      - name: Bundle with the DLLs (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: scripts/bundle-apps.ps1 rust/target/release dist portal-${{ matrix.os }} portal-server portal-client
+
+      # **Zipped here rather than in the release job**, because
+      # `upload-artifact` does not preserve file permissions — everything comes
+      # back `644`. The launcher and the binaries would arrive without their
+      # executable bit, the archive would record that, and `./portal-server`,
+      # which is the first command `docs/portal.md` gives, would answer
+      # `Permission denied`. Inside a zip the mode is part of the entry; the
+      # zip's own bit is nobody's business.
+      - name: Archive (Linux, macOS)
+        if: runner.os != 'Windows'
+        run: cd dist && zip -r "portal-${{ matrix.os }}.zip" "portal-${{ matrix.os }}"
+
+      # The same shape — one top-level directory named after the platform — so
+      # the page's `unzip … && cd …` reads the same on every platform. Nothing
+      # here needs a permission bit.
+      - name: Archive (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path "dist/portal-${{ matrix.os }}" -DestinationPath "dist/portal-${{ matrix.os }}.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: portal-${{ matrix.os }}
+          path: dist/portal-${{ matrix.os }}.zip
+          if-no-files-found: error
+
+  release:
+    name: Publish the release
+    needs: bundle
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # The archives are already zips — see the bundle job — so this only
+      # collects them.
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: portal-*
+          path: artifacts
+          merge-multiple: true
+      - run: ls -l artifacts
+
+      # Attach to the release if there is one, create it if there is not — the
+      # order the tag and the release arrive in depends on whether a person
+      # pushed a tag or cut the release from the UI, and `camera-apps.yml`'s
+      # header records what assuming one of them cost.
+      #
+      # **`--repo` on every call, and it is not decoration.** This job has no
+      # checkout, so there are no git remotes for `gh` to read a repository
+      # from, and it does not fall back to `$GITHUB_REPOSITORY`: without it
+      # every call fails with "could not determine base repo", the bundles build
+      # and nothing is attached. `camera-apps.yml` passes it for exactly this
+      # reason and this copy had dropped it.
+      #
+      # `--clobber` so re-running replaces what it uploaded last time.
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $GITHUB_REF_NAME exists; attaching to it"
+            gh release upload "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" --clobber artifacts/*.zip
+          else
+            echo "no release $GITHUB_REF_NAME yet; creating it"
+            gh release create "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$GITHUB_REF_NAME" \
+              --generate-notes \
+              artifacts/*.zip
+          fi

@@ -305,27 +305,21 @@ jobs:
       # each platform ships the libraries with it.
       - name: Bundle with the libraries (Linux, macOS)
         if: runner.os != 'Windows'
-        run: scripts/bundle-camera-apps.sh rust/target/release dist camera-apps-${{ matrix.os }}
+        run: scripts/bundle-apps.sh rust/target/release dist camera-apps-${{ matrix.os }} camera-server camera-client
 
       # Windows resolves a DLL from the directory the executable is in before
       # anywhere else, so beside the binaries is all this needs — no launcher
       # and no load-command rewriting.
+      # The binaries and msquic.dll are the shared part; OpenCV is the camera's
+      # own. Sharing the first half means `portal.yml`, which bundles only on a
+      # tag, is riding a script this job exercises on every push.
       - name: Bundle with the DLLs (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $stage = "dist/camera-apps-${{ matrix.os }}"
-          New-Item -ItemType Directory -Force -Path $stage | Out-Null
-          Copy-Item rust/target/release/camera-server.exe, rust/target/release/camera-client.exe $stage
+          scripts/bundle-apps.ps1 rust/target/release dist camera-apps-${{ matrix.os }} camera-server camera-client
           # OpenCV's own DLLs and everything vcpkg built them against.
-          Copy-Item "$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows/bin/*.dll" $stage
-          # libmsquic is built by seera-msquic's build script and never
-          # installed, so it is found by searching cargo's output.
-          $msquic = Get-ChildItem -Path rust/target/release/build -Recurse -Filter msquic.dll `
-            -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $msquic) { throw "msquic.dll not found under rust/target/release/build" }
-          Copy-Item $msquic.FullName $stage
-          Get-ChildItem $stage | Format-Table Name, Length
+          Copy-Item "$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows/bin/*.dll" "dist/camera-apps-${{ matrix.os }}"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -350,12 +344,26 @@ jobs:
 
       # One archive per platform rather than loose binaries, so what is attached
       # says which platform it came from after it has been downloaded.
+      # **The executable bit has to be put back before zipping.**
+      # `upload-artifact` does not preserve permissions — everything arrives
+      # `644` — so the launchers and the binaries under `bin/` come back
+      # unrunnable, the zip records that, and the first thing anyone does with
+      # the download fails with `Permission denied`. Found by review of the
+      # portal copy of this job (#170), which fixed it by zipping in the build
+      # job instead; this one keeps its shape and repairs the modes, which is
+      # the smaller change to a path that has already shipped.
+      #
+      # Nothing on Windows needs a bit, and `chmod` on those files is harmless.
       - name: Package each platform
         run: |
           set -euo pipefail
           mkdir -p release
           for dir in artifacts/*/; do
             name="$(basename "$dir")"
+            # `find`, not `[ -d bin ] && chmod`: under `set -e` that list
+            # fails the job on a Windows bundle, which has no `bin/`.
+            find "$dir" -maxdepth 1 -type f -name 'camera-*' -exec chmod 0755 {} +
+            find "$dir/bin" -type f -exec chmod 0755 {} + 2>/dev/null || true
             (cd "$dir" && zip -r "$GITHUB_WORKSPACE/release/$name.zip" .)
           done
           ls -l release
