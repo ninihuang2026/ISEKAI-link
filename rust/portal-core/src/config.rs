@@ -55,6 +55,49 @@ use serde::Deserialize;
 
 use crate::server::{Catalogue, Protocol};
 
+/// A catalogue to start from, which `portal-server --example-config` prints.
+///
+/// **The targets are RFC 5737 documentation addresses**, and that is the
+/// security-relevant part of this constant rather than a stylistic one. This is
+/// a file people copy and edit, and an example left in among their own entries
+/// is an entry they did not mean to offer. `10.0.0.1:53` reads as a plausible
+/// placeholder and is the commonest LAN gateway there is — on exactly the
+/// networks portal is pointed at — so leaving it in would quietly publish the
+/// operator's own resolver, and it would *work*, which is what makes it worse
+/// than a typo. `192.0.2.0/24` is routed nowhere by definition, so the same
+/// mistake costs an `Unreachable` and a log line naming the service.
+///
+/// The commentary is the half of the format that a schema cannot carry — what
+/// may be reached is decided here and only here.
+pub const EXAMPLE: &str = r#"# What this portal server offers, and nothing else.
+#
+# A peer asks for a service by NAME. The target below never crosses the wire, so
+# a peer cannot reach anything that is not listed here -- which is the whole
+# point: a Grant says two Endpoints may talk, not what may be reached.
+#
+# Targets are addresses, never hostnames. Resolving one would put a DNS answer
+# in charge of where forwarded traffic goes, which is a different decision from
+# this one.
+#
+# The forward carries whatever the service speaks. If that is plaintext, it is
+# plaintext to the peer that reached it -- a tunnel does not authenticate the
+# service at the far end of it.
+
+# The addresses below are RFC 5737 documentation addresses, routed nowhere.
+# Replace them: an example left in among your own entries is a service you did
+# not mean to offer.
+
+[service.db]
+protocol = "tcp"
+target   = "192.0.2.10:5432"
+
+# UDP is forwarded up to about 1200 bytes per datagram; anything larger is
+# dropped and counted rather than split. A large DNS response can exceed it.
+[service.dns]
+protocol = "udp"
+target   = "192.0.2.1:53"
+"#;
+
 /// Read the catalogue from `path`.
 pub fn load(path: &Path) -> anyhow::Result<Catalogue> {
     let text = std::fs::read_to_string(path)
@@ -157,6 +200,25 @@ mod tests {
             "asking for a UDP service over TCP must not find it",
         );
         assert_eq!(catalogue.look_up("nothing", Protocol::Tcp), Lookup::Unknown);
+    }
+
+    /// **The example is a file, and files get typos.** `--example-config` is
+    /// the first thing somebody runs, so one that does not parse is worse than
+    /// no example at all — they would go looking for what *they* did wrong.
+    /// Here rather than in the binary because this is where `parse` lives, and
+    /// an example that drifts from its parser is the same failure a step later.
+    #[test]
+    fn the_example_catalogue_is_one_this_would_accept() {
+        let catalogue = parse(EXAMPLE).expect("--example-config must produce a file that loads");
+        assert_eq!(
+            catalogue.look_up("db", Protocol::Tcp),
+            Lookup::Found("192.0.2.10:5432".parse().unwrap()),
+        );
+        assert_eq!(
+            catalogue.look_up("dns", Protocol::Udp),
+            Lookup::Found("192.0.2.1:53".parse().unwrap()),
+            "and the targets stay inside RFC 5737, for the reason `EXAMPLE` gives",
+        );
     }
 
     /// **Phase 2 rejected this file outright**, because a server offering only
