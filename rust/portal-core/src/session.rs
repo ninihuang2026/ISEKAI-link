@@ -151,13 +151,37 @@ impl ServerHandle {
             reg,
             ..
         } = self;
+        // Traced step by step for the reason `Connected::close` gives: this is
+        // the path Ctrl+C takes, and the last line printed names the step that
+        // did not finish.
+        tracing::debug!("closing: cancelling the session and the accept loop");
         shutdown.cancel();
+        tracing::debug!("closing: waiting for the Peer Listener to be withdrawn");
         if tokio::time::timeout(CLOSE_TIMEOUT, running).await.is_err() {
             tracing::warn!("the listener session did not finish within {CLOSE_TIMEOUT:?}");
         }
+        tracing::debug!("closing: waiting for msquic to release its handles");
         if !isekai_p2p::peer::drain_registration(&reg, DRAIN_TIMEOUT).await {
             tracing::warn!("msquic still had live handles after {DRAIN_TIMEOUT:?}");
         }
+        // **This is where Ctrl+C hung, and the fix is not to close it.**
+        //
+        // `reg` would drop at the end of this scope, and dropping the last
+        // `Arc<Registration>` runs `RegistrationClose` — a synchronous,
+        // uninterruptible wait that no timeout is over. The drain above does
+        // not prevent it: `wait_idle` deliberately does **not** track
+        // `Configuration`s (`Registration::open_configuration` says so), so it
+        // reports idle, `active` is zero, the drop prints no warning, and the
+        // close then blocks on the listener configuration's rundown reference
+        // anyway. Hardware showed `closing: closed` and then nothing.
+        //
+        // The configuration belongs to the `Listener` and the connections
+        // accepted from it, so this side cannot "drop it first" as that
+        // documentation asks. What it can do is not close a registration in a
+        // process that is stopping — which is what `drain_msquic` and
+        // `PeerSession::drain` already do, for this reason.
+        std::mem::forget(reg);
+        tracing::debug!("closed");
     }
 }
 
@@ -325,6 +349,12 @@ impl Connected {
             sessions,
             shutdown,
         } = self;
+        // **Each step says it is starting**, because this is the path a Ctrl+C
+        // takes and the last line printed is what names a step that does not
+        // finish. Every wait below is bounded, and each of those bounds was put
+        // there after something was not — so the next one that is not should
+        // cost a bug report rather than a bisect.
+        tracing::debug!("closing: cancelling the forwards");
         shutdown.cancel();
         // **Dropped before the wait, not after it.** `Sessions` holds a
         // `Connection` clone of its own, and the drain below is a wait for
@@ -332,10 +362,13 @@ impl Connected {
         // scope is one that will never be released, and the wait would time out
         // pointing at msquic rather than at this line.
         drop(sessions);
+        tracing::debug!("closing: waiting for msquic to release the peer connection");
         if !peer.drain(DRAIN_TIMEOUT).await {
             tracing::warn!("msquic still had live handles after {DRAIN_TIMEOUT:?}");
         }
+        tracing::debug!("closing: reporting the connection closed and taking the leg down");
         session.close().await;
+        tracing::debug!("closed");
     }
 }
 
