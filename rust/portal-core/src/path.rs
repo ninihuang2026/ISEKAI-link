@@ -57,35 +57,32 @@
 //!
 //! # What tells us a preferred path has gone bad
 //!
-//! `PathRemoved`, and **not a byte counter** — which is worth writing down,
-//! because copying `camera-core`'s watchdog was the obvious thing to do and it
-//! would not have worked here.
+//! Two things, and the second exists because the first leaves a gap.
 //!
-//! That watchdog asks "have any frames arrived since we moved?", and frames are
-//! application data, which travels on the preferred path alone. Portal has no
-//! single frame counter, and the connection-level counter that looks like a
-//! substitute is not one: under multipath the relay path is still active, still
-//! carrying its own keepalive PINGs and still receiving their acknowledgements,
-//! so `Recv.TotalBytes` keeps advancing however dead the preferred path is. A
-//! watchdog built on it would never fire, and would read in the code as though
-//! the case were handled.
+//! **`PathRemoved`** is msquic saying it has abandoned a path, and that is when
+//! the relay is preferred again. What it does not cover is a path msquic keeps
+//! and does not carry.
 //!
-//! So the transport's own judgement is what is used: msquic raises `PathRemoved`
-//! when it abandons a path, and that is when the relay is preferred again.
-//! **The gap that leaves is a path msquic keeps and does not carry.**
+//! **The preferred path's own statistics** cover that. `get_path_statistics`
+//! reports RTT and network statistics per path — where `get_stats`, which this
+//! loop used to report, only ever describes the *first* path however many the
+//! connection has. That is the whole reason a connection-level byte counter
+//! cannot see a dead preferred path: under multipath the relay is still active,
+//! still sending its own keepalive PINGs and still receiving their
+//! acknowledgements, so the connection's totals keep advancing while the path
+//! carrying the traffic delivers nothing.
 //!
-//! There *is* a signal for it now, and this does not use it yet:
-//! `Connection::get_path_statistics` reports RTT and network statistics **per
-//! path**, where `get_stats` only ever describes the first one — which is
-//! exactly why the connection-level counters above cannot see a dead preferred
-//! path. A watchdog on the preferred path's own numbers is the thing this
-//! paragraph said did not exist. Adopting it is #172.
+//! `camera-core`'s watchdog asks "have any frames arrived since we moved?",
+//! which works because a frame is application data and application data travels
+//! on the preferred path alone. Portal has no frame counter; [`Stalled`] asks
+//! the equivalent question of the path itself — see there for what it reads and
+//! why those two numbers and not others.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use msquic_async::{Connection, ConnectionEvent};
+use msquic_async::{msquic, Connection, ConnectionEvent};
 use tokio_util::sync::CancellationToken;
 
 use isekai_p2p::direct_path::{prefer_path, RELAY_PATH_ID};
@@ -107,6 +104,85 @@ const STATS_INTERVAL: Duration = Duration::from_secs(1);
 /// has no multipath — where the cost is one more second on the relay before the
 /// old switch, on a connection that is working the whole time.
 const MULTIPATH_GRACE: Duration = Duration::from_secs(1);
+
+/// How long the preferred path may hold data with nothing coming back before
+/// the relay is preferred again.
+///
+/// Generous next to a round trip and short next to the 30-second idle timeout
+/// that would otherwise take the whole connection down. `camera-core` allows
+/// five seconds for the same judgement about frames; this watches a slower
+/// signal — a smoothed RTT only moves when an acknowledgement arrives — so it
+/// waits longer before calling a path dead.
+const STALLED_GRACE: Duration = Duration::from_secs(10);
+
+/// The largest thing this end ever hands to `send_datagram`.
+///
+/// **Not `MAX_PAYLOAD`**, which is the *payload* bound: `datagram::encode`
+/// prepends the session id, so a full-size payload reaches the connection four
+/// bytes longer. Comparing the connection's limit against the payload figure
+/// would leave 1180..=1183 reported as fine while every maximum-size datagram
+/// came back `TooBig` and was counted as a loss.
+const LARGEST_DATAGRAM: usize = crate::datagram::HEADER + crate::datagram::MAX_PAYLOAD;
+
+/// How many reporting ticks between reads of the connection-wide counters.
+const CONNECTION_STATS_EVERY: u32 = 5;
+
+/// Whether the path being preferred is delivering anything.
+///
+/// **Two numbers, and the pair is the point.** Either alone answers the wrong
+/// question:
+///
+/// - `BytesInFlight` alone says data is outstanding, which is what a *busy*
+///   path looks like at any instant.
+/// - `Rtt` alone says nothing moved, which is what an *idle* path looks like —
+///   a forward carrying no traffic has nothing to measure, and calling that
+///   dead would drop every quiet connection back to the relay.
+///
+/// Together they say: this path is holding data **and** has not had a single
+/// acknowledgement in all that time. A smoothed RTT moves whenever one arrives,
+/// so an unchanged `Rtt` with bytes outstanding is a path that is being sent on
+/// and answering nothing. That is the failure `PathRemoved` does not cover.
+///
+/// **Deliberately not `BytesInFlight` growing**, which was the first thing
+/// tried: congestion control stops adding to a path that is not acknowledging,
+/// so the number plateaus rather than climbing, and a test for growth answers
+/// "recovering" to a path that has flatlined.
+#[derive(Debug, Default)]
+pub struct Stalled {
+    /// The `Rtt` last seen, and when it last changed.
+    seen: Option<(u64, tokio::time::Instant)>,
+}
+
+impl Stalled {
+    /// Fold in one sample of the preferred path. `true` when it has been
+    /// holding data with an unmoving RTT for [`STALLED_GRACE`].
+    ///
+    /// Takes the two numbers rather than the statistics struct so the decision
+    /// can be tested without a connection — it is the part worth testing, and
+    /// the part that is wrong if this is wrong.
+    pub fn sample(&mut self, rtt: u64, bytes_in_flight: u32, now: tokio::time::Instant) -> bool {
+        // Nothing outstanding: the path is idle, not dead. Forgetting what was
+        // seen is what stops an idle spell from counting towards the grace.
+        if bytes_in_flight == 0 {
+            self.seen = None;
+            return false;
+        }
+        match self.seen {
+            Some((last, since)) if last == rtt => now.duration_since(since) >= STALLED_GRACE,
+            // First sample with data outstanding, or the RTT moved — which is
+            // an acknowledgement, which is the path working.
+            _ => {
+                self.seen = Some((rtt, now));
+                false
+            }
+        }
+    }
+
+    /// Forget what was seen, for when the path being watched changes.
+    pub fn reset(&mut self) {
+        self.seen = None;
+    }
+}
 
 /// Watch `conn`'s paths and keep it on the best one, until the connection ends.
 ///
@@ -143,6 +219,10 @@ pub async fn keep_on_the_best_path(conn: Connection, shutdown: CancellationToken
     // for one. See the module header: this is the whole of how "the peer has no
     // multipath" is told from "`PathAdded` has not arrived yet".
     let mut awaiting_id: Option<((SocketAddr, SocketAddr), tokio::time::Instant)> = None;
+    // Whether the path being preferred is delivering. Reset whenever the
+    // preference moves, so a new path starts with a clean grace period.
+    let mut stalled = Stalled::default();
+    let mut ticks: u32 = 0;
 
     // The reporting the camera apps have, with the one thing they cannot say
     // added: which path the numbers are about. `get_stats` is sampled here
@@ -157,13 +237,47 @@ pub async fn keep_on_the_best_path(conn: Connection, shutdown: CancellationToken
         let event = tokio::select! {
             _ = shutdown.cancelled() => return,
             _ = reporting.tick() => {
-                match conn.get_stats() {
-                    Ok(stats) => log_connection_stats(
-                        &conn,
-                        &stats,
-                        if preferred.is_some() { "direct" } else { "relay" },
-                    ),
-                    Err(e) => tracing::debug!("could not read connection stats: {e}"),
+                // **Not every tick.** `get_stats` and `get_path_statistics`
+                // are each served by queueing an operation to msquic's
+                // connection worker and *blocking the calling thread* until it
+                // runs — which is what #155 cost a day to find. The per-path
+                // call has to happen every tick because the watchdog reads it;
+                // the connection-wide one carries loss and congestion totals
+                // that nothing here decides on, so it is sampled a fifth as
+                // often rather than doubling the stall this loop imposes.
+                //
+                // Labelled `connection` because it describes the *first* path
+                // however many there are — printing it as `direct` was this
+                // loop's own bug.
+                ticks = ticks.wrapping_add(1);
+                if ticks.is_multiple_of(CONNECTION_STATS_EVERY) {
+                    match conn.get_stats() {
+                        Ok(stats) => log_connection_stats(&conn, &stats, "connection"),
+                        Err(e) => tracing::debug!("could not read connection stats: {e}"),
+                    }
+                }
+                if report_paths(&conn, preferred, &direct, &mut stalled) {
+                    // **Preferring the relay again, not tearing anything down.**
+                    // Under multipath the relay was never left, only declared
+                    // backup, so this is withdrawing a preference — nothing in
+                    // flight is lost by asking.
+                    let stale = preferred;
+                    tracing::warn!(
+                        local = %stale.map(|p| p.0.to_string()).unwrap_or_default(),
+                        remote = %stale.map(|p| p.1.to_string()).unwrap_or_default(),
+                        "the direct path has held data for {STALLED_GRACE:?} without a single \
+                         acknowledgement; forwarding goes back to the relay",
+                    );
+                    // **Only forget the preference if the move happened.**
+                    // `prefer_path` answers `false` when nothing changed, and
+                    // clearing `preferred` anyway would leave traffic on the
+                    // stalled path with the watchdog switched off — it only
+                    // judges a path it believes is preferred, so there would be
+                    // no second attempt.
+                    if prefer_path(&conn, relay, relay, &direct) {
+                        preferred = None;
+                        stalled.reset();
+                    }
                 }
                 continue;
             }
@@ -179,6 +293,7 @@ pub async fn keep_on_the_best_path(conn: Connection, shutdown: CancellationToken
                 );
                 if prefer_path(&conn, pair, relay, &direct) {
                     preferred = Some(pair);
+                    stalled.reset();
                 }
                 continue;
             }
@@ -212,6 +327,10 @@ pub async fn keep_on_the_best_path(conn: Connection, shutdown: CancellationToken
                 }
                 if prefer_path(&conn, pair, relay, &direct) {
                     preferred = Some(pair);
+                    // A new path starts with a clean grace: carrying the last
+                    // one's `(rtt, since)` over would let this one inherit a
+                    // window that is already most of the way run.
+                    stalled.reset();
                     tracing::info!(
                         path_id, local = %local_address, remote = %peer_address,
                         "forwarding moved onto the direct path; the relay stays as backup",
@@ -267,6 +386,43 @@ pub async fn keep_on_the_best_path(conn: Connection, shutdown: CancellationToken
                 preferred = None;
                 prefer_path(&conn, relay, relay, &direct);
             }
+            // **What the peer will take, said once rather than discovered.**
+            // `send_enabled` false means it never advertised
+            // `max_datagram_frame_size`, so every UDP forward over this
+            // connection is dead before it starts — which is exactly how phase
+            // 3a's bug hid, as one `Denied` per datagram with nothing said. And
+            // `max_send_length` is the real limit `datagram::MAX_PAYLOAD` is
+            // deliberately under; it is checked rather than adopted, because
+            // the constant is a promise `docs/portal.md` makes to callers and
+            // raising it per connection would leave DNS working on one network
+            // and not another.
+            ConnectionEvent::DatagramStateChanged {
+                send_enabled,
+                max_send_length,
+            } => {
+                if !send_enabled {
+                    tracing::warn!(
+                        "the peer will not receive QUIC datagrams, so UDP forwarding over \
+                         this connection cannot work; TCP forwards are unaffected",
+                    );
+                } else if usize::from(max_send_length) < LARGEST_DATAGRAM {
+                    // The one direction the constant cannot absorb: under the
+                    // limit means payloads this end accepts are refused by the
+                    // connection, and counted as `unsent` rather than carried.
+                    tracing::warn!(
+                        max_send_length,
+                        largest = LARGEST_DATAGRAM,
+                        "the connection takes smaller datagrams than portal will send; \
+                         payloads near the limit will be refused and counted as unsent",
+                    );
+                } else {
+                    tracing::debug!(
+                        max_send_length,
+                        largest = LARGEST_DATAGRAM,
+                        "the peer receives datagrams",
+                    );
+                }
+            }
             ConnectionEvent::PathStatusChanged {
                 path_id,
                 local_address,
@@ -292,6 +448,7 @@ pub async fn keep_on_the_best_path(conn: Connection, shutdown: CancellationToken
                          forwarding is on the relay again",
                     );
                     preferred = None;
+                    stalled.reset();
                 } else {
                     tracing::debug!(
                         path_id, local = %local_address, remote = %peer_address, is_active,
@@ -301,6 +458,99 @@ pub async fn keep_on_the_best_path(conn: Connection, shutdown: CancellationToken
             }
             _ => {}
         }
+    }
+}
+
+/// Log what each path is doing, and say whether the preferred one has stalled.
+///
+/// **`get_path_statistics` and not `get_stats`**, which only ever describes the
+/// first path: on a connection that has moved onto a direct one, the numbers
+/// this loop used to print were the relay's, labelled `direct`. That was worse
+/// than saying nothing — it is the log an operator reads to decide whether
+/// migration helped.
+///
+/// `None` for `preferred` means the relay is carrying traffic, and then there is
+/// nothing to call stalled: the relay path is the one QUIC falls back to, and
+/// declaring *it* dead has nowhere to go.
+fn report_paths(
+    conn: &Connection,
+    preferred: Option<(SocketAddr, SocketAddr)>,
+    direct: &BTreeMap<(SocketAddr, SocketAddr), u32>,
+    stalled: &mut Stalled,
+) -> bool {
+    let paths = match conn.get_path_statistics() {
+        Ok(paths) => paths,
+        Err(e) => {
+            tracing::debug!("could not read per-path statistics: {e}");
+            return false;
+        }
+    };
+    for path in &paths {
+        tracing::debug!(
+            path_id = path.PathId,
+            rtt_us = path.Rtt,
+            min_rtt_us = path.MinRtt,
+            mtu = path.Mtu,
+            in_flight = path.NetworkStatistics.BytesInFlight,
+            cwnd = path.NetworkStatistics.CongestionWindow,
+            bandwidth = path.NetworkStatistics.Bandwidth,
+            "path",
+        );
+    }
+    let Some(pair) = preferred else {
+        stalled.reset();
+        return false;
+    };
+    let Some(path) = preferred_entry(&paths, pair, direct) else {
+        // Not knowable this tick. Saying nothing is right: the alternative is
+        // judging the wrong path, and the wrong path here is a healthy one.
+        tracing::debug!("cannot tell which entry is the preferred path; not judging it");
+        stalled.reset();
+        return false;
+    };
+    stalled.sample(
+        path.Rtt,
+        path.NetworkStatistics.BytesInFlight,
+        tokio::time::Instant::now(),
+    )
+}
+
+/// Which statistics entry belongs to the path being preferred.
+///
+/// **The entries carry no addresses**, only a `PathId` that msquic says does not
+/// identify one — so this is positional, and the position depends on which of
+/// the two operations `prefer_path` performed.
+///
+/// **Without multipath the preferred path is the first entry.**
+/// `QuicPathSetActive` *swaps* it into `Paths[0]` (`seera-msquic`'s
+/// `src/core/path.c`): the activated path is copied to index 0 and the one it
+/// replaced takes its old slot. So after the `activate_path` fallback the last
+/// entry is the **demoted relay** — which reports a frozen `Rtt`, because no
+/// acknowledgement lands there any more, beside the *shared* `BytesInFlight`
+/// that every path carries when they share a `PathId`. Reading that pair as a
+/// stall would declare a perfectly healthy direct path dead within ten seconds
+/// of ordinary traffic, and this function existed to get that exactly backwards
+/// until review read the core.
+///
+/// **With multipath the id is known and is used.** `PathAdded` carried it, so
+/// `direct` has it; entries with any other id are certainly not this path. If
+/// more than one shares it — which happens when a rebinding path inherits the
+/// id of the one it replaces — there is no way to choose, and `None` says so.
+fn preferred_entry<'a>(
+    paths: &'a [msquic::ffi::QUIC_PATH_STATISTICS],
+    preferred: (SocketAddr, SocketAddr),
+    direct: &BTreeMap<(SocketAddr, SocketAddr), u32>,
+) -> Option<&'a msquic::ffi::QUIC_PATH_STATISTICS> {
+    let Some(&path_id) = direct.get(&preferred) else {
+        // No id for it means `prefer_path` took the `Switch` branch, which is
+        // the swap described above.
+        return paths.first();
+    };
+    let mut matching = paths.iter().filter(|p| p.PathId == path_id);
+    let first = matching.next()?;
+    match matching.next() {
+        None => Some(first),
+        Some(_) => None,
     }
 }
 
@@ -354,5 +604,165 @@ async fn stay_on_the_relay(conn: &Connection, shutdown: &CancellationToken) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(base: tokio::time::Instant, secs: u64) -> tokio::time::Instant {
+        base + Duration::from_secs(secs)
+    }
+
+    fn entry(path_id: u32, rtt: u64) -> msquic::ffi::QUIC_PATH_STATISTICS {
+        let mut stats: msquic::ffi::QUIC_PATH_STATISTICS = unsafe { std::mem::zeroed() };
+        stats.PathId = path_id;
+        stats.Rtt = rtt;
+        stats
+    }
+
+    fn pair(port: u16) -> (SocketAddr, SocketAddr) {
+        (
+            format!("127.0.0.1:{port}").parse().unwrap(),
+            format!("127.0.0.1:{}", port + 1).parse().unwrap(),
+        )
+    }
+
+    /// **Without multipath the preferred path is the first entry, not the
+    /// last.** `QuicPathSetActive` swaps the activated path into `Paths[0]` and
+    /// puts the one it replaced in its old slot, so the last entry is the
+    /// *demoted* relay — which reports a frozen RTT beside the shared bytes in
+    /// flight, and would be read as a stall on a healthy connection.
+    ///
+    /// This is the one the first version had backwards.
+    #[test]
+    fn without_multipath_the_active_path_is_the_first_entry() {
+        let paths = [entry(0, 1111), entry(0, 9999)];
+        let empty = BTreeMap::new();
+        let chosen = preferred_entry(&paths, pair(4000), &empty).expect("the active path");
+        assert_eq!(
+            chosen.Rtt, 1111,
+            "the swap puts the activated path at index 0",
+        );
+    }
+
+    /// With multipath the id came from `PathAdded`, so it is used.
+    #[test]
+    fn with_multipath_the_path_id_selects_the_entry() {
+        let paths = [entry(0, 1111), entry(7, 2222)];
+        let direct = BTreeMap::from([(pair(4000), 7)]);
+        let chosen = preferred_entry(&paths, pair(4000), &direct).expect("the preferred path");
+        assert_eq!(chosen.Rtt, 2222);
+    }
+
+    /// **And an id two entries share is not a choice.** A rebinding path
+    /// inherits the id of the one it replaces, so guessing between them risks
+    /// judging a path that is not the one carrying traffic — and the cost of
+    /// being wrong is sending a working forward back to the relay.
+    #[test]
+    fn a_shared_path_id_is_refused_rather_than_guessed() {
+        let paths = [entry(7, 1111), entry(7, 2222)];
+        let direct = BTreeMap::from([(pair(4000), 7)]);
+        assert!(preferred_entry(&paths, pair(4000), &direct).is_none());
+    }
+
+    /// The event that carries the limit describes the whole datagram, and what
+    /// portal hands over is the payload plus the session id.
+    #[test]
+    fn the_limit_is_compared_against_what_is_actually_sent() {
+        assert_eq!(
+            LARGEST_DATAGRAM,
+            crate::datagram::MAX_PAYLOAD + crate::datagram::HEADER,
+        );
+        assert!(
+            crate::datagram::encode(1, &vec![0; crate::datagram::MAX_PAYLOAD])
+                .expect("a payload at the limit")
+                .len()
+                == LARGEST_DATAGRAM,
+            "and that is the length that reaches send_datagram",
+        );
+    }
+
+    /// **A busy path is not a stalled one.** Data outstanding is what sending
+    /// looks like; what makes it a stall is the acknowledgements never coming,
+    /// and a moving RTT is an acknowledgement arriving.
+    #[tokio::test]
+    async fn a_path_that_is_answering_never_stalls() {
+        let t0 = tokio::time::Instant::now();
+        let mut stalled = Stalled::default();
+        for i in 0..60 {
+            // In flight the whole time, and the RTT moves — a working path
+            // under load.
+            assert!(
+                !stalled.sample(1000 + i, 4096, at(t0, i)),
+                "an acknowledged path must never be called stalled (at {i}s)",
+            );
+        }
+    }
+
+    /// **An idle path is not a stalled one either**, which is the other way to
+    /// get this wrong: a forward carrying nothing has no RTT sample to move,
+    /// and calling that dead would drop every quiet connection to the relay.
+    #[tokio::test]
+    async fn an_idle_path_never_stalls() {
+        let t0 = tokio::time::Instant::now();
+        let mut stalled = Stalled::default();
+        for i in 0..60 {
+            assert!(
+                !stalled.sample(1000, 0, at(t0, i)),
+                "nothing outstanding is idle, not dead (at {i}s)",
+            );
+        }
+    }
+
+    /// The case this exists for: data held, and not one acknowledgement.
+    #[tokio::test]
+    async fn data_held_with_no_acknowledgement_stalls_after_the_grace() {
+        let t0 = tokio::time::Instant::now();
+        let mut stalled = Stalled::default();
+        assert!(
+            !stalled.sample(1000, 4096, t0),
+            "the first sample only arms it"
+        );
+        assert!(
+            !stalled.sample(1000, 4096, at(t0, STALLED_GRACE.as_secs() - 1)),
+            "a second short of the grace is not yet a verdict",
+        );
+        assert!(
+            stalled.sample(1000, 4096, at(t0, STALLED_GRACE.as_secs())),
+            "held for the whole grace with an unmoving RTT is the failure",
+        );
+    }
+
+    /// **One acknowledgement resets the clock**, so a path that recovers is not
+    /// punished for the seconds before it did.
+    #[tokio::test]
+    async fn a_single_acknowledgement_starts_the_grace_again() {
+        let t0 = tokio::time::Instant::now();
+        let mut stalled = Stalled::default();
+        stalled.sample(1000, 4096, t0);
+        // Nine seconds of silence, then the RTT moves.
+        assert!(!stalled.sample(1000, 4096, at(t0, 9)));
+        assert!(!stalled.sample(1100, 4096, at(t0, 9)), "the RTT moved");
+        assert!(
+            !stalled.sample(1100, 4096, at(t0, 18)),
+            "and the grace runs from there, not from the first sample",
+        );
+        assert!(stalled.sample(1100, 4096, at(t0, 19)));
+    }
+
+    /// And going quiet in the middle does the same, because an idle spell is
+    /// not evidence either way.
+    #[tokio::test]
+    async fn going_idle_clears_what_was_seen() {
+        let t0 = tokio::time::Instant::now();
+        let mut stalled = Stalled::default();
+        stalled.sample(1000, 4096, t0);
+        assert!(!stalled.sample(1000, 0, at(t0, 5)), "nothing outstanding");
+        assert!(
+            !stalled.sample(1000, 4096, at(t0, 20)),
+            "the grace starts from here, not from before the quiet spell",
+        );
     }
 }
