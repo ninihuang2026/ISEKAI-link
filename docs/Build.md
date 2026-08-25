@@ -286,10 +286,16 @@ interactive.
 `scripts/camera-server.service` is a systemd unit that runs the script under
 a virtual display (`xvfb-run`), restarting it if it exits. It expects
 `camera-server` already built (`cargo build [--release] -p camera-server`
-from `rust/`) and `OPENCV_LIB_DIR` set for your machine — edit the
-`Environment=` line, and `User=`/`SupplementaryGroups=` if your setup
-differs from a single desktop user in the `video` group. Install and enable
-it with:
+from `rust/`). Every line that needs editing for your machine is marked
+`CHANGE-FOR-YOUR-MACHINE` in the unit file itself (`grep
+CHANGE-FOR-YOUR-MACHINE scripts/camera-server.service` to find them all) —
+as of writing that's `User=`, `SupplementaryGroups=` (only if your setup
+differs from a single desktop user in the `video` group — check `ls -la
+/dev/video0` if unsure), the `ExecStart=` path to this checkout's
+`run-camera-server.sh` (**easy to miss**: it is not `%h`-relative, so a
+checkout anywhere but `ninilouise`'s home needs this edited, or the unit
+fails to start pointing at a path that does not exist), and
+`Environment=OPENCV_LIB_DIR=...`. Install and enable it with:
 
 ```sh
 sudo cp scripts/camera-server.service /etc/systemd/system/

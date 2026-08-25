@@ -1,8 +1,11 @@
 #!/bin/sh
-# Launches camera-server headless: signs in from the persisted Auth0 session
-# and starts capture automatically (CAMERA_AUTOSTART), with no GUI
-# interaction needed for that. It does NOT open the P2P listener
-# automatically -- that still needs a human to click "Open" at least once.
+# Launches camera-server headless: picks up a previously-restored Auth0
+# sign-in (with_stored_auth0 reads the token file and builds the refresher;
+# it makes no network call itself -- the first call using it is whatever
+# needs a token next, which is not this script) and starts capture
+# automatically (CAMERA_AUTOSTART), with no GUI interaction needed for
+# either. It does NOT open the P2P listener automatically -- that still
+# needs a human to click "Open" at least once.
 #
 # That is deliberate, not a missing feature: an earlier version of this
 # script set P2P_AUTOSTART=1 too, which opened P2P (and, combined with
@@ -29,9 +32,11 @@ PROFILE="${PROFILE:-debug}"
 # a stale one from an earlier build can still be on disk -- nothing removes
 # it short of `cargo clean` -- so this doesn't just take the first match, it
 # picks the most recently built one. Matched by name only, not a hardcoded
-# `lib` path component: CMake's GNUInstallDirs puts the library under `lib`
-# or `lib64` depending on the distribution (see scripts/bundle-apps.sh's own
-# find_msquic, which has the same reasoning for the same problem).
+# subdirectory: CMake's GNUInstallDirs puts the library under `lib` or
+# `lib64` depending on the distribution, and on at least one real machine it
+# was under `out/artifacts` instead of either (confirmed in review) -- same
+# reasoning as scripts/bundle-apps.sh's own find_msquic, which searches this
+# broadly for the same reason, not a `lib`-vs-`lib64` split specifically.
 MSQUIC_LIB_DIR=$(find "target/$PROFILE/build/seera-msquic-"*/out -name 'libmsquic.so*' \
     -printf '%T@ %h\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)
 if [ -z "$MSQUIC_LIB_DIR" ]; then
