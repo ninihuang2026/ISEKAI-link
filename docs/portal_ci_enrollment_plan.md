@@ -769,7 +769,7 @@ Identity 仕様 §8.8.10 が「運用で最も踏まれる」と書いている�
 - `GithubActionsOidc` が audience ごとにキャッシュし、`exp` の手前で捨てる。
   環境変数が無ければ、何を設定すべきか（`permissions: id-token: write`）を名指しで言う。
 
-### フェーズ 3 — Proxy クライアント
+### フェーズ 3 — Proxy クライアント — **完了**
 
 §2.2。§8.13 の 5 メソッドと型、`redact_secrets`。
 
@@ -1211,11 +1211,23 @@ enroll / refresh / revoke の 3 経路についてで、**鍵の管理 API（§8
 `#[serde(default)]` を外した** — 一覧は冪等で再実行が安く、読めない形は黙らずに
 言うべきである。
 
-平文のほうは **`key_plaintext` を正とし、`key` も alias で受ける**。ここは
-**仕様と実装が食い違っている**（§8.8.2 の例は `key`、`openapi.yaml` と
-`enrollment.rs` は `key_plaintext`）ので、寛容にするのが正しい唯一の場所である —
-名前が合わないことの代償が、再試行ではなく鍵 1 本だからである。
-上流へ [ISEKAI-identity#35](https://github.com/seera-networks/ISEKAI-identity/issues/35) として報告した。
+平文のほうは **`key_plaintext` を正とし、`key` も alias で受ける**。報告した時点では
+**仕様と実装が食い違っていた**（§8.8.2 の例は `key`、`openapi.yaml` と `enrollment.rs` は
+`key_plaintext`）ので、寛容にするのが正しい唯一の場所だった — 名前が合わないことの代償が、
+再試行ではなく鍵 1 本だからである。
+
+> **解決した。** [ISEKAI-identity#35](https://github.com/seera-networks/ISEKAI-identity/issues/35)
+> は [#36](https://github.com/seera-networks/ISEKAI-identity/pull/36) で閉じ、§8.8.2 の例が
+> `key_plaintext` に直った。**alias は残す** — 代償の非対称は変わらないので、古い版を
+> 動かしている配備に対する 1 行の保険として置いておく。
+>
+> **同じ形のずれが他に 3 件見つかっている**（§8.8.2 の `status` / `revoked_at`、
+> §8.8.5 の `policy_distribution`、§8.8.9 の `proxy_notification`）。どれも
+> **こちらの型は影響を受けない** — serde が知らない項目を無視するためで、
+> `proxy_notification` に至っては §10.4 で既に足してある。
+> 上流は仕様の例と実際の応答を項目の経路で突き合わせるテストを入れた。
+>
+> 一覧の包みが `items` であることも、18 項目すべてを書いた例として仕様に載った。
 
 **加えて 3 件、設計の誤り。**
 
@@ -1335,3 +1347,91 @@ Credential` を足した。
 
 フェーズ 3（Proxy クライアント、§8.13）。§9.5 のとおり、フェーズ 5 の
 `--issue-enrollment-key` は `--permissions` を既定で `peer-connect:initiate` に絞る。
+
+---
+
+## 12. フェーズ 3 の結果
+
+`isekai-p2p-core::proxy` に §8.13 を実装した。テストは 11 本、ワークスペースは
+ビルドでき、触ったクレートの `fmt` / `clippy -D warnings` はクリーン。
+
+### 12.1 入ったもの
+
+`create_provisioning_key` / `list_provisioning_keys` / `provisioning_redemptions` /
+`revoke_provisioning_key` / `redeem_provisioning_key` と、
+`ProvisioningBinding` / `ProvisioningKey` / `ProvisioningKeyRecord` /
+`ProvisioningRedemption`。`RedeemedProvisioningKey` は `RedeemedTicket` の別名で、
+**同じ型をそのまま使う** — Proxy のハンドラ自身が「Ticket を引き換えられる
+クライアントが 2 つ目のパーサを要らないように」と書いている。
+
+`Grant` に `provisioning_key_id` を足し、`origin` の doc に `provisioning` を加えた。
+`redact_tickets` は `redact_secrets` になり、4 つの前置すべてを伏せる。
+`ProxyError::Problem` は `retry_after` を運び、`kind()` が生えた。
+
+### 12.2 サーバを読んで避けた取り違え
+
+**フェーズ 1 と同じ罠が、逆向きに置いてあった。**
+
+| | Identity（§8.8） | Proxy（§8.13） |
+| --- | --- | --- |
+| 平文の鍵 | `key_plaintext` | **`key`** |
+| 一覧の包み | `items` | **`keys`** |
+
+フェーズ 1 で `key_plaintext` / `items` に直したばかりなので、**対称だろうと考えて
+そちらに揃えていたら、今度は逆向きに間違えていた。** 2 つは別のサーバで別の仕様であり、
+Identity の §8.8.2 は「なぜ Proxy に揃えないか」を明記している。
+今回は最初にハンドラを読んだので踏まずに済んだ。テストのモックもサーバの名前で書いてある。
+
+**もう 1 つ、モックのほうが間違っていた。** `Problem` の `status` は必須で、Proxy の
+`ProblemBody` も実際に送っている。省いたフィクスチャを書いたせいで `kind()` が
+`None` になり、テストが 2 本落ちた — **コードではなくテストの側の誤り**だったが、
+「サーバが本当に送っているか」を確かめる手順を踏んでいなければ、`Problem` を緩めて
+しまうところだった。
+
+### 12.3 決めたこと
+
+- **一覧の包みは `#[serde(default)]` にしない。** フェーズ 1 の `items` と同じ理由で、
+  読めない形は黙って空を返すより言うべきである。「この Endpoint に鍵は無い」と
+  読めるのが、クォータ 4 を超えて発行する直前に人が見る画面である。
+- **`ProxyError::kind()` を足したが、使ってよい場面は限られる。** §8.13.6 が
+  未知・期限切れ・失効・不正形式を 1 つの `provisioning-key-invalid` に畳んでいるのは
+  意図であり、それを解こうとする呼び出し側は一様性が否定している oracle を作り直す
+  ことになる。**例外は `provisioning-binding-invalid`** で、こちらは「鍵は本物、CI の
+  設定が違う」と言っている — 畳み込むと運用者が漏洩と打ち間違いを区別できない。
+- **`ProvisioningBinding` は `binding` を省略可のままにする**（Identity 側とは逆）。
+  §8.8.2 が非対称の理由を書いている: 鍵が作るのは認可であって主体ではない。
+
+### 12.4 `/code-review high` の指摘
+
+**3 件。1 件目は、この PR が作った非対称そのものだった。**
+
+**1. 伏せる側だけ広げて、検出する側を残していた。** `portal-client` の `--pair` の
+ガードは `ticket_from_transfer` を使っており、`tkt1_` / `iskt1_` しか見ない。この PR は
+**その 1 行下の `redact_secrets` を 4 前置に広げながら、ガードは触っていなかった。**
+
+結果として、Provisioning Key を `--pair` に貼ると**ガードが鳴らず、256 ビットの秘密が
+`code` フィールドに載って Proxy のリクエストログへ行く** — ガードの上のコメントが
+「まさにそれを避けるためにある」と書いている事故である。
+
+`secret_prefix` を足し、ガードは 4 つすべてを見るようにした。**検出と伏せ字は同じ 4 つを
+知っていなければならない**ので、そのことをテストで固定した（`SECRET_PREFIXES` を回して
+両方を確認する）。伏せ字は「打ち間違えた後にログへ出さない」だけで、**送らせないのは
+検出のほう**である。片方だけ広げるのは、約束の静かなほうの半分だけ守ることになる。
+
+**2. `endpoint_cert.rs` のコメントが、この一連の変更で嘘になっていた。**
+「Proxy は `Retry-After: 30` を出すがこれは読まない — トランスポートはステータスと本文
+しか返さないので」と書いてあったが、**フェーズ 1 で `HttpResponse` にヘッダを足した時点で
+過去のもの**であり、しかもコメント自身が「読むほうが良い答えである」と書いていた。
+1 行で済むようになっていたので、読むようにした。**上限を 30 秒に置く** — Proxy が
+広告している値なので、ヘッダを尊重することが「ヘッダが正直なとき」より悪くなることは無い。
+
+**3. `ProvisioningKey.key` に `key_plaintext` の alias を足した。** 対称性を退けた
+議論は**改名に反対するもので、防御的な alias に反対するものではない**、という指摘。
+そのとおりで、代償の非対称（鍵 1 本 vs 再試行）はこちら側でも同じである。
+**いま食い違っているわけではない**ことは doc に明記した。
+
+### 12.5 次
+
+フェーズ 4（`portal-server` の発行系 CLI）。§9.5 のとおり、配備が
+`DEFAULT_PERMISSIONS` に `peer-provisioning:create` を入れていなければ
+`--provisioning-key` は `403` になる。
