@@ -754,7 +754,7 @@ Identity 仕様 §8.8.10 が「運用で最も踏まれる」と書いている�
 - `Enrolled` が `endpoint_id` と `endpoint_token` だけの応答をパースできる。
 - `429` の `Retry-After` が `IdentityError` に載る。
 
-### フェーズ 2 — 資格情報の継ぎ目
+### フェーズ 2 — 資格情報の継ぎ目 — **完了**
 
 §2.3。`Credential` / `Enrollment` / `AssertionSource` と `issue_endpoint_token` の分岐。
 13 か所の構築サイトの移行を含む。
@@ -1248,3 +1248,90 @@ enroll / refresh / revoke の 3 経路についてで、**鍵の管理 API（§8
 （§9.5）。後者は実装の話でもあり、フェーズ 5 の `portal-client --issue-enrollment-key`
 は `--permissions` を**既定で `peer-connect:initiate` に絞る**。省略が最小権限に
 ならない配備がありうる以上、省略の側を安全に倒しておく。
+
+---
+
+## 11. フェーズ 2 の結果
+
+`isekai-p2p` に実装した。**ワークスペース全体がビルドでき**、触ったクレートの
+テストは全て通る。`fmt` はクリーン、`clippy -D warnings` も触ったクレートについては
+クリーンである（`webrtc-app` と `channel-masque` には既存の指摘が 4 件・16 件あるが、
+`main` でも同じように出る）。
+
+### 11.1 入ったもの
+
+- **`Credential`**（`auth.rs`）。`P2pConfig` の `auth0_token` / `auth0` / `register` が
+  1 つになった。`register` は `Credential::Auth0` の**中**で、無人経路では書きようが無い。
+- **`AssertionSource`**（`auth.rs`）。`Auth0TokenSource` の隣、同じ形。
+  **`audience` を引数に取る。**
+- **`oidc` モジュール** — `GithubActionsOidc`（`ACTIONS_ID_TOKEN_REQUEST_*` から鋳造）と
+  `TokenFiles`（audience → パス、呼ばれるたびに読み直す）。
+- **`issue_endpoint_token` の分岐** — 未登録なら §8.8.4 → §8.8.5、登録済みなら
+  §8.2.2 → §8.2.3。判定は `Arc<tokio::sync::OnceCell<String>>`。
+
+移行した構築サイトは 13 か所。`Credential::auth0(token, source, register)` を置いたので、
+差分は各所 1〜数行に収まった。
+
+### 11.2 実装して分かったこと
+
+**`OnceCell` の「負けた側」を落としてはならない。** `get_or_try_init` は勝者の値を
+全員に返すが、**トークンは値ではなく副産物**である（§8.8.5 は登録と最初のトークンを
+1 往復で返す）。勝者はそのトークンを持ち、敗者は持たない。敗者を勝者のトークンで
+帰すと、1 時間前に発行された 15 分のトークンを返しうる。**勝者だけが自分の鋳造した
+トークンを返し、それ以外は更新へ落ちる**形にした（`unattended`）。
+並行 8 本のテストが、enroll が 1 回で `TOKEN.FROM.ENROL` を持つ呼び出しも 1 つだけ
+であることを固定している。
+
+**FFI の `cfg.auth0_token = …` が書けなくなった。** 構築後に代入していた箇所が 2 つあり、
+`directory_config` の引数に移した。**これは enum を入れた目的そのもの**である —
+「一瞬だけ誤った資格を名乗っている config」という状態が表現できなくなった。
+
+**`GithubActionsOidc` に `Debug` は付けない。** ランナーの bearer を持っているので、
+derive した `Debug` は「issue に貼られたログ行に秘密が載る」経路になる。テストは
+`unwrap_err()` ではなく `let Err(err) = … else` で書いた。
+
+### 11.3 `/code-review high` の指摘
+
+**5 件、いずれも実装して初めて立つ論点だった。**
+
+**1. `OnceCell` の鍵が守るべき不変条件と一致していなかった。** セルは `Enrollment`
+（＝資格情報）に載っているが、`409 endpoint-already-registered` が起きる条件は
+**鍵ペア**の性質である。1 本の Enrollment Key は複数の Endpoint を生やせる
+（`max_live_endpoints` が数えているのはそれ）ので、1 つの `Credential` を鍵の違う
+2 つの config で共有すると、**2 つ目は登録を飛ばして「登録されていない Endpoint」の
+更新へ行く**。セルに `cfg.key.endpoint_id()` を記録し、呼び出し側で突き合わせて、
+食い違えばその場で言うようにした。
+
+> **記録するのは応答が返した ID ではなく、手元の鍵の ID である。** §8.8.4 が既に
+> `endpoint_id` を公開鍵に束縛しているので、echo を信じる必要は無く、信じると
+> 「自分で導いた値についてサーバの同意に依存するガード」になる。
+
+**2. 「サーバには届いたが手元では失敗した登録」から戻れなかった。**
+`get_or_try_init` は失敗を憶えないので、応答本文の読み取り中に接続が切れた場合や、
+`Enrolled` がパースできない形（`identity.rs` が明示的に想定しているケース）では、
+**以後の全ての呼び出しが登録をやり直し、毎回 `409` を受ける** — 更新なら通ったのに、
+更新ループがそれをジョブの間じゅう繰り返す。**`409` はこのセルにとって成功である**
+として扱い、セルを埋めて更新へ落とすようにした。
+
+**3. `reqwest::Client::new()` にタイムアウトが無かった。** これは `OnceCell` の
+初期化子の中で走るので、ランナーの endpoint が接続を受けたまま黙ると、**同じ資格情報の
+並行呼び出しが全員そこで止まる** — 明確なエラーで落ちるはずのジョブがハングする。
+20 秒で切る。
+
+**4. コメントが逆のことを言っていた。** 「challenge の前に鋳造するのは assertion の
+寿命を 1 往復ぶん残すため」と書いていたが、**前に鋳造すれば検証時には 1 往復ぶん古い。**
+本当の理由は「鋳造に失敗しても challenge を無駄にしない」である（challenge は
+one-shot で 120 秒）。順序は変えず、理由を書き直した。
+
+**5. `Credential::enrollment` が enum を返すのに、builder は `Enrollment` にあった。**
+`Enrollment` はクレート外から構築できなかったので、assertion を足すには
+**起こり得ないアームを持つ `match`** を書くことになる — 新しいテストが実際にそう書いて
+いて、それが証拠になっていた。`Enrollment::new` を公開し、`From<Enrollment> for
+Credential` を足した。
+
+テストは 7 本になった（+2）。
+
+### 11.4 次
+
+フェーズ 3（Proxy クライアント、§8.13）。§9.5 のとおり、フェーズ 5 の
+`--issue-enrollment-key` は `--permissions` を既定で `peer-connect:initiate` に絞る。
