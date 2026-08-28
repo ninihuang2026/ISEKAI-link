@@ -50,6 +50,14 @@ use crate::agent::ObservedAddress;
 /// gone whatever the app still holds. Exported for that.
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The peer connection's MTU and what a datagram has left inside it.
+///
+/// **Defined one layer down**, in `isekai_p2p_core::transport`, because the
+/// listener half of this same connection is configured from `isekai-link-utils`
+/// — which cannot see this crate. A number that has to agree on both ends of a
+/// connection cannot live in a crate only one end depends on.
+pub use isekai_p2p_core::mtu::{DATAGRAM_OVERHEAD, GUARANTEED_DATAGRAM, PEER_MTU};
+
 /// How long the whole connection may go without sending before it gets a PING.
 ///
 /// Distinct from [`DIRECT_PATH_KEEPALIVE`], which is per path; this one is
@@ -185,21 +193,9 @@ pub fn client_config(
         // seconds with the viewer still sitting there. The listener side has
         // had this all along (`isekai_link_utils`); this side had not.
         .set_KeepAliveIntervalMs(CONNECTION_KEEPALIVE.as_millis() as u32)
-        // msquic clamps `MaximumMtu` up to QUIC_DPLPMTUD_MIN_MTU
-        // (1248), so asking for less is silently ignored — 1248 is what
-        // this connection actually uses, and stating it keeps the code
-        // honest about the cap it is applying.
-        //
-        // The cap exists so a video QUIC packet plus CONNECT-UDP
-        // encapsulation fits inside the relay tunnel's HTTP datagram.
-        // Without it the default 1500 overflows the tunnel and packets
-        // are dropped as `TooLarge`. The outer connection's
-        // `MinimumMtu` (see `isekai_p2p_core::transport`, which does the
-        // arithmetic) is what is sized to carry 1248 plus that
-        // encapsulation. Deliberately not repeated here: this said 1400
-        // for a while after that floor became 1350, and a number in two
-        // places is a number that disagrees with itself.
-        .set_MaximumMtu(1248)
+        // See [`PEER_MTU`]. Without a cap the default 1500 overflows the
+        // relay tunnel and packets are dropped as `TooLarge`.
+        .set_MaximumMtu(PEER_MTU)
         .set_PeerUnidiStreamCount(100)
         .set_StreamMultiReceiveEnabled();
     // Asked for by whoever will receive them, which is why it is an option
