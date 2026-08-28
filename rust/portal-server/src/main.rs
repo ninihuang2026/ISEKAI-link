@@ -45,8 +45,9 @@ use tokio_util::sync::CancellationToken;
     example = "\
 portal-server --login
 
-portal-server --key ./portal-server.pem --register \\
-              --config ./portal-server.toml --pair
+portal-server --key ./portal-server.pem --register --pair
+
+portal-server --key ./portal-server.pem --config ./portal-server.toml
 
 portal-server --grants",
     note = "\
@@ -78,13 +79,26 @@ The case to know is a large DNS response; docs/portal.md has the arithmetic.
 ",
     note = "\
 The proxy will not let two Endpoints talk until this side has authorised them,
-and there are two ways to do it. They are not alternatives of equal standing.
+and there are three ways to do it. They are not alternatives of equal standing.
 
 --pair shows a code. Whoever redeems it gets a GRANT, which is reusable, has no
 expiry unless one is set, and -- because a Grant's key does not name a listener
 (spec 8.8) -- keeps working when this server restarts onto a new listener id.
 That is what an installation should run on. Use --grants to see who is in and
 --revoke to take it away.
+
+Everything to do with authorising somebody answers and exits without serving:
+--pair, --ticket, --tickets, --revoke-ticket, --grants and --revoke all act on
+the Endpoint rather than on a listener, so a code can be issued while a server
+is already running rather than only by starting one. --allow is the exception;
+a capability is issued against the listener it is for.
+
+--ticket also ends in a grant, but one that EXPIRES ON ITS OWN, and you can
+have several outstanding at once -- a pairing code is one per protocol because
+a person is reading it off a screen. So this is the one for work that ends: a
+CI job, an agent sandbox, anywhere there is no screen and nobody to read a code
+aloud. It prints one string to send; --tickets shows who spent which, which is
+the only record of where a ticket went. --revoke-ticket tears up an unused one.
 
 --allow issues a CAPABILITY for one Endpoint. It is one-shot and lasts 300
 seconds at most, so it is for letting a guest in once. A peer that reconnects
@@ -149,9 +163,10 @@ struct Args {
     /// print a starter catalogue on stdout and exit
     #[argh(switch)]
     example_config: bool,
-    /// show a pairing code and let whoever redeems it in for good. This is
-    /// the one to use: a redeemed code is a Grant, which is reusable and
-    /// survives this server restarting
+    /// print a pairing code and exit, letting whoever redeems it in for good.
+    /// This is the one to use: a redeemed code is a Grant, which is reusable
+    /// and survives this server restarting. Needs no server running, so a
+    /// code can be issued while one already is
     #[argh(switch)]
     pair: bool,
     /// how long the pairing code lasts, in seconds. Clamped to 60..=300
@@ -173,6 +188,32 @@ struct Args {
     /// a person -- pass 300 unless the peer is already waiting
     #[argh(option)]
     capability_ttl: Option<u64>,
+    /// issue a TICKET and print the one string to hand over, then exit.
+    /// Unlike --pair, several can be outstanding at once -- run this again for
+    /// each -- and what redeeming one makes expires on its own
+    #[argh(switch)]
+    ticket: bool,
+    /// how long a --ticket stays redeemable, in seconds. Clamped to
+    /// 60..=86400, default 900. This is the life of the paper, not of the
+    /// access it grants
+    #[argh(option)]
+    ticket_ttl: Option<u64>,
+    /// how long the grant made by redeeming a --ticket lasts, in seconds.
+    /// Clamped to 60..=86400, default 3600. Cannot be unlimited
+    #[argh(option)]
+    grant_ttl: Option<u64>,
+    /// what a --ticket is for. Shown only to you, in --tickets, and carried
+    /// onto the grant whoever redeems it gets. 128 bytes at most
+    #[argh(option)]
+    ticket_label: Option<String>,
+    /// print the tickets this Endpoint has issued and who redeemed them, and
+    /// exit
+    #[argh(switch)]
+    tickets: bool,
+    /// tear up a ticket, by the id --tickets prints. A grant already made
+    /// from it stays -- use --revoke for that
+    #[argh(option)]
+    revoke_ticket: Option<String>,
 }
 
 /// Answer `--grants` and `--revoke`, which need no listener.
@@ -233,14 +274,113 @@ async fn grant_admin(args: &Args, cfg: &P2pConfig) -> anyhow::Result<()> {
             println!(
                 "grant       : {}  {}  ({}{})",
                 grant.grant_id,
-                grant.allowed_endpoint,
-                grant.origin,
+                grant.allowed_endpoint.as_deref().unwrap_or("?"),
+                grant.origin.as_deref().unwrap_or("origin unknown"),
                 grant
                     .label
                     .as_deref()
                     .map(|l| format!(", {l}"))
                     .unwrap_or_default(),
             );
+        }
+    }
+
+    if let Some(ticket_id) = &args.revoke_ticket {
+        proxy
+            .revoke_ticket(ticket_id)
+            .await
+            .with_context(|| format!("revoke ticket {ticket_id}"))?;
+        // The proxy answers 204 for an id it has never seen, so this says what
+        // is true either way rather than claiming something was there.
+        println!("ticket gone : {ticket_id}");
+        println!("A grant already made from it is untouched; --grants lists those.");
+    }
+
+    if args.pair {
+        // **Nothing here needs the listener**, however much it looks like it
+        // should: `POST /v1/peer/pairing-codes` names a protocol and a ttl and
+        // no listener at all (§8.9.1), because what a redeemed code makes is a
+        // Grant, whose key has no listener in it either (§8.8). That is the
+        // same reason `--ticket` sits on this path.
+        //
+        // It used to be minted by the running server, which meant a code could
+        // only be had by starting one -- so an installation with a server
+        // already up could not issue a code without standing a second one
+        // beside it, adding a row under this Endpoint for every client that
+        // then looks one up.
+        let code = proxy
+            .create_pairing_code(&cfg.protocol, args.pairing_ttl)
+            .await
+            .context("mint a pairing code")?;
+        println!("\npairing code: {}", code.code);
+        println!(
+            "  or the URI: {}",
+            isekai_p2p::agent::pairing_uri(&code.code)
+        );
+        println!("  expires at: {}", code.expires_at);
+        println!("\nThe peer runs: portal-client --pair {}", code.code);
+        println!("Once redeemed they can reconnect without asking again, and this");
+        println!("server can restart without breaking it.");
+    }
+
+    if args.ticket {
+        let ticket = proxy
+            .create_ticket(
+                &cfg.protocol,
+                args.ticket_ttl,
+                args.grant_ttl,
+                args.ticket_label.as_deref(),
+            )
+            .await
+            .context("issue a ticket")?;
+        // **The secret first.** Everything else here is optional, and the
+        // reason is that it is shown once: a response missing `created_at`
+        // must not cost the operator the one string they came for.
+        println!("\nHand over this one string:\n");
+        println!(
+            "  {}",
+            isekai_p2p::agent::ticket_transfer(
+                isekai_p2p::agent::proxy_authority(&args.proxy_url),
+                &ticket.ticket,
+            )
+        );
+        println!();
+        match &ticket.ticket_id {
+            Some(id) => println!("ticket id   : {id}  (--revoke-ticket takes this)"),
+            None => println!("ticket id   : not reported -- --tickets will list it"),
+        }
+        if let Some(at) = &ticket.expires_at {
+            println!("expires at  : {at}");
+        }
+        if let Some(ttl) = ticket.grant_ttl {
+            println!("grant ttl   : {ttl}s");
+        }
+        println!("\nThe peer runs: portal-client --redeem <that string>");
+        println!("\nIt works once, it is not shown again, and it is a secret until");
+        println!("it is spent -- send it the way you would send a password.");
+    }
+
+    if args.tickets {
+        let tickets = proxy.list_tickets().await.context("list tickets")?;
+        if tickets.is_empty() {
+            println!("No tickets outstanding.");
+        }
+        for ticket in &tickets {
+            let label = ticket
+                .label
+                .as_deref()
+                .map(|l| format!(", {l}"))
+                .unwrap_or_default();
+            match &ticket.redemption {
+                Some(r) => println!(
+                    "ticket      : {}  redeemed by {} as {} at {}{}",
+                    ticket.ticket_id, r.endpoint_id, r.grant_id, r.redeemed_at, label,
+                ),
+                None => println!(
+                    "ticket      : {}  unredeemed, expires {}{}",
+                    ticket.ticket_id, ticket.expires_at, label,
+                ),
+            }
         }
     }
     Ok(())
@@ -322,7 +462,27 @@ async fn run(args: Args) -> anyhow::Result<()> {
         return portal_core::login::sign_in(&tokens).await;
     }
 
-    if args.grants || args.revoke.is_some() {
+    // Everything here is an Endpoint-token call that names no listener
+    // (§8.8, §8.12), so none of it needs a server standing up first.
+    let administering = args.grants
+        || args.revoke.is_some()
+        || args.pair
+        || args.ticket
+        || args.tickets
+        || args.revoke_ticket.is_some();
+    // **`--allow` is the one that does need a listener**, and these paths exit
+    // before there is one. Dropping it quietly is the worst of the three
+    // options: the code or the listing would print, the run would look like it
+    // worked, and the capability nobody was issued would be discovered by the
+    // peer failing to connect.
+    if administering && !args.allow.is_empty() {
+        anyhow::bail!(
+            "--allow issues a capability against a running listener, and this run exits \
+             before there is one. Issue it from the run that serves, or use --pair \
+             or --ticket, which need no server"
+        );
+    }
+    if administering {
         return administer_grants(&args, &tokens).await;
     }
 
@@ -371,29 +531,6 @@ async fn run(args: Args) -> anyhow::Result<()> {
     // client on a grant looks the current one up for itself; only the
     // capability path needs it by hand, and only until the connect it is for.
     println!("listener id : {}", server.info.listener_id);
-
-    if args.pair {
-        // **`close()` on the way out of a failure, not `?`.** A listener this
-        // process registered and did not withdraw stays listed for its whole
-        // lease, and since phase 6 that is not merely untidy: it is a second row
-        // under this Endpoint for every client that connects on a grant.
-        let code = match server.show_pairing_code(args.pairing_ttl).await {
-            Ok(code) => code,
-            Err(e) => {
-                server.close().await;
-                return Err(e.context("mint a pairing code"));
-            }
-        };
-        println!("\npairing code: {}", code.code);
-        println!(
-            "  or the URI: {}",
-            isekai_p2p::agent::pairing_uri(&code.code)
-        );
-        println!("  expires at: {}", code.expires_at);
-        println!("\nThe peer runs: portal-client --pair {}", code.code);
-        println!("Once redeemed they can reconnect without asking again, and this");
-        println!("server can restart without breaking it.");
-    }
 
     for endpoint in &args.allow {
         let capability = match server.issue_capability(endpoint, args.capability_ttl).await {

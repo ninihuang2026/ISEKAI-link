@@ -161,16 +161,32 @@ in charge of where forwarded traffic goes.
 The file is read before anything touches the network, so a typo costs you a
 message naming the service rather than a half-started server.
 
-## 2. Start the server and show a pairing code
+## 2. Start the server
 
 ```sh
-portal-server --register --pair
+portal-server --register --config portal-server.toml
 ```
 
 ```
 endpoint id : ep:9z8y7x…
 listener id : pl_1a2b3c…
+```
 
+Leave it running. The listener id is printed for diagnostics: a client on a
+grant looks the current one up for itself, and only the one-shot capability
+path below needs it by hand.
+
+`--register` is only needed the first time, when the key is new. Keep
+`portal-server.pem`: a new key is a new Endpoint ID, and every grant made
+against the old one stops applying.
+
+## 3. Show a pairing code
+
+```sh
+portal-server --pair
+```
+
+```
 pairing code: K7QM-3XPD
   or the URI: isekai://pair?code=K7QM-3XPD
   expires at: 2026-08-22T07:31:04Z
@@ -182,11 +198,15 @@ Read the code to whoever should be let in. It lasts five minutes and can be
 redeemed once; asking again replaces it, so an unused code is not something you
 have to clean up.
 
-`--register` is only needed the first time, when the key is new. Keep
-`portal-server.pem`: a new key is a new Endpoint ID, and every grant made
-against the old one stops applying.
+**This does not start the server**, and does not need one running either. A
+pairing code names a protocol and nothing else — what redeeming it makes is a
+grant, and a grant's key has no listener in it — so it can be issued while a
+server is already up, which is the usual case once something is installed.
 
-## 3. Redeem it, once
+So this is a second terminal, not a second server — which is what it had to be
+before, and the reason for the change.
+
+## 4. Redeem it, once
 
 On the client machine:
 
@@ -210,7 +230,7 @@ asks the proxy which listener that Endpoint has now, every time it connects.
 `--register` on the first run only: the key was generated here and the Identity
 API has not seen it yet.
 
-## 4. Forward a port
+## 5. Forward a port
 
 ```sh
 portal-client --map 5432:db --map udp:5353:dns
@@ -270,6 +290,129 @@ command line does not, yet. `--peer` chooses which of several paired servers to
 connect to, not how many at once.
 
 ---
+
+## Letting in something that has no screen
+
+Pairing needs a person: one side shows eight characters, the other types them,
+and there is **one live code per protocol** because that is what fits on a
+screen. Three CI jobs cannot each have their own, and an agent sandbox has
+nobody to read a code aloud.
+
+A **ticket** is the same idea with those two constraints removed. It is a
+256-bit secret handed over out of band, several can be outstanding at once, and
+what redeeming one makes **expires on its own**.
+
+```sh
+portal-server --ticket --ticket-label ci-run-4821 --grant-ttl 3600
+```
+
+```
+Hand over this one string:
+
+  iskt1_eyJwIjoidG9reW8ubGluay5pc2VrYWkudG9vbHM6ODQ0MyIsInQiOiJ0a3QxX1FBODF…
+
+ticket id   : tkt_AbC12345  (--revoke-ticket takes this)
+expires at  : 2026-08-28T08:45:00Z
+grant ttl   : 3600s
+
+The peer runs: portal-client --redeem <that string>
+
+It works once, it is not shown again, and it is a secret until
+it is spent -- send it the way you would send a password.
+```
+
+The secret is printed **first, and before anything that could be missing from
+the proxy's answer**: it is shown once and never again, so nothing optional gets
+to come between you and it.
+
+```sh
+portal-client --redeem iskt1_eyJwIjoi… --map 5432:db
+```
+
+```
+let in by   : ep:9z8y7x…
+grant       : gr_AbC12345
+expires at  : 2026-08-28T09:32:00Z
+connection id: b7f0c1…
+tcp 127.0.0.1:5432 -> db
+```
+
+**Redeeming and connecting are one command.** Add `--map` and the same run goes
+on to forward, using the Endpoint it was just let in by — there is no reason to
+start the client twice, and the second run would only have to be told the peer
+the first one had this second been told. Leave `--map` off and it stops after
+redeeming, which is what you want when the ticket arrives before the work does.
+
+The same goes for `--pair`.
+
+After that it is an ordinary grant — `--map` alone, the listener looked up each
+time, restarts survived — until its expiry, at which point access ends without
+anyone having to remember to take it away. **That is what a ticket is for**:
+work that finishes.
+
+### Two lifetimes, and they are different quantities
+
+`--ticket-ttl` is how long the paper stays good; `--grant-ttl` is how long
+whoever presents it may stay. A 15-minute ticket making a 1-hour grant is the
+normal case, not a mistake. Both clamp to 60..=86,400 seconds, defaulting to 900
+and 3,600.
+
+**A ticket cannot make unlimited access.** That is the one thing pairing does
+that this deliberately does not.
+
+### The string carries the proxy, but does not choose it
+
+`--redeem` takes the whole `iskt1_` string rather than the bare secret, because
+a ticket by itself does not say **where** to spend it: presenting one to the
+wrong proxy is refused as an unknown ticket, with nothing in the answer to
+suggest the address was the problem.
+
+What it does **not** do is send you there. Redeeming presents this Endpoint's
+token, and the proof-of-possession covers the method, path and body but not the
+host — so a string composed by somebody else would otherwise decide where your
+credentials go. If the ticket names a proxy other than `--proxy-url`, portal
+stops and tells you what to pass:
+
+```
+Error: this ticket is for osaka.link.isekai.tools:8443, but --proxy-url is
+tokyo.link.isekai.tools:8443.
+```
+
+Pass that `--proxy-url` to the later commands too — **the grant lives at the
+proxy you redeemed at**, and `--map` looks it up wherever `--proxy-url` points.
+
+Put it in a link's **fragment** if you send one (`https://…/join#iskt1_…`): a
+path or a query ends up in `Referer` headers and access logs. `--redeem` takes
+that form too.
+
+Treat it as a password until it is spent. Both `iskt1_` and `tkt1_` are fixed
+prefixes so that secret scanners and `grep` can find one that got away. Handing
+a ticket to `--pair` by mistake is refused before anything is sent, rather than
+travelling to the proxy in a field meant for an eight-character code.
+
+### Seeing where they went
+
+```sh
+portal-server --tickets
+```
+
+```
+ticket      : tkt_AbC12345  redeemed by ep:4d5e6f… as gr_AbC12345 at 2026-08-28T08:32:00Z, ci-run-4821
+ticket      : tkt_Dd77e210  unredeemed, expires 2026-08-28T09:15:00Z, nightly-backup
+```
+
+**This is the only record of where a ticket went.** Whoever redeems binds
+themselves to it, and if the wrong party got there first this is where you see
+it — and the intended one finds out because their redemption is refused.
+
+```sh
+portal-server --revoke-ticket tkt_Dd77e210
+```
+
+Tearing up an unused ticket stops it being redeemable. **It does not remove
+anybody already let in by it** — that is a grant now, and `--revoke` is what
+takes a grant away. Tearing up the paper does not evict the person who already
+walked in.
 
 ## Letting somebody in just once
 
