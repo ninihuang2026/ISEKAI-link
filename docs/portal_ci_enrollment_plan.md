@@ -236,7 +236,22 @@ ID トークンの寿命（5〜15 分）と同じ桁かそれより長い。asse
    - **`reason` は渡せない。** Identity が `enrollment_released` を付ける。有人経路の
      `reason` は引き続き必須なので、`Auth0` と `Enrollment` で必須項が入れ替わる —
      型で分けずに `Option` 1 つで通すと、有人経路の `reason` 忘れが `400` になって初めて
-     分かる。**呼び分けは引数ではなく `IdentityAuth` の側で決まる**ことをテストで固定する。
+     分かる。
+
+   **この経路だけ `RevokeAuth` を別に持つ**（実装で決めた。改訂 2 は
+   「`IdentityAuth::Auth0` へ入れる」と書いていたが、`IdentityAuth` は登録・発行・更新が
+   共有する型なので、そこへ `reason` を積むと関係の無い経路まで持たされる）。
+
+   ```rust
+   pub enum RevokeAuth<'a> {
+       Auth0 { token: &'a str, reason: RevokeReason },
+       Enrollment { key: &'a str },
+   }
+   ```
+
+   `RevokeReason` も列挙型にする。語彙は閉じており、しかも**半分は呼び出し元のもので
+   はない** — `enrollment_idle` / `enrollment_key_revoked` は Identity が書く理由で、
+   要求に書くと弾かれる。応答と一覧には載るが要求には載らないので、この型には無い。
 
    できるのは**自分を止めることだけ**である（PoP がその Endpoint の秘密鍵を要求する）。
    漏れた鍵だけでは、同じ鍵で生やした別の Endpoint も、有人登録の Endpoint も止められない。
@@ -494,9 +509,12 @@ Listener を鍵に含まないという Proxy 仕様 §8.8 の設計の帰結**�
 「入った人は出ていかない」だが、Provisioning Key の失効は派生 Grant を消す
 （Proxy 仕様 §8.13.7 が意図的に反転させている）。走行中のジョブが落ちる、と出力に書く。
 
-**前提**: 発行には新しい permission `peer-provisioning:create` が要る（§8.13.2）。
-`peer-connect:accept` では発行できない。運用者の Endpoint の天井にこれが無ければ
-`403 insufficient-permission` で止まる — §5 のフェーズ 0 で確認する。
+**前提**: 発行には新しい permission `peer-provisioning:create` が要る
+（Proxy 仕様 §8.13.2）。`peer-connect:accept` では発行できない。
+
+> **ISEKAI-identity#34 で発行できるようになった。** ただし**既定では付かない** —
+> 配備が `DEFAULT_PERMISSIONS` に明示する必要があり、その粒度は配備全体である。
+> §9.2 / §9.5 を読むこと。**このフェーズのブロックは解けている。**
 
 ### 2.7 CI ワークフロー
 
@@ -704,7 +722,7 @@ Identity 仕様 §8.8.10 が「運用で最も踏まれる」と書いている�
 
 ## 5. フェーズ
 
-### フェーズ 0 — サーバ側の前提を確認する（実装なし）
+### フェーズ 0 — サーバ側の前提を確認する（実装なし）— **実施済み。§9 に結果**
 
 これが無いと以降のすべてが `404` か `403` になり、しかもクライアントのログは
 その理由を言わない。
@@ -719,7 +737,7 @@ Identity 仕様 §8.8.10 が「運用で最も踏まれる」と書いている�
 
 **受け入れ条件**: 上の 6 つが書き取られ、値が `docs/portal.md` の運用節に載っている。
 
-### フェーズ 1 — Identity クライアント
+### フェーズ 1 — Identity クライアント — **完了**
 
 §2.1。§8.2.2 / §8.2.3 / §8.8.2 / §8.8.4 / §8.8.5 / §8.8.9 と `IdentityAuth`。
 
@@ -807,6 +825,7 @@ $ portal-client --login                      # CI の Endpoint を所有する U
 $ portal-client --issue-enrollment-key \
     --binding-oidc token.actions.githubusercontent.com \
     --binding-subject 'repo:<org>/<repo>:ref:refs/heads/main' \
+    --permissions peer-connect:initiate \
     --protocols isekai-portal-v1 \
     --max-live-endpoints 8 --endpoint-idle-ttl 1800 \
     --enrollment-label gha-main
@@ -828,7 +847,7 @@ $ portal-server --provisioning-key \
 | 項目 | Enrollment Key | Provisioning Key |
 | --- | --- | --- |
 | protocol | `protocols` に `isekai-portal-v1` | `protocol` = `isekai-portal-v1` |
-| permission | `permissions` に `peer-connect:initiate` | （引き換え側に追加の権限は不要） |
+| permission | `permissions` に `peer-connect:initiate` **だけ**を明示（§9.5） | （引き換え側に追加の権限は不要） |
 | `binding.issuer` | 一致 | 一致 |
 | `binding.subject` | **完全一致**。ワイルドカード不可 | 同じ値 |
 | `binding.audience` | `isekai-identity`（運用者設定） | `isekai-proxy`（運用者設定） |
@@ -960,3 +979,272 @@ $ portal-server --grants                               # いま入っている�
   Proxy 仕様 §8.13.3 が明示しており、**どちらも交換の窓のために 1 ではなく 4 にした**と
   書いてある。ただし出典が無いと確かめようが無いので、§6.4 に引用を足し、
   `max_live_endpoints` の既定 4 と**別の数**であることを言い足した。
+
+---
+
+## 9. フェーズ 0 の結果
+
+Identity は `../ISEKAI-identity-0-a`（`main`、`aa8ae54` = #32 が入ったもの）、
+Proxy は `../ISEKAI-link-server-0-a`（`main`、`a5ccb0f`）を読んだ。
+**ソースが答えられるのは「何が設定できるか」までで、「稼働中の配備に何が設定されているか」は
+§9.4 のとおり未確認である。**
+
+### 9.1 6 項目の確認結果
+
+| # | 項目 | 結果 |
+| --- | --- | :---: |
+| 1 | `ENROLLMENT_KEYS_ENABLED` | ⚠ 既定 `0`。**立てる必要がある** |
+| 2 | `ENROLLMENT_OIDC_ISSUERS` に GitHub | ⚠ 既定 **空**。**足す必要がある** |
+| 3 | 2 つの audience の実値 | ✅ 既定のまま分かれている |
+| 4 | Proxy の `--p2p-provisioning-oidc-issuer` | ⚠ 既定 **空**。**足す必要がある** |
+| 5 | 運用者の天井に `peer-provisioning:create` | ⚠ **解決済み**（上流）。ただし配備で明示が要る。§9.2 |
+| 6 | 発行者の天井（`peer-connect:initiate` / `isekai-portal-v1`） | ⚠ 権限は既定で足りる。**protocol は既定に無い** |
+
+**1.** `state.rs` の `env_flag("ENROLLMENT_KEYS_ENABLED")`。偽なら §8.8 の経路を router へ
+マウントしない（`403` ではなく `404`）。
+
+**2.** 空のまま起動すると「`binding.type` は `none` しか作れない」と警告が出る。
+`https` 以外を書くと**起動しない**（SSRF の入口なので、起動を止めて運用者に見せる設計）。
+
+**3.** Identity は `ENROLLMENT_OIDC_AUDIENCE` の既定が `isekai-identity`、Proxy は
+`--p2p-provisioning-oidc-audience` の既定が `isekai-proxy`。どちらもコードのコメントが
+「利用者は指定できない」と明記している。**§4.3 の前提はそのまま成り立つ。**
+
+**4.** `--p2p-provisioning-oidc-issuer` は繰り返し指定で、既定は空 =「何も許さない」。
+起動時に「https で host を持つ URL」を検証して、違えば起動を止める。
+
+**6.** permission の天井は `DEFAULT_PERMISSIONS`（既定は §7 の全 5 権限で、
+`peer-connect:initiate` を含む）。protocol の天井は `resolve_ceiling` を通る
+per-user の値で、**サーバ既定は組織テナントが `["isekai-validator-v1"]`、
+個人テナント（`org_id` を持たない利用者）は空 = 1 つも許さない**。
+したがって `isekai-portal-v1` は、`DEFAULT_PROTOCOLS` / `INDIVIDUAL_PROTOCOLS`、
+またはそのユーザーの `protocol_ceilings` の行として**明示的に入れる必要がある**。
+portal が今日動いている配備では既に入っているはずだが、**それは配備の事実であって
+既定ではない**（§9.4）。
+
+### 9.2 ~~ブロッカー~~: `peer-provisioning:create`（解決済み）
+
+> **解決した。** [ISEKAI-identity#34](https://github.com/seera-networks/ISEKAI-identity/pull/34)
+> が `Permission::PeerProvisioningCreate` を足し、仕様 §7 の権限表にも入れた
+> （`28d659e`）。**フェーズ 4 のブロックは解けている。**
+>
+> **ただし既定では付かない。** 提案どおり `DEFAULT_PERMISSIONS` の既定には入っておらず、
+> 要る配備が明示する。**そして粒度は配備全体である** — permission を主体ごとに配る器が
+> 無いので、有効にすると**以後その配備で登録される全 Endpoint に付く**。上流も
+> 「発行できないよりは配備全体で有効にできるほうがよい」という順序で閉じ、粒度は
+> 仕様 §8.8.12-6 に残している。
+>
+> **こちらに 2 つ効く。** §9.5 に書いた。
+>
+> 以下は当時の分析で、記録として残す。
+
+#### 当時の分析: Identity は `peer-provisioning:create` を発行できない
+
+**Proxy は要求する。**
+
+```rust
+// isekai-link-server/src/p2p/handlers.rs — create_provisioning_key
+require_permission(&claim, permission::PEER_PROVISIONING_CREATE)?;
+```
+
+**Identity は発行できない。** 権限は完全一致でパースされ、未知の文字列は `None` になる。
+
+```rust
+// ISEKAI-identity/src/domain/permission.rs
+pub enum Permission {
+    UdpListenPublicCreate, UdpListenPublicDelete,
+    PeerListenerPrivateCreate, PeerConnectInitiate, PeerConnectAccept,
+}
+```
+
+**そして、これは実装の抜けではなく仕様の食い違いである。** Identity 仕様 §7 の権限表は
+この 5 つで閉じており、`peer-provisioning:create` はどこにも無い — 唯一の言及は
+§8.8.12-5（未解決）で、Proxy 仕様が新設したことに触れているだけである。
+一方 Proxy 仕様 §8.13.2 は「**§5.4 の permission 表に 1 行加える**」と書いている。
+**§5.4 は Proxy 仕様の表であり、その値を実際に鋳造するのは Identity である。**
+片方の仕様が、もう片方が発行する語彙を、もう片方に断らずに増やしている。
+
+**影響。** `portal-server --provisioning-key`（フェーズ 4）が必ず
+`403 insufficient-permission` になる。Provisioning Key を作れないので **P2 が塞がらず、
+CI から接続できない**（§0 の「片方だけでは用を成さない」がそのまま起きる）。
+
+**回避策は無い。**
+
+| 案 | 判定 |
+| --- | --- |
+| Identity に権限を足す（上流） | **これしかない。** 語彙は Identity が持っている |
+| `DEFAULT_PERMISSIONS` に文字列で足す | 不可。`Permission::parse` が `None` を返し、環境変数は `filter_map` で黙って落とす |
+| Proxy 側の `require_permission` を外す | 不可。Proxy 仕様 §8.13.1 が「補償の 1 つ目」に数えており、外すなら Provisioning Key を出荷してはならない |
+
+**上流へ上げる。** 要るのは Identity 仕様 §7 に 1 行と、`Permission` に 1 列挙子である。
+`DEFAULT_PERMISSIONS` の既定に入れるかどうかは別の判断で、**入れないほうがよい** —
+Proxy 仕様 §8.13.2 が「既存の Endpoint Token に自動で付いてはならない」と書いているのは
+まさにこの点であり、既定に入れると全 Endpoint に付いてしまう。運用者が
+`DEFAULT_PERMISSIONS` で明示するか、エンタイトルメントで配る形が筋である。
+
+*（→ #34 はこのとおりに閉じた。既定には入れず、`DEFAULT_PERMISSIONS` の綴り違いと
+空指定で起動を止めるようにもなっている — 黙って落とす形が「回避策を試して何も起きない」
+の正体だった。）*
+
+### 9.5 #34 がこちらに効く 2 点
+
+**1. フェーズ 0 の確認項目が 1 つ増える。**
+
+`DEFAULT_PERMISSIONS` に `peer-provisioning:create` が入っているか。既定では付かず、
+入っていなければ `portal-server --provisioning-key` は従来どおり
+`403 insufficient-permission` である。§9.4 の一覧に足す。
+
+**2. Enrollment Key は `permissions` を明示しなければならない。**
+
+**これが本題である。** `EnrollmentGrant::clamp` は `requested_permissions` が `None` の
+とき**天井をそのまま焼き付ける**。天井は `DEFAULT_PERMISSIONS` なので、上の 1 を
+有効にした配備で `permissions` を省いて鍵を作ると、**CI の Endpoint に
+`peer-provisioning:create` が付く。**
+
+```text
+DEFAULT_PERMISSIONS に peer-provisioning:create を足す（portal-server が要る）
+  → Enrollment Key の permissions を省略
+    → CI の Endpoint が Provisioning Key を発行できる
+      → CI から、portal-server への恒久的な到達を配れる
+```
+
+CI ランナーに要るのは `peer-connect:initiate` **だけ**である。§6.1 の発行例に
+`--permissions peer-connect:initiate` を足した。**省略が最小権限にならない配備が
+ありうる**、というのが #34 の粒度の話がこちらへ届く形である。
+
+（Proxy 仕様 §8.13.2 が「引き換え側に必要な permission は `peer-connect:initiate` のみ」と
+書いているとおりで、鍵を配る側と使う側は非対称である。）
+
+### 9.3 ついでに分かったこと
+
+- **Proxy の §8.13 は常時マウントされている**（gate が無い）のに、Identity の §8.8 は
+  既定で無効である。**片側だけ準備しても気づけない** — Provisioning Key は作れるのに
+  Enrollment Key の経路が `404` を返す、という状態が普通に起こりうる。
+  フェーズ 0 を「実装なし」で残したのはこのためである。
+- **Enrollment Key の permission 天井は、発行者が実際に持っている権限ではなく
+  サーバ既定 `DEFAULT_PERMISSIONS` である。** protocol だけが per-user の天井を通る。
+  仕様 §8.8.2 の「発行者が自分で登録したときに得られたもの」と読み合わせれば一貫している。
+- **個人テナントの protocol 既定が空**なのは、CI 用の Enrollment Key を個人アカウントで
+  発行しようとしたときに `403 protocol-not-allowed` として現れる。エラーは
+  「その protocol は許されていない」としか言わないので、**テナントの種類を先に確かめる。**
+
+### 9.4 稼働中の配備について未確認のもの
+
+ソースからは決まらない。運用者に訊くか、配備へ問い合わせるかが要る。
+
+1. `identity.isekai.tools:9443` で `ENROLLMENT_KEYS_ENABLED` が立っているか
+   （立っていなければ §8.8 の全経路が `404`）
+2. その `ENROLLMENT_OIDC_ISSUERS` に GitHub の issuer が入っているか
+3. `tokyo.link.isekai.tools:8443` に `--p2p-provisioning-oidc-issuer` が渡されているか
+4. CI の Endpoint を持つ User の protocol 天井に `isekai-portal-v1` が入っているか
+5. **`DEFAULT_PERMISSIONS` に `peer-provisioning:create` が入っているか**（§9.5）。
+   入っていなければ `--provisioning-key` は `403`。入れる場合は、その配備で以後
+   登録される**全 Endpoint に付く**ことを承知のうえで入れる
+
+**1 は無認証の要求 1 本で判別できる**（経路が無ければ `404`、あれば `401`）が、
+本番配備への問い合わせなので運用者の了解を取ってから行う。
+
+---
+
+## 10. フェーズ 1 の結果
+
+`isekai-p2p-core` に実装した。`cargo test -p isekai-p2p-core` は 75 本が通り、
+`fmt` / `clippy -D warnings` はクリーン。`isekai-p2p` / `portal-core` / `portal-client` /
+`portal-server` も通る。
+
+### 10.1 入ったもの
+
+| 仕様 | API |
+| --- | --- |
+| §8.2.2 / §8.2.3 | `refresh_challenge` / `refresh_token` |
+| §8.8.4 / §8.8.5 | `enroll_challenge` / `enroll` |
+| §8.8.2 / §8.8.9 | `create_enrollment_key` / `list_enrollment_keys` / `enrollment_key_enrollments` / `revoke_enrollment_key` |
+| §8.7 | `revoke_endpoint`（有人・自己失効の両方） |
+
+型は `IdentityAuth` / `RevokeAuth` / `RevokeReason` / `Enrolled` / `Binding` /
+`NewEnrollmentKey` / `IssuedEnrollmentKey` / `EnrollmentKeyRecord` /
+`EnrollmentRecord` / `Revoked` / `RevokedEnrollmentKey`。
+
+### 10.2 計画に無かった変更: `HttpResponse` がヘッダを持つ
+
+**`Retry-After` はヘッダにしか無い。** 計画の §2.1-7 は「`IdentityError` に
+`retry_after` を載せる」と書いていたが、`HttpResponse` が `status` と `body` しか
+運んでいなかったので、**そもそも読めなかった**。Identity 側は
+`AppError::into_response` で `RETRY_AFTER` ヘッダを立てるだけで、Problem のボディには
+入れない。
+
+`HttpResponse` に `headers: Vec<(String, String)>` を足し、`https.rs` と
+`transport.rs` の両方で詰めるようにした。`retry_after()` は delta-seconds 形式だけを
+読む — HTTP-date 形式はどちらのサーバも送らず、**半端に解釈した日付は「答えが無い」より
+悪い**（呼び出し元自身の後退は健全な代替だが、0 と読んだ日付はそうではない）。
+
+### 10.3 サーバ実装と突き合わせて分かったこと
+
+仕様だけでは決まらず、`../ISEKAI-identity-0-a` を読んで確定させた点。
+
+- **自己失効に `Authorization` を付けてはならない。** ハンドラは
+  「**Auth0 認証が失敗したときにだけ**ボディの鍵を見る」構造になっている
+  （`revoke.rs` の `match Auth0Auth::from_parts`）。両方を送ると人として判定される
+  経路へ入る。`IdentityAuth::Enrollment` がヘッダを出さないのは、そのための
+  仕様であって作法ではない。
+- **`refresh/challenge` のボディは `{endpoint_id, enrollment_key}` だけ。**
+  `RefreshChallengeRequest` に `assertion` の項が無い。ISEKAI-identity#32 の回答どおり。
+- **`enroll` の応答は `EnrollResponse` の全項を必ず返す。** それでも `Enrolled` は
+  `endpoint_id` と `endpoint_token` 以外を省略可のままにした。サーバが返さない想定では
+  なく、**パースに失敗した登録応答の代償が取り返せない**（枠・Challenge・鍵ペアを
+  同時に失う）ためである。
+
+### 10.4 `/code-review high` の指摘（改訂 3）
+
+**2 件、サーバの wire format と食い違っていた。** どちらも「仕様の文面から書き、サーバで
+確かめなかった」型の誤りである — §10.3 で「サーバを読んで確定させた」と書いたのは
+enroll / refresh / revoke の 3 経路についてで、**鍵の管理 API（§8.8.2 / §8.8.9）は
+確かめていなかった。**
+
+| 誤り | 正 | 症状 |
+| --- | --- | --- |
+| 発行応答の平文が `key` | **`key_plaintext`** | パースに失敗し、**鍵を 1 本失う**（クォータは減り、二度と表示されない） |
+| 一覧の包みが `keys` | **`items`** | `serde(default)` のせいで**エラーにならず空を返す** |
+
+2 つ目のほうが悪い。「この owner に鍵は無い」と読めてしまい、それを見た運用者が
+5 本目を発行して `429 enrollment-key-quota-exceeded` を踏む。**`items` は
+`#[serde(default)]` を外した** — 一覧は冪等で再実行が安く、読めない形は黙らずに
+言うべきである。
+
+平文のほうは **`key_plaintext` を正とし、`key` も alias で受ける**。ここは
+**仕様と実装が食い違っている**（§8.8.2 の例は `key`、`openapi.yaml` と
+`enrollment.rs` は `key_plaintext`）ので、寛容にするのが正しい唯一の場所である —
+名前が合わないことの代償が、再試行ではなく鍵 1 本だからである。
+上流へ [ISEKAI-identity#35](https://github.com/seera-networks/ISEKAI-identity/issues/35) として報告した。
+
+**加えて 3 件、設計の誤り。**
+
+- **`revoke_endpoint` が `EndpointKey` しか受け取っていなかった。** 有人経路
+  （`device_lost` / `admin_revoke` / `security_incident`）は**その端末の秘密鍵を
+  持たない人**が呼ぶものなので、鍵から `endpoint_id` を導くと「自分が秘密鍵を持つ
+  Endpoint しか失効させられない」API になっていた。`RevokeAuth::Auth0` が
+  `endpoint_id` を、`Enrollment` が `endpoint: &EndpointKey` を取る形に分けた。
+  **型が経路の違いを言う**ようになった。
+- **`binding.type` が `sub` / `tenant` の鍵を引き換えられなかった。** §8.8.3 は
+  Auth0 AT を**併せて**要求するが、`IdentityAuth::Enrollment` にその口が無く、
+  `enroll_challenge` は `bearer` を `None` に固定していた。`create_enrollment_key` は
+  `Binding::Sub` / `Binding::Tenant` を発行できるので、**引き換えられない鍵を作れる**
+  状態だった。`auth0: Option<&str>` を足し、`IdentityAuth::enrollment(key)` /
+  `.with_assertion()` / `.with_auth0()` を用意した。
+- **`RevokedEnrollmentKey` が `proxy_notification` を落としていた。** `Revoked` には
+  「`200` は止まったことを意味しない」と書いておきながら、カスケードの側で同じ危険を
+  見えなくしていた。鍵を止めるのは漏洩の場面である。
+
+テストは 15 本になった（+5）。**モックはサーバの名前で書く** — 仕様の例で書いたことが
+1 つ目の誤りをテストごと隠していた。
+
+### 10.5 次
+
+**ブロッカーは無くなった。** ISEKAI-identity#34 が `peer-provisioning:create` を
+発行できるようにしたので（§9.2）、フェーズ 2〜6 はどれも順に進められる。
+
+残る条件は運用側の 1 行 — `DEFAULT_PERMISSIONS` に `peer-provisioning:create` を
+足すこと — と、**それに伴って Enrollment Key の `permissions` を明示すること**
+（§9.5）。後者は実装の話でもあり、フェーズ 5 の `portal-client --issue-enrollment-key`
+は `--permissions` を**既定で `peer-connect:initiate` に絞る**。省略が最小権限に
+ならない配備がありうる以上、省略の側を安全に倒しておく。
