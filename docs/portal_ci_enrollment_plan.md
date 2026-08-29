@@ -779,7 +779,7 @@ Identity 仕様 §8.8.10 が「運用で最も踏まれる」と書いている�
   読まない（既存テストの拡張）。
 - `403 provisioning-binding-invalid` が `provisioning-key-invalid` と別の型として届く。
 
-### フェーズ 4 — `portal-server` の発行系
+### フェーズ 4 — `portal-server` の発行系 — **完了**
 
 §2.6。既存の `grant_admin` に 4 フラグ。
 
@@ -1435,3 +1435,115 @@ Identity の §8.8.2 は「なぜ Proxy に揃えないか」を明記してい�
 フェーズ 4（`portal-server` の発行系 CLI）。§9.5 のとおり、配備が
 `DEFAULT_PERMISSIONS` に `peer-provisioning:create` を入れていなければ
 `--provisioning-key` は `403` になる。
+
+---
+
+## 13. フェーズ 4 の結果
+
+`portal-server` に 4 つのフラグと、それを支える 2 つの補助関数。テスト 3 本
+（`portal-server` に初めてテストが入った）、ワークスペースはビルドでき、
+触ったクレートの `fmt` / `clippy -D warnings` はクリーン。
+
+### 13.1 入ったもの
+
+| フラグ | 対応 |
+| --- | --- |
+| `--provisioning-key` | §8.13.3。`--provisioning-ttl` / `--grant-ttl` / `--max-live-grants` / `--binding-oidc` / `--binding-subject` / `--provisioning-label` |
+| `--provisioning-keys` | §8.13.7 一覧。**枠は `live/max` の両方**を出す |
+| `--provisioning-redemptions <id>` | §8.13.7 引き換え記録 |
+| `--revoke-provisioning-key <id>` | §8.13.7 失効 |
+
+`--grant-ttl` は `--ticket` と**共用する**。同じ意味の値であり、フラグを分けると
+「どちらがどちらに効くのか」を help で説明する羽目になる。
+
+### 13.2 出力で決めたこと
+
+**`--revoke-provisioning-key` は `--revoke-ticket` と逆のことを言う。**
+Ticket の失効は「破いた紙で入った人は出ていかない」だが、こちらは派生 Grant を消す。
+出力にそう書いた — 走行中のジョブが認可を失うこと、確立済みの接続は切れないこと、
+記録は残ること。**2 つの出力を読み比べて矛盾しない**ことが受け入れ条件だった。
+
+**`--provisioning-key` は audience を出す。** これは運用者が推測できず設定もできない値で
+（Proxy が自分の設定から取る）、**CI を設定する人がその値を知る唯一の経路が
+この出力**である。載っていなければ「Proxy の運用者に訊け」と言う。
+
+**`--provisioning-keys` は `live/max` を両方出す。** 天井だけでは「この鍵がジョブを
+断っているか」が分からない。`provisioning-slots-exhausted` を踏んだ運用者が見るのは
+この行である。
+
+**引き換え記録は「回数」を出す。** 行は Endpoint、`redeem_count` は訪問回数であり、
+長寿命ランナーが 1 日に何十回更新しても行は 1 つ。行だけ出すと誰も訊いていない質問に
+答えることになる。
+
+### 13.3 実装して分かったこと
+
+**binding の検証は認証より前に置く。** 最初は `grant_admin` の中に書いていたが、
+そこは sign-in と Identity への 1 往復のあとである。**引数だけで分かる誤りに、
+ネットワークを 1 往復させてから答える理由が無い** — `portal-client` が
+`check_ticket` について同じことをしている。`administer_grants` の先頭へ移した。
+
+**応答の `binding` を `serde_json::Value` にしていたのを型にした。**
+`portal-server` に `serde_json` を足すか、型を作るかの二択で、後者を選んだ。
+`BindingView` の `kind` は **`String` のまま**にしてある — 要求側は Proxy が知る型を
+名乗る必要があるが、応答側は読めれば足り、知らない型 1 つで一覧全体のパースが
+止まるのは §8.13.9（型の追加は未解決）に対して不必要に壊れやすい。
+
+**`portal-server` にテストが 1 本も無かった。** binding の組み立ては純粋関数なので、
+これで固定できる。
+
+> **「この環境では起動できない」は誤りだった。** `./target/debug/portal-server` を
+> 直接叩いて `libmsquic.so.2` が見つからず、そう結論していた。`libmsquic` は
+> `seera-msquic` のビルドスクリプトの出力にしか無く（誰もインストールしない）、
+> **`cargo run` はそこをローダのパスに載せる** — Build.md §5 が `cargo run` で
+> 書いているのはそのためである。
+>
+> 実際に走らせて、3 つのガードが**ネットワークに触れる前に**発火することと、
+> help が意図どおり出ることを確認した。そこで 1 つ見つかった: argh の doc コメントは
+> **ターミナルにそのまま出る**ので、`**強調**` が literal のアスタリスクとして
+> 表示されていた。この repo の help は大文字で強調する（`EXPIRES ON ITS OWN`）ので、
+> それに合わせた。
+>
+> Build.md にはこの罠が書かれていなかったので、§5 と Troubleshooting に足した
+> （知識は `scripts/bundle-apps.sh` の冒頭にだけあった）。§5 の一覧に
+> `portal-server` / `portal-client` が入っていなかったのも埋めた。
+
+### 13.4 `/code-review high` の指摘
+
+**8 件。うち 1 件は、このフェーズの型付けが自分で開けた穴だった。**
+
+**1. `BindingView.kind` を必須にしてしまっていた。** `ProvisioningKey` は
+「秘密以外は全て省略可」と自分で書いている — パースに失敗した発行応答は
+**鍵 1 本とクォータ 1 枠の損失**だからである。ところが `binding` を
+`serde_json::Value`（何でもパースする）から型にした結果、**`type` の無い `binding` が
+応答全体を落とす**ようになっていた。`#[serde(default)]` を `Option` に付けても
+「在るが読めない」は救えない。`kind` に `default` を足し、テストで固定した。
+
+**2. `--grant-ttl` の help が ticket の clamp しか言っていなかった。** 共用にした
+判断そのものは変えないが、**2 つは clamp が違う**（ticket は 60..=86400 / 既定 3600、
+provisioning key は 60..=3600 / 既定 1800）。黙って丸められると、CI ジョブが
+1 時間で認可を失う。両方を書いた。
+
+**3・4. 出力が、この build に無いものを指していた。** help も発行時の出力も
+「peer が引き換える」と書いていたが、**`portal-client` に引き換えるフラグがまだ無い**
+（フェーズ 5）。指示どおりにすると、使えない標準的な資格情報が CI のシークレット
+ストアに置かれ、しかも `--provisioning-ttl` は数え始めている。両方に明記した。
+
+**5. `print_binding` が `None` で黙っていた。** `--binding-oidc` を渡した運用者は、
+行が無いことを「報告すべきことが無い」と読む — 実際には「束縛できたか言えない」で
+あり、その差は**鍵の文字列だけで入れるかどうか**である。「not reported」と言う。
+
+**6. binding のフラグが、効かない run では黙って捨てられていた。**
+`--provisioning-key` を付けずに `--binding-oidc` を渡すとサーバが普通に起動する。
+**隣の `--allow` のガードが避けているのと同じ失敗**なので、同じように弾く。
+
+**7. 一覧が `binding` を読んで捨てていた。** 「自分の鍵のうちどれが束縛の無い
+bearer か」は、この PR 自身の言い分では**最も安全に関わる質問**である。答えられる
+出力が 1 つも無かった。`UNBOUND` / `oidc <subject>` を行に出す。
+
+**8. テストの doc コメントを孤児にしていた。** 新しいテストを、既存の doc コメントと
+その本体の間に挿入していた。
+
+### 13.5 次
+
+フェーズ 5（`portal-client` の CI 経路と `keep_the_grant`）。§9.5 のとおり
+`--issue-enrollment-key` は `--permissions` を既定で `peer-connect:initiate` に絞る。
