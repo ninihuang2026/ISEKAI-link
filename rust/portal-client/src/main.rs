@@ -13,7 +13,8 @@
 //! `--map` reaches the server, which only ever sees the service name.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::Context as _;
 use argh::FromArgs;
@@ -169,6 +170,144 @@ struct Args {
     /// server's services
     #[argh(option, default = "std::net::IpAddr::from([127, 0, 0, 1])")]
     bind: std::net::IpAddr,
+    /// register this Endpoint with an ENROLLMENT KEY instead of signing in.
+    /// For a job with nobody at the keyboard. The key comes from
+    /// ISEKAI_ENROLLMENT_KEY or --enrollment-key-file, never from an argument
+    #[argh(switch)]
+    enroll: bool,
+    /// read the Enrollment Key from this file rather than
+    /// ISEKAI_ENROLLMENT_KEY
+    #[argh(option)]
+    enrollment_key_file: Option<PathBuf>,
+    /// read the Provisioning Key from this file rather than
+    /// ISEKAI_PROVISIONING_KEY. Redeeming it is what authorises this Endpoint
+    /// to reach the server, and this run redeems it again to extend the grant
+    #[argh(option)]
+    provisioning_key_file: Option<PathBuf>,
+    /// where to get the workload identity token a bound key needs: `github`
+    /// (GitHub Actions), `files` (one per audience, see --oidc-token-file) or
+    /// `none`. Default `none`
+    #[argh(option, default = "String::from(\"none\")")]
+    oidc: String,
+    /// an `audience=path` pair for --oidc files. Repeatable, and both
+    /// audiences are needed: the Identity API and the proxy deliberately want
+    /// different tokens
+    #[argh(option)]
+    oidc_token_file: Vec<String>,
+    /// issue an ENROLLMENT KEY and print it once, then exit. This is what lets
+    /// a job register an Endpoint of its own. Needs a sign-in: you are
+    /// delegating what you can already do
+    #[argh(switch)]
+    issue_enrollment_key: bool,
+    /// which protocols the derived Endpoints may use. Defaults to --protocol.
+    /// Cannot exceed what you have yourself
+    #[argh(option)]
+    enrollment_protocols: Vec<String>,
+    /// which permissions the derived Endpoints get. Defaults to
+    /// `peer-connect:initiate` alone, which is all a job needs -- see the
+    /// --issue-enrollment-key note
+    #[argh(option)]
+    permissions: Vec<String>,
+    /// how long the key stays usable, in seconds. Clamped to 60..=2592000
+    /// (30 days), default 604800. There is no unlimited
+    #[argh(option)]
+    enrollment_ttl: Option<i64>,
+    /// how many derived Endpoints may be alive at once. Clamped to 1..=32,
+    /// default 4. Match it to how many jobs run in parallel
+    #[argh(option)]
+    max_live_endpoints: Option<i64>,
+    /// how long a derived Endpoint may go unused before it is retired, in
+    /// seconds. Clamped to 900..=604800, default 3600. It is the insurance for
+    /// a job that could not return its own slot, so shorter is safer
+    #[argh(option)]
+    endpoint_idle_ttl: Option<i64>,
+    /// bind the key to a workload identity issuer, so the key alone will not
+    /// register anything. Needs --binding-subject. REQUIRED unless you pass
+    /// --binding-none
+    #[argh(option)]
+    binding_oidc: Option<String>,
+    /// the exact `sub` the bound workload must present. No wildcards
+    #[argh(option)]
+    binding_subject: Option<String>,
+    /// issue a key that anything holding it can use. Only for a machine whose
+    /// secret store is yours -- never for a public repository
+    #[argh(switch)]
+    binding_none: bool,
+    /// what the key is for. Shown only to you. 128 bytes at most
+    #[argh(option)]
+    enrollment_label: Option<String>,
+    /// print the enrollment keys you have issued, and exit
+    #[argh(switch)]
+    enrollment_keys: bool,
+    /// print which Endpoints came in on a key and how each ended, by the id
+    /// --enrollment-keys prints, and exit
+    #[argh(option)]
+    enrollment_key_enrollments: Option<String>,
+    /// stop an enrollment key, by the id --enrollment-keys prints. An
+    /// `ephemeral` key takes its derived Endpoints with it
+    #[argh(option)]
+    revoke_enrollment_key: Option<String>,
+}
+
+/// The audience the **proxy** checks a binding assertion against (§8.13.4).
+const PROXY_AUDIENCE: &str = "isekai-proxy";
+
+/// Where the Enrollment Key is looked for when `--enroll` is given.
+const ENROLLMENT_KEY_VAR: &str = "ISEKAI_ENROLLMENT_KEY";
+/// Where the Provisioning Key is looked for.
+const PROVISIONING_KEY_VAR: &str = "ISEKAI_PROVISIONING_KEY";
+
+/// A secret from a file, or from the environment variable that carries it.
+///
+/// **There is deliberately no flag that takes the value itself.** On Linux any
+/// process running as the same user can read `/proc/<pid>/cmdline`, and a CI
+/// runner is a machine that runs other people's code; `set -x`, a failed step's
+/// log and a stray `ps` all print an argument list too. `--auth0-token` has the
+/// same shape and predates this, but it is for a person at a terminal and
+/// `--login` is the answer there — an unattended path has no such excuse.
+fn secret_from(file: Option<&Path>, var: &str) -> anyhow::Result<Option<String>> {
+    if let Some(path) = file {
+        let value = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read the key at {}", path.display()))?;
+        let value = value.trim();
+        if value.is_empty() {
+            anyhow::bail!("{} is empty", path.display());
+        }
+        return Ok(Some(value.to_owned()));
+    }
+    // **Trimmed like the file, and for the same reason.** A secret written with
+    // `echo "K=$(cat f)" >> $GITHUB_ENV`, or pasted, carries a trailing
+    // newline; sending it makes Identity hash a different string and answer
+    // `403 enrollment-key-invalid`, which says nothing about whitespace.
+    //
+    // An empty variable is the same as an unset one: that is what a workflow
+    // referencing a secret nobody configured actually produces.
+    Ok(std::env::var(var)
+        .ok()
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty()))
+}
+
+/// Where a bound key's workload identity tokens come from.
+///
+/// Both servers want one, for **different audiences**, so this is a source
+/// rather than a value — see `isekai_p2p::oidc`.
+fn assertions(args: &Args) -> anyhow::Result<Option<Arc<dyn isekai_p2p::AssertionSource>>> {
+    match args.oidc.as_str() {
+        "none" => Ok(None),
+        "github" => Ok(Some(Arc::new(
+            isekai_p2p::oidc::GithubActionsOidc::from_env()?,
+        ))),
+        "files" => {
+            let pairs = args
+                .oidc_token_file
+                .iter()
+                .map(|arg| isekai_p2p::oidc::TokenFiles::parse_pair(arg))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            Ok(Some(Arc::new(isekai_p2p::oidc::TokenFiles::new(pairs))))
+        }
+        other => anyhow::bail!("--oidc takes `github`, `files` or `none`, not `{other}`"),
+    }
 }
 
 #[tokio::main]
@@ -208,7 +347,10 @@ async fn main() -> anyhow::Result<()> {
     // runtime and then the registrations, and `RegistrationClose` blocks
     // uninterruptibly on a configuration's rundown reference that no timeout
     // covers. `portal_core::shutdown` has the whole of it.
-    let code = match run(args).await {
+    // **Filled in by `run` once an Endpoint exists**, so that returning the
+    // slot does not depend on which way `run` left.
+    let mut enrolled: Option<P2pConfig> = None;
+    let code = match run(args, &mut enrolled).await {
         Ok(()) => 0,
         Err(e) => {
             // Printed here because `_exit` skips the reporting `main` would
@@ -217,10 +359,44 @@ async fn main() -> anyhow::Result<()> {
             1
         }
     };
+    // **Here, and not beside the connection.** `run` returns from several
+    // places once the Endpoint exists — no `--map` to forward, a refused
+    // connect, a port already bound — and the run that fails before forwarding
+    // starts is exactly the one whose slot should come back. Doing it on the
+    // way out covers all of them, and a new early return cannot forget it.
+    if let Some(cfg) = enrolled {
+        release_the_slot(&cfg).await;
+    }
     portal_core::shutdown::leave(code).await
 }
 
-async fn run(args: Args) -> anyhow::Result<()> {
+/// Give the enrolment slot back, best effort.
+///
+/// **Never changes the exit code.** The idle sweep is behind this, so failing
+/// costs a slot until then and nothing else; work that otherwise succeeded must
+/// not be reported as failed because the tidying up did not land.
+async fn release_the_slot(cfg: &P2pConfig) {
+    // **Bounded.** This runs after the work is done, so waiting on a silent
+    // Identity only delays a job that has already finished.
+    let released = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        isekai_p2p::config::release_enrollment(cfg),
+    )
+    .await;
+    match released {
+        Ok(Ok(true)) => tracing::info!("returned the enrolment slot"),
+        // **Nothing was taken, so say nothing.** A run that failed before
+        // enrolling has no slot out, and announcing one either way would tell
+        // an operator reading the log that something happened that did not.
+        Ok(Ok(false)) => {}
+        Ok(Err(e)) => {
+            tracing::warn!("could not return the enrolment slot; the idle sweep will: {e:#}")
+        }
+        Err(_) => tracing::warn!("timed out returning the enrolment slot; the idle sweep will"),
+    }
+}
+
+async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()> {
     let tokens = args
         .auth0_tokens
         .clone()
@@ -230,6 +406,17 @@ async fn run(args: Args) -> anyhow::Result<()> {
     // do with it. `portal-server` orders these the same way.
     if args.login {
         return portal_core::login::sign_in(&tokens).await;
+    }
+
+    // **Before the key**, because none of these need an Endpoint of this
+    // client's own: issuing a key is route A, and §8.8.2 asks for no PoP
+    // precisely because the caller is a person.
+    if args.issue_enrollment_key
+        || args.enrollment_keys
+        || args.enrollment_key_enrollments.is_some()
+        || args.revoke_enrollment_key.is_some()
+    {
+        return enrollment_admin(&args, &tokens).await;
     }
 
     // **Said out loud, because a generated key looks exactly like a loaded one
@@ -251,11 +438,37 @@ async fn run(args: Args) -> anyhow::Result<()> {
     if let (Some(_), Some(_)) = (&args.pair, &args.redeem) {
         anyhow::bail!("--pair and --redeem are two ways in; use one");
     }
+    // **Which credential is this?** Answering "both" is not a thing the
+    // Identity API can do, and picking one silently would leave the operator
+    // with a session standing on something they did not choose.
+    if args.enroll && args.auth0_token.is_some() {
+        anyhow::bail!("--enroll registers with an Enrollment Key; --auth0-token is the other way");
+    }
+    // §8.1 registration wants Auth0 authentication state, so it is not a choice
+    // the unattended path has — enrolling *is* the registration.
+    if args.enroll && args.register {
+        anyhow::bail!("--enroll already registers this Endpoint; --register is the attended way");
+    }
+    // **Refused rather than dropped**, which is the mistake `--allow` on the
+    // server side exists to avoid: a run that ignored these would mint no
+    // token and fail later against a bound key, naming nothing.
+    if args.oidc != "files" && !args.oidc_token_file.is_empty() {
+        anyhow::bail!("--oidc-token-file describes `--oidc files`, which this run is not using");
+    }
+    if args.oidc == "files" && args.oidc_token_file.is_empty() {
+        anyhow::bail!("--oidc files needs at least one --oidc-token-file `audience=path`");
+    }
+    let provisioning = secret_from(args.provisioning_key_file.as_deref(), PROVISIONING_KEY_VAR)?;
+    if provisioning.is_some() && (args.pair.is_some() || args.redeem.is_some()) {
+        anyhow::bail!("a Provisioning Key and --pair/--redeem are different ways in; use one");
+    }
     // **Refused on the arguments alone, before anything is spent.** Redeeming
     // is what says which peer, so naming one as well is either redundant or
     // wrong -- and finding out which would mean using up a single-use ticket
     // first, only to stop.
-    if args.peer.is_some() && (args.pair.is_some() || args.redeem.is_some()) {
+    if args.peer.is_some()
+        && (args.pair.is_some() || args.redeem.is_some() || provisioning.is_some())
+    {
         anyhow::bail!("--peer is not needed here: being let in is what names the peer");
     }
     if let Some(code) = &args.pair {
@@ -291,24 +504,54 @@ async fn run(args: Args) -> anyhow::Result<()> {
         .transpose()?;
 
     let maps = maps(&args.map, args.bind)?;
-    let letting_in = args.pair.is_some() || ticket.is_some();
+    let letting_in = args.pair.is_some() || ticket.is_some() || provisioning.is_some();
     if maps.is_empty() && !letting_in {
         anyhow::bail!("nothing to forward; pass at least one --map port:service");
     }
 
     let cfg = config(&args, &tokens, key).await?;
+    // From here on this Endpoint may exist, so every way out owes a slot back.
+    if args.enroll {
+        *enrolled = Some(cfg.clone());
+    }
 
     // **Being let in and connecting are one command when both were asked for.**
     // Redeeming used to exit, so anyone starting out ran the same client twice
     // -- and the second run had to be told which peer, which the first one had
     // just been told. Without `--map` there is nothing to forward, so it still
     // stops after saying what it got.
-    let admitted_by = match (&args.pair, &ticket) {
-        (Some(code), _) => Some(redeem(&cfg, code, args.label.as_deref(), !maps.is_empty()).await?),
-        (None, Some(transfer)) => {
+    // **Made before anything that needs stopping**, so the grant keeper can
+    // take it rather than a token nobody holds — with a throwaway, its
+    // cooperative arm never fires and the only stop is `Drop`'s `abort`, which
+    // can cut a redemption mid-request and leave msquic a handle for the drain
+    // to wait on.
+    let shutdown = CancellationToken::new();
+    // **The keeper outlives this block**, which is why it is bound here: a
+    // provisioning grant is capped at an hour precisely because redeeming again
+    // extends it, so a client that redeemed once would inherit the narrow
+    // ceiling without the thing that makes it workable.
+    let mut keeper = None;
+    let admitted_by = match (&args.pair, &ticket, &provisioning) {
+        (Some(code), _, _) => {
+            Some(redeem(&cfg, code, args.label.as_deref(), !maps.is_empty()).await?)
+        }
+        (None, Some(transfer), _) => {
             Some(redeem_ticket(&cfg, transfer, args.label.as_deref(), !maps.is_empty()).await?)
         }
-        (None, None) => None,
+        (None, None, Some(key)) => {
+            let (owner, held) = redeem_provisioning(
+                &cfg,
+                key,
+                assertions(&args)?,
+                args.label.as_deref(),
+                !maps.is_empty(),
+                shutdown.clone(),
+            )
+            .await?;
+            keeper = held;
+            Some(owner)
+        }
+        (None, None, None) => None,
     };
     if maps.is_empty() {
         return Ok(());
@@ -336,7 +579,19 @@ async fn run(args: Args) -> anyhow::Result<()> {
         (None, None) => portal_core::session::Reach::Grant { peer },
     };
 
-    let shutdown = CancellationToken::new();
+    // **Installed before the connect, and the hatch armed with it.**
+    // Registering it replaces SIGTERM's default disposition for the rest of the
+    // process, so from here a `kill` does nothing unless something polls — and
+    // the select below is a long way off, past a proxy connect that can hang.
+    // Registering early means a SIGTERM arriving during the connect is queued
+    // and delivered the moment the select starts, which is a clean stop with
+    // the slot returned; arming the hatch means a second one leaves at once
+    // even if the connect never returns.
+    let terminate = terminate_signal();
+    tokio::pin!(terminate);
+    #[cfg(unix)]
+    portal_core::shutdown::hard_exit_on_terminate();
+
     let connected = portal_core::session::connect(&cfg, reach, &shutdown)
         .await
         .context("connect to the portal server")?;
@@ -352,6 +607,11 @@ async fn run(args: Args) -> anyhow::Result<()> {
         connected.close().await;
         return Err(e);
     }
+    // **One line, last, on stdout.** A CI step needs a point to wait for that
+    // means "the ports are bound", and grepping the forward lines would mean
+    // knowing how many to expect. `camera-core`'s `synthetic_server` prints the
+    // same word and `ios-ffi.yml` waits on it with `grep -q '^ready$'`.
+    println!("ready");
 
     // **Both ways this can end without us**, and watching only one of them is
     // the worse failure: the forwarded ports stay bound over a connection that
@@ -372,8 +632,12 @@ async fn run(args: Args) -> anyhow::Result<()> {
     // skip reporting the connection closed — which leaves the relay leg
     // reserved until the proxy expires it.
     let mut interrupted = false;
+    // SIGTERM as well as SIGINT, because a job that stops this with a plain
+    // `kill` is the ordinary case in CI, and on the enrolment path the way out
+    // is what returns the slot.
     tokio::select! {
         _ = tokio::signal::ctrl_c() => { interrupted = true; }
+        _ = &mut terminate => { interrupted = true; }
         _ = ended.cancelled() => {
             tracing::warn!("the session ended; the forwards are going with it");
         }
@@ -389,6 +653,11 @@ async fn run(args: Args) -> anyhow::Result<()> {
     if interrupted {
         portal_core::shutdown::hard_exit_on_second_interrupt();
     }
+    // **Told to stop before it is dropped.** Dropping the keeper aborts it,
+    // which can cut a redemption mid-request and leave msquic a handle the
+    // drain then waits on; cancelling first lets it finish what it is doing
+    // and return.
+    shutdown.cancel();
     connected.close().await;
     Ok(())
 }
@@ -468,6 +737,87 @@ async fn redeem_ticket(
         println!("\nConnect with --map alone; the listener is found for you.");
     }
     Ok(grant.owner_endpoint.clone())
+}
+
+/// Redeem a Provisioning Key, and keep the grant it made alive.
+///
+/// Returns the Endpoint that let us in and, when this run goes on to forward,
+/// the guard that re-redeems. **Unlike a ticket this runs every time**: a
+/// second redemption answers `200` and extends the grant rather than being
+/// refused, which is the whole reason its ceiling can be an hour.
+async fn redeem_provisioning(
+    cfg: &P2pConfig,
+    key: &str,
+    assertions: Option<Arc<dyn isekai_p2p::AssertionSource>>,
+    label: Option<&str>,
+    then_connect: bool,
+    shutdown: CancellationToken,
+) -> anyhow::Result<(String, Option<portal_core::grant::GrantKeeper>)> {
+    let directory = isekai_p2p::PeerDirectory::open(cfg)
+        .await
+        .context("open the proxy control plane")?;
+    // Minted for this call. The proxy checks the binding on every redemption,
+    // which is what stops a leaked key working once the job has ended.
+    let assertion = match &assertions {
+        Some(source) => Some(
+            source
+                .assertion(PROXY_AUDIENCE)
+                .await
+                .context("could not mint a workload identity token for the proxy")?,
+        ),
+        None => None,
+    };
+    let redeemed = directory
+        .redeem_provisioning_key(key, assertion.as_deref(), label)
+        .await
+        .context("redeem the provisioning key")?;
+    let grant = &redeemed.grant;
+    println!("let in by   : {}", grant.owner_endpoint);
+    println!("grant       : {}", grant.grant_id);
+    match &grant.expires_at {
+        Some(at) => println!("expires at  : {at}  (extended while this runs)"),
+        // The proxy is required to put a finite life on one of these, so this
+        // should not happen; say so rather than printing nothing.
+        None => println!("expires at  : never -- unexpected for a provisioning key"),
+    }
+    let owner = grant.owner_endpoint.clone();
+    if !then_connect {
+        println!("\nNothing is being forwarded, so this grant is not being kept alive.");
+        println!("Run again with --map when there is work to do.");
+        return Ok((owner, None));
+    }
+    let keeper = portal_core::grant::keep_the_grant(
+        directory,
+        key.to_owned(),
+        assertions,
+        grant.expires_at.clone(),
+        label.map(str::to_owned),
+        shutdown,
+    );
+    Ok((owner, Some(keeper)))
+}
+
+/// SIGTERM on Unix, and a future that never completes elsewhere.
+///
+/// Windows has no SIGTERM; `ctrl_c` covers the interactive case there, and the
+/// unattended one does not arise because CI runs this on Linux.
+async fn terminate_signal() {
+    #[cfg(unix)]
+    {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            // A process that cannot install the handler should still run; it
+            // simply dies on SIGTERM the way it always did.
+            Err(e) => {
+                tracing::warn!("could not listen for SIGTERM: {e}");
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    std::future::pending::<()>().await;
 }
 
 /// Check a ticket's shape and where it wants to be redeemed, before anything
@@ -560,20 +910,273 @@ async fn config(
     tokens: &std::path::Path,
     key: isekai_p2p::agent::EndpointKey,
 ) -> anyhow::Result<P2pConfig> {
-    let auth = portal_core::login::authenticate(tokens, args.auth0_token.as_deref()).await?;
+    let credential = if args.enroll {
+        enrollment_credential(args)?
+    } else {
+        let auth = portal_core::login::authenticate(tokens, args.auth0_token.as_deref()).await?;
+        // **The whole point of the source.** The Endpoint Token renewal runs
+        // every few minutes for the life of the session and needs a current
+        // Auth0 token each time; without one it reuses one that expires.
+        isekai_p2p::Credential::auth0(auth.token, auth.source, args.register)
+    };
     Ok(P2pConfig {
         identity_url: args.identity_url.clone(),
         identity_http3: args.identity_http3,
         proxy_url: args.proxy_url.clone(),
-        // **The whole point of the source.** The Endpoint Token renewal runs
-        // every few minutes for the life of the session and needs a current
-        // Auth0 token each time; without one it reuses one that expires.
-        credential: isekai_p2p::Credential::auth0(auth.token, auth.source, args.register),
+        credential,
         protocol: args.protocol.clone(),
         device_name: args.device_name.clone(),
         token_ttl: None,
         key,
     })
+}
+
+/// Answer the Enrollment Key commands, which need no key of this Endpoint's own.
+///
+/// **Route A, with no PoP.** The caller is a person rather than an Endpoint, so
+/// there is no Endpoint private key to bind the request to (§8.8.2) — which is
+/// also why `--login` is the whole of what these need.
+async fn enrollment_admin(args: &Args, tokens: &Path) -> anyhow::Result<()> {
+    // **Settled on the arguments, before anything authenticates.** A missing or
+    // half-given binding is a typo, and a sign-in tells the operator nothing
+    // they did not already know. `portal-server` does the same with its own
+    // binding flags, and `portal-client` with a ticket's authority.
+    let request = args
+        .issue_enrollment_key
+        .then(|| enrollment_request(args))
+        .transpose()?;
+    let auth = portal_core::login::authenticate(tokens, args.auth0_token.as_deref()).await?;
+    let identity = isekai_p2p::enrollment::Identity::new(&args.identity_url, args.identity_http3);
+    let token = &auth.token;
+
+    if let Some(key_id) = &args.revoke_enrollment_key {
+        let revoked = isekai_p2p::enrollment::revoke(&identity, token, key_id)
+            .await
+            .with_context(|| format!("revoke enrollment key {key_id}"))?;
+        println!("revoked     : {}", revoked.key_id);
+        // **The two lists are the answer, not decoration.** An `ephemeral` key
+        // takes its Endpoints down; one that is not leaves them running,
+        // because an Endpoint revocation cannot be undone and one key
+        // registers one Endpoint — retiring a long-lived runner's Endpoint
+        // means it cannot come back until somebody makes it a new keypair.
+        if let Some(effects) = &revoked.effects {
+            for id in &effects.revoked_endpoints {
+                println!("  retired   : {id}");
+            }
+            for id in &effects.remaining_endpoints {
+                println!("  still up  : {id}  (revoke it yourself if you meant to)");
+            }
+        }
+        println!("No new Endpoints can be registered with it, and no derived Endpoint");
+        println!("can renew its token. The record of who came in stays.");
+    }
+
+    if let Some(request) = &request {
+        let issued = isekai_p2p::enrollment::issue(&identity, token, request)
+            .await
+            .context("issue an enrollment key")?;
+        // The secret first: everything else in the response is optional, and a
+        // missing `created_at` must not cost the operator the one string they
+        // came for.
+        println!("\nPut this in the job's secret store as ISEKAI_ENROLLMENT_KEY:\n");
+        println!("  {}", issued.key);
+        println!();
+        match &issued.key_id {
+            Some(id) => println!("key id      : {id}  (--revoke-enrollment-key takes this)"),
+            None => println!("key id      : not reported -- --enrollment-keys will list it"),
+        }
+        if let Some(at) = &issued.expires_at {
+            println!("expires at  : {at}");
+        }
+        if !issued.permissions.is_empty() {
+            println!("permissions : {}", issued.permissions.join(", "));
+        }
+        if !issued.protocols.is_empty() {
+            println!("protocols   : {}", issued.protocols.join(", "));
+        }
+        if let Some(slots) = issued.max_live_endpoints {
+            println!("slots       : {slots} Endpoints alive at once");
+        }
+        print_enrollment_binding(issued.binding.as_ref());
+        // **Not authorization, and said so.** §8.8.2 is explicit that issuing
+        // succeeds with these present; they name the §8.8.10 mismatches that
+        // otherwise surface in CI days later.
+        for warning in &issued.warnings {
+            println!("warning     : {warning}");
+        }
+        println!("\nThe job also needs a Provisioning Key from the server side --");
+        println!("portal-server --provisioning-key. They are different objects issued");
+        println!("by different servers, and revoked at different ones.");
+    }
+
+    if args.enrollment_keys {
+        let keys = isekai_p2p::enrollment::list(&identity, token)
+            .await
+            .context("list enrollment keys")?;
+        if keys.is_empty() {
+            println!("No enrollment keys issued.");
+        }
+        for key in &keys {
+            let label = key
+                .label
+                .as_deref()
+                .map(|l| format!(", {l}"))
+                .unwrap_or_default();
+            let slots = match (key.live_endpoints, key.max_live_endpoints) {
+                (Some(live), Some(max)) => format!("{live}/{max} slots"),
+                (Some(live), None) => format!("{live} live"),
+                _ => "slots unknown".to_owned(),
+            };
+            // Which of these is a bare bearer credential is the question worth
+            // answering here, the same as on the server's side.
+            let bound = match key.binding.as_ref().map(|b| b.kind.as_str()) {
+                Some("oidc") => "oidc".to_owned(),
+                Some("none") | Some("") | None => "UNBOUND".to_owned(),
+                Some(other) => other.to_owned(),
+            };
+            println!(
+                "key         : {}  {bound}, {slots}, {}{label}",
+                key.key_id,
+                key.status.as_deref().unwrap_or("?"),
+            );
+        }
+    }
+
+    if let Some(key_id) = &args.enrollment_key_enrollments {
+        let rows = isekai_p2p::enrollment::enrollments(&identity, token, key_id)
+            .await
+            .with_context(|| format!("list enrollments of {key_id}"))?;
+        if rows.is_empty() {
+            println!("Nothing has registered with {key_id}.");
+        }
+        for row in &rows {
+            let subject = row
+                .binding_subject
+                .as_deref()
+                .map(|s| format!("  as {s}"))
+                .unwrap_or_default();
+            // **`enrollment_released` against `enrollment_idle` is the axis
+            // worth watching.** The first means the job tidied up after itself;
+            // the second means nothing did and the sweep got there, which is a
+            // CI problem rather than a capacity one.
+            let ended = match (row.status.as_deref(), row.revoke_reason.as_deref()) {
+                (_, Some(reason)) => format!("  ended {reason}"),
+                (Some(status), None) => format!("  {status}"),
+                _ => String::new(),
+            };
+            println!("registered  : {}{subject}{ended}", row.endpoint_id);
+        }
+    }
+    Ok(())
+}
+
+/// What to ask for when issuing, refused before anything authenticates.
+///
+/// **`binding` cannot be omitted**, and this insists on the same thing §8.8.2
+/// does: every other knob fails closed, so letting the shortest request be the
+/// most dangerous one would be backwards. `--binding-none` is how somebody says
+/// they meant it.
+fn enrollment_request(args: &Args) -> anyhow::Result<isekai_p2p::agent::NewEnrollmentKey> {
+    // **The contradiction is matched first.** Reaching the half-given arms with
+    // `--binding-none` also set answers a narrower question than the one the
+    // operator got wrong.
+    if args.binding_none && (args.binding_oidc.is_some() || args.binding_subject.is_some()) {
+        anyhow::bail!("--binding-none and --binding-oidc are two answers; give one");
+    }
+    let binding = match (&args.binding_oidc, &args.binding_subject, args.binding_none) {
+        (Some(issuer), Some(subject), false) => isekai_p2p::agent::Binding::Oidc {
+            issuer: issuer.clone(),
+            subject: subject.clone(),
+        },
+        (None, None, true) => isekai_p2p::agent::Binding::None,
+        (None, None, false) => anyhow::bail!(
+            "--issue-enrollment-key needs a binding: --binding-oidc with --binding-subject, \
+             or --binding-none to say the key alone is enough. Omitting it would make the \
+             shortest command the most dangerous one"
+        ),
+        (Some(_), None, _) => anyhow::bail!(
+            "--binding-oidc needs --binding-subject: an issuer without a subject would let any \
+             workload that issuer knows about register"
+        ),
+        (None, Some(_), _) => anyhow::bail!(
+            "--binding-subject needs --binding-oidc, which says who vouches for that subject"
+        ),
+        // Unreachable: the contradiction is refused above.
+        (_, _, true) => unreachable!("--binding-none with a binding is refused above"),
+    };
+    let mut request = isekai_p2p::agent::NewEnrollmentKey::new(binding);
+    // **Narrow by default, and this is the one place it matters.** The server
+    // burns the *ceiling* into the key when `permissions` is omitted, and the
+    // ceiling is the deployment's `DEFAULT_PERMISSIONS` — so in a deployment
+    // that enabled `peer-provisioning:create` for its portal server, an omitted
+    // list would hand every CI Endpoint the power to mint Provisioning Keys of
+    // its own. A job needs `peer-connect:initiate` and nothing else.
+    request.permissions = Some(if args.permissions.is_empty() {
+        vec!["peer-connect:initiate".to_owned()]
+    } else {
+        args.permissions.clone()
+    });
+    request.protocols = Some(if args.enrollment_protocols.is_empty() {
+        vec![args.protocol.clone()]
+    } else {
+        args.enrollment_protocols.clone()
+    });
+    request.ttl = args.enrollment_ttl;
+    request.max_live_endpoints = args.max_live_endpoints;
+    request.endpoint_idle_ttl = args.endpoint_idle_ttl;
+    request.label = args.enrollment_label.clone();
+    Ok(request)
+}
+
+/// Show a key's binding, including the audience the job has to mint for.
+fn print_enrollment_binding(binding: Option<&isekai_p2p::agent::BindingView>) {
+    let Some(binding) = binding else {
+        println!("bound to    : not reported -- check with --enrollment-keys");
+        return;
+    };
+    match binding.kind.as_str() {
+        "oidc" => {
+            println!(
+                "bound to    : {} / {}",
+                binding.issuer.as_deref().unwrap_or("?"),
+                binding.subject.as_deref().unwrap_or("?"),
+            );
+            // **The value the job cannot guess and nobody can set.** Identity
+            // takes it from its own configuration, and it is deliberately not
+            // the proxy's — a token minted for one is refused by the other.
+            match binding.audience.as_deref() {
+                Some(audience) => println!("audience    : {audience}  (the job mints for this)"),
+                None => println!("audience    : not reported -- ask the Identity operator"),
+            }
+        }
+        "none" | "" => {
+            println!("bound to    : nothing -- the key alone can register Endpoints.");
+            println!("              Never do this for a public repository's CI.");
+        }
+        other => println!("bound to    : {other}"),
+    }
+}
+
+/// The unattended credential, with whatever its binding needs attached.
+///
+/// **No sign-in happens on this path.** That is the point of `--enroll`: §4.3
+/// registration wants Auth0 authentication state and a job has none, so the key
+/// stands in for it — under a binding, a slot count and a finite life.
+fn enrollment_credential(args: &Args) -> anyhow::Result<isekai_p2p::Credential> {
+    let key = secret_from(args.enrollment_key_file.as_deref(), ENROLLMENT_KEY_VAR)?.with_context(
+        || {
+            format!(
+                "--enroll needs an Enrollment Key in {ENROLLMENT_KEY_VAR} or \
+                 --enrollment-key-file. It is not an argument on purpose: an argument list is \
+                 readable by anything running as this user"
+            )
+        },
+    )?;
+    let mut enrollment = isekai_p2p::Enrollment::new(key);
+    if let Some(source) = assertions(args)? {
+        enrollment = enrollment.with_assertions(source);
+    }
+    Ok(enrollment.into())
 }
 
 /// Parse `port:name` or `udp:port:name` into what to bind and what to ask for.

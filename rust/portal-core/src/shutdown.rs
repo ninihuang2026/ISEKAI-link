@@ -61,8 +61,35 @@ pub fn hard_exit_on_second_interrupt() {
     }
 }
 
+/// Make a `kill` leave immediately, from the moment SIGTERM is listened for.
+///
+/// **Call this as soon as the listener is installed, not when stopping.**
+/// `tokio::signal::unix::signal` replaces SIGTERM's default disposition for the
+/// rest of the process and never puts it back, so from that instant a `kill`
+/// does nothing unless something is polling for it — and the paths that are not
+/// polling are exactly the ones that can block: `close()` waiting on a rundown
+/// reference, and [`leave`]'s drain.
+///
+/// **This is why it is unconditional where the interrupt hatch is not.** That
+/// one is armed only once somebody has pressed Ctrl+C, because arming it
+/// earlier would turn a first press into a hard exit that skips reporting the
+/// connection closed. SIGTERM has no such case: nothing has been "pressed", the
+/// default has already been taken away, and a CI teardown's `kill` has to keep
+/// working.
+#[cfg(unix)]
+pub fn hard_exit_on_terminate() {
+    // SAFETY: as above, with `SIGTERM` in place of `SIGINT`.
+    unsafe {
+        signal(SIGTERM, hard_exit as extern "C" fn(i32) as usize);
+    }
+}
+
 /// SIGINT's number on every platform this builds for.
 const SIGINT: i32 = 2;
+
+/// SIGTERM's number on the Unix platforms this builds for. Windows has none.
+#[cfg(unix)]
+const SIGTERM: i32 = 15;
 
 /// **A raw handler, not a spawned task**, and the difference is the case this
 /// exists for. A task needs a free worker to run on; the thing it is meant to
@@ -74,9 +101,10 @@ const SIGINT: i32 = 2;
 /// involved. `_exit` is async-signal-safe, which is the whole of what a handler
 /// is allowed to do — no allocation, no locks, and no message, because printing
 /// one is not.
-extern "C" fn hard_exit(_signal: i32) {
-    // 128 + SIGINT, which is what a shell reports for an interrupted program.
-    unsafe { libc_exit(130) }
+extern "C" fn hard_exit(signal: i32) {
+    // 128 + the signal, which is what a shell reports for a program killed by
+    // one: 130 for an interrupt, 143 for a terminate.
+    unsafe { libc_exit(128 + signal) }
 }
 
 unsafe extern "C" {
