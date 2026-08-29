@@ -804,7 +804,7 @@ Identity 仕様 §8.8.10 が「運用で最も踏まれる」と書いている�
 - 有人経路（`--enroll` なし）では失効を**打たない**。
 - 失敗の表示が §4.7 の表のとおりに分かれる。
 
-### フェーズ 6 — CI と文書
+### フェーズ 6 — CI と文書 — **完了**
 
 §2.7 と `docs/portal.md`。
 
@@ -1665,3 +1665,359 @@ revoke を打ち、**取っていない枠が漏れた**と警告していた。
 フェーズ 6（ワークフローと `docs/portal.md`）。`portal-server` の
 `--provisioning-key` の出力にある「この build では引き換えられない」の但し書きを
 **消せるようになった**ので、それも含める。
+
+---
+
+## 15. 追補: `portal-server --enroll`（計画外の追加）
+
+**計画はこれを持っていなかった。** §2.5 は `portal-client` に無人経路を与え、§2.6 は
+`portal-server` に**鍵を発行するコマンドだけ**を与えている。前提が「CI 側は client で、
+到達先の server は人が立てて動かし続けているもの」だったからである。
+
+**フェーズ 6 で CI を実際に書いた時点で、その前提が崩れた。** ジョブが検証できるのは
+「到達先の server が別に用意されている」ときだけで、この repository にはそれが無い。
+外部に依存しない CI にするには、**同じジョブの中で両側を動かす**しかなく、そこには
+サインインが無い。
+
+したがって `portal-server` にも `--enroll` を足す。
+
+### 15.1 なぜ計画に無かったか、なぜ足すのか
+
+**「キーボードの前に誰もいないジョブ」という前提は、CI の中の server にも同じく
+当てはまる。** §8.8.1 が塞ごうとしている穴（P1: 無人のジョブは Endpoint を作れない）は
+役割を問わないもので、計画がそれを client だけの話として書いたのは、想定した配置が
+1 つだったからにすぎない。
+
+**中身はフェーズ 5 の再利用である。** `P2pConfig` の作り方は両者同じで、要るのは
+`Credential` を選ぶ分岐と鍵の読み取りだけ。ただし**同じものを 2 つ書かない** —
+秘密の読み方（argv に置かない、trim する）と assertion の出どころは
+`portal-core` へ移し、両方がそれを呼ぶ。2 部あれば必ず片方だけ直る日が来る。
+
+### 15.2 server 側の鍵は client 側と違う
+
+CI の server は listener を立て、接続を受け、実行時に Provisioning Key を発行する。
+したがって鍵に焼き付ける permission が違う。
+
+| | permissions |
+| --- | --- |
+| client 用 | `peer-connect:initiate` |
+| server 用 | `peer-listener:private:create`, `peer-connect:accept`, `peer-provisioning:create` |
+
+**client 側を絞る理由（§9.5）はここでも効いている。** 省略すれば天井が焼き付き、
+CI の client にも listener を立てる権限が付く。**役割ごとに鍵を分け、それぞれに要る
+ものだけを書く**のが、この 2 本を別々に発行する理由である。
+
+### 15.3 CI の形が変わる
+
+| | A（フェーズ 6 の初稿） | B（これ） |
+| --- | --- | --- |
+| 到達先 | 別に立っている server | **同じジョブの中** |
+| `ISEKAI_PROVISIONING_KEY` | リポジトリのシークレット | **server が実行時に発行**し、同じ runner のファイルで渡す |
+| シークレット | 鍵 1 本 | **鍵 2 本**（client 用・server 用の Enrollment Key） |
+| 検証できる範囲 | enrol → redeem まで | **enrol → redeem → connect → forward** |
+
+B は proxy を実際に通るループバックになる。A のテンプレートとしての価値は残るので、
+`docs/portal.md` の書き方は「到達先がある場合」のままでよい — CI が検証するのは
+**両方が同じ配備で成立すること**である。
+
+### 15.4 実装した形
+
+`portal-server` に `--enroll` / `--enrollment-key-file` / `--oidc` /
+`--oidc-token-file`。加えて、client と同じ SIGTERM の扱いと、出るときの枠の返却。
+
+**共通部分は `portal-core::ci` へ出した。** 秘密の読み方（argv に置かない、trim する）、
+assertion の出どころ、引数の組み合わせの検査、枠の返却 — どれも役割で変わらない。
+2 部あれば必ず片方だけ直る日が来るし、**フェーズ 5 のレビューが env の trim 漏れを
+見つけたのは、まさに片方だけ直っていたから**である。
+
+**変数は 2 つに分ける。** `ISEKAI_ENROLLMENT_KEY`（client）と
+`ISEKAI_SERVER_ENROLLMENT_KEY`（server）。1 つにまとめると「両方の役割の権限を持つ
+1 本の鍵」になり、§15.2 で分けた意味が消える。
+
+### 15.5 3 度目の「関係ない失敗が先に出る」
+
+`--enroll` に鍵が無いとき、**カタログの読み取りエラーが先に出ていた。**
+
+```text
+Error: failed to read the service catalogue at portal-server.toml: ...
+```
+
+カタログを先に読むのは意図的で（「カタログのタイプミスは、登録された Endpoint では
+なくメッセージで済むべき」）、そこは変えたくない。**鍵が無いことは引数についての
+事実**なので、その検査だけを前に出した。フェーズ 4（binding を認証の後ろで検査）、
+フェーズ 5（同じことを client で繰り返した）に続いて 3 度目である。
+
+**走らせなければ、また見つからなかった。** 変数名を間違えた運用者が
+「カタログが無い」と言われる形は、テストでは出てこない。
+
+### 15.6 CI ジョブの形（B）
+
+同じジョブで両側を動かす。**外部に立っている server に依存しない**ので、この
+repository の CI がそのまま回せる。
+
+```text
+service (127.0.0.1:15099)  ← 転送先。ポートが答えるだけのもの
+   ↑
+portal-server --enroll     ← 登録し、listener を立て、実行時に Provisioning Key を発行
+   ↑ proxy
+portal-client --enroll     ← 登録し、その鍵を引き換え、15432 を転送
+   ↑
+curl 127.0.0.1:15432       ← ここまで来れば端から端まで通っている
+```
+
+**Provisioning Key はリポジトリのシークレットにしない。** 鍵は Endpoint に属し、
+その Endpoint は毎回違う（毎回登録するので）。server が実行時に発行し、同じ runner の
+ファイルで渡す。シークレットは Enrollment Key 2 本だけである。
+
+### 15.7 実装しながら見つけたこと
+
+**`portal-server` に `ready` に相当する行が無かった。** client には CI の待ちループの
+ために付けてあるのに、server 側は `endpoint id` と `listener id` を出すだけで、
+しかもそれは `--allow` の capability を発行する**前**である。待つ先として使うと、
+`--allow` が終わる前に client を起動しうる。同じ理由で `ready` を足した。
+
+**鍵を発行するコマンドはカタログを読まない。** `administering` の分岐がカタログの
+読み取りより前で返るので、`--provisioning-key` に `--config` は要らない。
+Grant が listener ではなく Endpoint を名指すことの帰結である（§8.8）。
+
+### 15.8 後片付けで見つかった 2 点
+
+検証用に作ったものを片付ける過程で、どちらも実装ではなく**運用と道具立て**の穴が出た。
+
+**1. `PROXY_INTERNAL_URL` が設定されていない。**
+
+`ep:243119b5…` を §8.7 で失効させたときの応答:
+
+```json
+{ "status": "revoked", "proxy_notification": "disabled", "effects": { … 全て 0 } }
+```
+
+`disabled` は §8.7 の表で **`PROXY_INTERNAL_URL` 未設定**を意味する。Identity 側の
+失効は確定しているが、**Proxy へは通知されない** — Proxy の Grant / Listener /
+Capability / 接続は残る。
+
+今回は `effects` が全て 0 で実害は無かったが、**本番のインシデント対応ではここが効く**。
+端末を紛失して失効させても、Proxy はその Endpoint を通し続ける。§8.7 が
+「**`200` は『Endpoint が止まった』ことを意味しない**」と書いているのは、まさにこの
+状態のことである。
+
+**これは配備の設定であって、この計画が直せるものではない。** ただし CI の枠と違って
+「気づかないまま正しく動いているように見える」種類なので、記録しておく。
+§8.8.8 の掃引が `ephemeral` な Endpoint を失効させるときも同じ経路を通るので、
+**CI が返した枠が Proxy 側に伝わらない**ことにもなる。
+
+> **解決した。** 上流へ
+> [ISEKAI-link-server#252](https://github.com/seera-networks/ISEKAI-link-server/issues/252)
+> として報告し、#253 が `/internal/v1` を専用リスナ（`--internal-listen`）へ移した。
+> 配備側で URL を向け直し、ファイアウォールを開けたところ `delivered` になった。
+>
+> ```text
+> disabled                     PROXY_INTERNAL_URL 未設定
+>   → failed / unreachable     8443 は h3 専用。TCP が即座に失敗
+>   → failed / gave up 3000ms  専用リスナへ向いたが firewall で落ちていた
+>   → delivered                届いた。newly_revoked: true
+> ```
+>
+> **`newly_revoked` が 4 回目で初めて `true` になった。** それまでの 3 回は
+> Identity 側だけで失効しており、**Proxy には一度も届いていなかった**ことを
+> この値が言っている。§8.7 が `newly_revoked` を持っている理由がそのまま出た形である。
+>
+> 上流の PR は、報告した診断より 1 つ悪いことも見つけている: `--service-addr` の
+> TCP 側は 3 経路の H2 router で、`/internal/v1` は**どの構成でも h1/h2 から
+> 到達できなかった**（QMUX の有無に関わらず）。
+
+**2. 自分の Endpoint を失効させる CLI が無い。**
+
+フェーズ 1 で `revoke_endpoint` を有人・無人の両経路とも実装したが、バイナリに
+繋がっているのは**自己失効（枠を返す）だけ**である。所有者が端末を退役させるには、
+curl を書くしかない。
+
+```text
+portal-server --revoke <grant_id>              あり
+portal-client --revoke-enrollment-key <id>     あり
+portal-server --revoke-provisioning-key <id>   あり
+（Endpoint そのもの）                          無い
+```
+
+**§8.7 は非常口である。** 他の失効はすべて CLI にあるのに、いちばん強いものだけが
+無いのは不揃いで、しかも「端末を無くした」は運用者が最も慌てている場面である。
+`portal-client --revoke-endpoint <id> --reason device_lost` 相当を足すのが筋だが、
+本計画の範囲外なので**次にやることとして残す**。
+
+### 15.9 CI が設計どおりに落ちた
+
+シークレットを入れて最初の run が `403 enrollment-binding-invalid` で落ちた。
+**鍵は `refs/heads/main` に束縛されていて、run はブランチ上だった。**
+
+```text
+Error: stand the portal server up: could not enrol this Endpoint:
+       Identity API returned 403: enrollment-binding-invalid
+```
+
+**binding が効いている証拠である。** §8.8.3 は subject を完全一致で照合し、
+ワイルドカードもプレフィックスも認めない。鍵の文字列を持っていても、その
+ワークフロー・そのブランチ・そのリポジトリでなければ入れない — CI 用の鍵を
+公開リポジトリに置ける唯一の理由がこれで、**それがそのまま働いた。**
+
+**そして、この挙動は §6.2 に自分で書いてあった。**
+
+> `subject` が完全一致であることは、ブランチを跨ぐなら鍵を分けることを意味する。
+> `refs/heads/main` の鍵で PR のジョブは通らない。それは意図した狭さである。
+
+書いておきながら、その前提を無視したワークフローを書いた。ジョブを
+`main` への push に限定した — ブランチごとに鍵を分けるのは**判断**であって、
+ワークフローが黙って回避してよいものではない。
+
+**つまりこのジョブは、マージされて初めて走る。** PR の上では skip される。
+`ios-ffi.yml` の live test が secrets の有無で skip されるのと同じ性質のもので、
+「PR で緑だからマージ後も緑」とは言えない範囲が 1 つ増える。**それは binding の
+狭さの代償であり、狭さのほうを取る。**
+
+### 15.10 `/code-review high` の指摘 — SIGTERM の扱いが根本から誤っていた
+
+**1. ハッチを武装すると、非同期の腕が走らなくなる。** フェーズ 5・6 で足した
+SIGTERM 対応は、**まったく機能していなかった。**
+
+`tokio::signal` は `signal_hook_registry` を通り、そのハンドラは登録済みアクションの
+**前に**「以前の処理」を呼ぶ（`slot.prev.execute(sig)`）。したがって:
+
+| 武装の順序 | 起きること |
+| --- | --- |
+| tokio より先 | tokio が `hard_exit` を `prev` として捕まえ、毎回それが先に走って `_exit(143)` |
+| tokio より後 | tokio のハンドラを**置き換える**ので、非同期側は信号を一切受け取らない |
+
+**どちらの順序でも正常停止の経路は死ぬ。** 実際に測った:
+
+```text
+armed-first        exit=143         （非同期の腕に到達しない）
+armed-after        exit=143         （同上）
+（武装しない）      GRACEFUL  exit=0
+armed-on-receipt   GRACEFUL  exit=143（正常停止し、2 度目で即離脱）
+```
+
+つまり `kill -TERM` は **listener を畳まず、枠も返さずに** プロセスを落としていた。
+docs/portal.md の「停止させることが枠を返す」は、起きないことを書いていた。
+
+**SIGINT が「押されてから武装する」のは作法ではなく必然だった。** そこに
+「SIGTERM には押す/押さないの区別が無い」という理由を付けたのが誤りで、本当の理由は
+**早く武装すると最初の信号が壊れる**ことである。両方を、停止を決めた時点で武装する
+1 つの関数（`hard_exit_on_second_signal`）にまとめた。
+
+> **測って直した。** ソースを読んだだけでは「順序を入れ替えれば直る」と判断していた。
+> 実際には後から武装しても壊れる。一時的な example を書いて 4 通り走らせたので分かった。
+
+**2. 鍵を発行する run も枠を使い、返していなかった。** `administering` の分岐は
+`*enrolled` を書く前に return するが、`grant_admin` は `issue_endpoint_token` を呼ぶ
+（＝無人経路では登録する）。`--enroll --provisioning-key` を 4 回打つと、4 枠の鍵が
+掃引まで埋まる。
+
+**3〜5. ワークフローの 3 点。** `always()` のステップがシークレット未設定の配備で
+チェックアウト無しに走って job を赤くする、`pipefail` が診断出力を殺していた、
+helper の `sleep 1200` がコールドビルドと競合し job の 25 分もコールドには足りない。
+
+---
+
+## 16. フェーズ 6 の結果
+
+`docs/portal.md` に「Letting a CI job in」、`portal.yml` に `ci-enrolment` ジョブ、
+そしてフェーズ 4 が出力に入れた但し書きの削除。**これで計画の全フェーズが終わった。**
+
+### 16.1 稼働中の配備を確認した — §9.4 の答え
+
+proxy と identity がデプロイ済みとのことなので、**変更を伴わない問い合わせだけ**
+実際に投げた。
+
+| # | 項目 | 結果 |
+| --- | --- | :---: |
+| 1 | `ENROLLMENT_KEYS_ENABLED` | ✅ **有効化された**（下記） |
+| 3 | Proxy の §8.13 の経路 | ✅ 生きている（h3 で `401`） |
+
+最初に見たとき、Identity 側は**無効だった**。
+
+```text
+POST /v1/endpoints/enroll/challenge   → 404
+POST /v1/enrollment-keys              → 404
+POST /v1/endpoints/register/challenge → 401   ← 比較用。経路はある
+POST /v1/peer/provisioning-keys       → 401   ← h3。経路はある
+```
+
+**404 と 401 の差がそのまま答えだった。** 既存の登録経路は認証を要求して `401` を
+返すのに、§8.8 の 2 つは `404` — router にマウントされていない。仕様どおり
+「要ると言った配備にだけ開く」ままだったということで、実装の問題ではない。
+
+**その後 `ENROLLMENT_KEYS_ENABLED=1` が立てられ、経路が現れた。**
+
+```text
+POST /v1/endpoints/enroll/challenge   → 400   ← 空のボディが検証まで届いている
+POST /v1/enrollment-keys              → 401   ← Auth0 を要求している
+```
+
+`400` と `401` の違いも意味を持つ。前者は `Authorization` を持たない第 3 の資格の
+経路で、ボディの検証まで進んでいる（§8.8.4）。後者は系統 A なので認証で止まる。
+**どちらも「マウントされている」ことを別々に言っている。**
+
+さらに `DEFAULT_PERMISSIONS` に `peer-provisioning:create` が追加され、実際に発行して
+確かめた。**§9.4 の 4 項目はこれで全部埋まった。**
+
+| # | 項目 | 結果 |
+| --- | --- | :---: |
+| 1 | `ENROLLMENT_KEYS_ENABLED` | ✅ 有効 |
+| 2 | `ENROLLMENT_OIDC_ISSUERS` に GitHub | ❌ **入っていない** |
+| 3 | Proxy の `--p2p-provisioning-oidc-issuer` | ❌ **設定されていない** |
+| 4 | protocol の天井に `isekai-portal-v1` | ✅ ある |
+| 5 | `peer-provisioning:create` | ✅ トークンに載る |
+
+**4 と 5 は Endpoint Token を 1 本発行して読んだ。** 鍵を作らずに答えられる質問なので
+そうした。返ってきた `permissions` に `peer-provisioning:create` があり、`protocols` に
+`isekai-portal-v1` がある — ISEKAI-identity#33 で「鋳造できない」と報告した権限が、
+#34 と配備の設定を経て**実際にトークンへ載るところまで来た**。
+
+**2 と 3 は、鍵を作ろうとして拒否されたことで分かった。** どちらも
+`400 binding-not-supported` で、**binding が通らなければ鍵は作られない**ので
+クォータは消費していない。
+
+```text
+Identity: issuer is not on the allow list: https://token.actions.githubusercontent.com
+Proxy:    binding-not-supported: this issuer is not configured
+```
+
+**両側に同じ設定が要る**（§8.8.10）ことが、そのまま両側からのエラーとして出た形である。
+CI 経路が動くには、残るのはこの 1 つだけになった。
+
+### 16.2 入ったもの
+
+**`docs/portal.md`** — 「画面を持たないものを入れる」（Ticket）の次に置いた。
+鍵が 2 本要ること、`--binding-oidc` が「鍵だけでは足りなくする」ものであること、
+枠は「同時に何本か」であって「1 日に何本か」ではないこと、そして
+**失効が Ticket と逆であること**。最後に「これが動く前に配備が満たすべきこと」を
+節にした — §15.1 で分かったとおり、そこが今いちばん効く。
+
+**`portal.yml` の `ci-enrolment` ジョブ。** 2 つのシークレットが揃っている配備でだけ
+走る（`ios-ffi.yml` と同じ守り方）。`permissions: id-token: write`、
+`$RUNNER_TEMP` の鍵、`ready` を待つループ、`if: always()` の後始末。
+`cargo run` を使うのはフェーズ 4 で学んだとおりである。
+
+**但し書きの削除。** フェーズ 4 は「この build では引き換えられない」と help と
+出力の両方に書いた。フェーズ 5 で引き換えられるようになったので、docs への
+案内に置き換えた。**一時的に正しかった文が、そのまま残ると嘘になる。**
+
+### 16.3 ついでに直した
+
+`portal-client` に `keeper is assigned but never used` の警告が出ていた。
+フェーズ 5 で入れて見落としていたもので、RAII のガードなので**読まないのが正しい** —
+`_keeper` にして、それが意図であることを名前とコメントで言うようにした。
+
+### 16.4 残っていること
+
+**残るのは issuer の許可リスト 1 つである**（§16.1 の 2 と 3）。両サーバに
+`https://token.actions.githubusercontent.com` を足せば、次の順で通せるはずである。
+
+1. `portal-client --issue-enrollment-key` — 鍵が返る
+2. `portal-server --provisioning-key` — 鍵が返る（権限は確認済み）
+3. 2 本をリポジトリのシークレットへ入れ、`ci-enrolment` ジョブが `ready` に到達する
+4. `portal-client --enrollment-key-enrollments` が `enrollment_released` を示す。
+   `enrollment_idle` が並んでいたら後始末が走っていない（§6.5）
+
+**確認のために Endpoint を 1 つ登録した**（`device_name: phase6-check`、
+`ep:243119b51e99d90b7c241201251e145ebfed7838d46e13e932c4c501dc38b3b9`）。権限を読むためだけのもので、要らなければ
+`POST /v1/endpoints/{id}/revoke` で失効させてよい。
