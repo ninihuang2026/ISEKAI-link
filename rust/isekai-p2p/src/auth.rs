@@ -154,7 +154,26 @@ pub struct Enrollment {
     /// **`tokio`'s `OnceCell` and not `std`'s.** The initializer is async, and
     /// `std::sync::OnceLock` has no way to hold one: "check, then enrol" across
     /// an `.await` is a race two concurrent callers both win.
-    enrolled: Arc<OnceCell<String>>,
+    enrolled: Arc<OnceCell<Registered>>,
+    /// Whether this process has already tried to register.
+    ///
+    /// **What tells a `409` we caused from one we merely met.** The first is a
+    /// lost response to our own enrolment — we spent the slot — and the second
+    /// is somebody else's Endpoint, which we must not revoke.
+    attempted: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// What an enrolment attempt settled, once.
+///
+/// **`by_us` is the part that matters on the way out.** A slot is spent by the
+/// process that *registered*, and a run that found the Endpoint already there —
+/// `409`, which this treats as success — spent nothing. Revoking on its way out
+/// would destroy an Endpoint somebody else is still using, which is exactly
+/// what a key-issuing invocation beside a running server does.
+#[derive(Debug, Clone)]
+pub(crate) struct Registered {
+    pub(crate) endpoint_id: String,
+    pub(crate) by_us: bool,
 }
 
 impl Enrollment {
@@ -170,6 +189,7 @@ impl Enrollment {
             assertion: None,
             auth0: None,
             enrolled: Arc::new(OnceCell::new()),
+            attempted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -185,13 +205,26 @@ impl Enrollment {
         self
     }
 
-    /// The Endpoint this key grew, once it has.
+    /// The Endpoint this credential is on, once that is settled — whether this
+    /// run registered it or found it already there.
     pub fn endpoint_id(&self) -> Option<&str> {
-        self.enrolled.get().map(String::as_str)
+        self.enrolled.get().map(|r| r.endpoint_id.as_str())
+    }
+
+    /// Whether *this process* registered it, and so owes the slot back.
+    pub fn registered_here(&self) -> bool {
+        self.enrolled.get().is_some_and(|r| r.by_us)
+    }
+
+    /// Record that an enrolment is being attempted, and say whether one had
+    /// been before. See [`Enrollment::attempted`].
+    pub(crate) fn mark_attempt(&self) -> bool {
+        self.attempted
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
     }
 
     /// The cell the enrolment writes to. See its documentation.
-    pub(crate) fn cell(&self) -> &OnceCell<String> {
+    pub(crate) fn cell(&self) -> &OnceCell<Registered> {
         &self.enrolled
     }
 }
