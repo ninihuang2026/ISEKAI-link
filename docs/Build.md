@@ -286,16 +286,32 @@ interactive.
 `scripts/camera-server.service` is a systemd unit that runs the script under
 a virtual display (`xvfb-run`), restarting it if it exits. It expects
 `camera-server` already built (`cargo build [--release] -p camera-server`
-from `rust/`). Every line that needs editing for your machine is marked
-`CHANGE-FOR-YOUR-MACHINE` in the unit file itself (`grep
-CHANGE-FOR-YOUR-MACHINE scripts/camera-server.service` to find them all) —
-as of writing that's `User=`, `SupplementaryGroups=` (only if your setup
-differs from a single desktop user in the `video` group — check `ls -la
-/dev/video0` if unsure), the `ExecStart=` path to this checkout's
-`run-camera-server.sh` (**easy to miss**: it is not `%h`-relative, so a
-checkout anywhere but `ninilouise`'s home needs this edited, or the unit
-fails to start pointing at a path that does not exist), and
-`Environment=OPENCV_LIB_DIR=...`. Install and enable it with:
+from `rust/`).
+
+Two kinds of machine-specific value, handled two different ways:
+
+- **This checkout's path, and `OPENCV_LIB_DIR`** live in a separate
+  `EnvironmentFile=`, not the unit itself — systemd expands `${VAR}` from
+  `Environment=`/`EnvironmentFile=` inside `Exec*` command lines
+  (systemd.exec(5)), so these never need the unit file touched:
+  ```sh
+  cp scripts/camera-server.env.example /etc/camera-server.env
+  # then edit /etc/camera-server.env: CAMERA_SERVER_CHECKOUT (this checkout's
+  # absolute path) and OPENCV_LIB_DIR (see the OpenCV build step above)
+  ```
+  The unit refuses to start if `/etc/camera-server.env` is missing, rather
+  than silently falling back to something wrong.
+- **`User=` and `SupplementaryGroups=`** can't be pulled from
+  `EnvironmentFile=` the same way — systemd only expands `${VAR}` inside
+  `Exec*` command lines, never in plain directives like these, so they stay
+  literal edits in the unit file itself. Every such line is marked
+  `CHANGE-FOR-YOUR-MACHINE` (`grep CHANGE-FOR-YOUR-MACHINE
+  scripts/camera-server.service` to find them all): `User=` (the user
+  `camera-server` should run as), and `SupplementaryGroups=` — only if your
+  setup differs from a single desktop user in the `video` group; check `ls
+  -la /dev/video0` if unsure.
+
+Install and enable it with:
 
 ```sh
 sudo cp scripts/camera-server.service /etc/systemd/system/
