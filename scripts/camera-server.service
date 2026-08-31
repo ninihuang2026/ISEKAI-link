@@ -9,25 +9,29 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# CHANGE-FOR-YOUR-MACHINE: the user camera-server should run as. Can't be
-# pulled from EnvironmentFile= below like the paths further down -- systemd
-# only expands ${VAR} from Environment=/EnvironmentFile= inside Exec*
-# command lines (systemd.exec(5)), never in plain directives like this one,
-# so it has to be a literal here regardless. Also why it's spelled out
-# rather than via %h -- that specifier only reliably resolves against User=
-# in a --user (session) unit; in a system unit like this one it silently
-# falls back to the *manager's* home (root) regardless of User=, confirmed
-# the hard way on this exact systemd (255).
-User=ninilouise
-# CHANGE-FOR-YOUR-MACHINE (maybe), same reason as User= above -- can't come
-# from EnvironmentFile= either: systemd does not load a service's
-# supplementary groups from /etc/group the way a login session does -- User=
-# alone gets only the primary group. The camera device (/dev/video0 on this
-# hardware) is group `video`, and without this line the service starts,
-# opens no camera, and reports nothing wrong until CAMERA_AUTOSTART's capture
-# silently never begins. Check `ls -la /dev/video0` on your machine -- the
-# group there is what belongs here, which may not be `video`.
-SupplementaryGroups=video
+# Placeholders, not real values -- User=/SupplementaryGroups= can't be
+# pulled from EnvironmentFile= like the paths further down (systemd only
+# expands ${VAR} from Environment=/EnvironmentFile= inside Exec* command
+# lines, systemd.exec(5), never in plain directives like these), so there's
+# no way to make this file itself machine-independent for these two. The
+# standard systemd answer for "let a deployer override a vendored unit
+# without editing it" is a drop-in, not hand-editing here: create
+# /etc/systemd/system/camera-server.service.d/override.conf (copy
+# scripts/camera-server.service.d.example/override.conf, which has the
+# real syntax and the `ls -la /dev/video0` note for SupplementaryGroups=)
+# with the real values for your machine. Left as this obviously-wrong
+# placeholder rather than a plausible-looking one (e.g. some real
+# username) so a missing override fails loudly at start -- getpwnam() on
+# a nonexistent user -- instead of silently running as whatever this
+# happened to resolve to.
+#
+# (Spelled out as a literal at all, rather than via %h, for the same
+# reason an override is still needed even once set: %h only reliably
+# resolves against User= in a --user *session* unit; in a system unit like
+# this one it silently falls back to the *manager's* home, i.e. root,
+# regardless of User=, confirmed the hard way on this exact systemd (255).)
+User=CHANGE-FOR-YOUR-MACHINE-see-camera-server.service.d.example
+SupplementaryGroups=CHANGE-FOR-YOUR-MACHINE-see-camera-server.service.d.example
 
 # Machine-specific paths that a plain command line *can* draw from --
 # systemd does expand ${VAR} inside Exec* command lines from here (unlike

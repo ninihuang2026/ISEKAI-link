@@ -288,12 +288,13 @@ a virtual display (`xvfb-run`), restarting it if it exits. It expects
 `camera-server` already built (`cargo build [--release] -p camera-server`
 from `rust/`).
 
-Two kinds of machine-specific value, handled two different ways:
+The unit file itself never needs editing — every machine-specific value is
+supplied externally, two different ways depending on what systemd allows:
 
 - **This checkout's path, and `OPENCV_LIB_DIR`** live in a separate
-  `EnvironmentFile=`, not the unit itself — systemd expands `${VAR}` from
+  `EnvironmentFile=` — systemd expands `${VAR}` from
   `Environment=`/`EnvironmentFile=` inside `Exec*` command lines
-  (systemd.exec(5)), so these never need the unit file touched:
+  (systemd.exec(5)):
   ```sh
   cp scripts/camera-server.env.example /etc/camera-server.env
   # then edit /etc/camera-server.env: CAMERA_SERVER_CHECKOUT (this checkout's
@@ -303,13 +304,19 @@ Two kinds of machine-specific value, handled two different ways:
   than silently falling back to something wrong.
 - **`User=` and `SupplementaryGroups=`** can't be pulled from
   `EnvironmentFile=` the same way — systemd only expands `${VAR}` inside
-  `Exec*` command lines, never in plain directives like these, so they stay
-  literal edits in the unit file itself. Every such line is marked
-  `CHANGE-FOR-YOUR-MACHINE` (`grep CHANGE-FOR-YOUR-MACHINE
-  scripts/camera-server.service` to find them all): `User=` (the user
-  `camera-server` should run as), and `SupplementaryGroups=` — only if your
-  setup differs from a single desktop user in the `video` group; check `ls
-  -la /dev/video0` if unsure.
+  `Exec*` command lines, never in plain directives like these. The unit
+  ships with an obviously-invalid placeholder for both (so a forgotten
+  override fails loudly at start, rather than running as whatever it
+  happened to resolve to), overridden via a systemd drop-in — the standard
+  mechanism for customizing a vendored unit without editing it:
+  ```sh
+  sudo mkdir -p /etc/systemd/system/camera-server.service.d
+  sudo cp scripts/camera-server.service.d.example/override.conf \
+      /etc/systemd/system/camera-server.service.d/override.conf
+  # then edit that copy: User= (the user camera-server should run as), and
+  # SupplementaryGroups= if your setup differs from a single desktop user
+  # in the `video` group -- check `ls -la /dev/video0` if unsure
+  ```
 
 Install and enable it with:
 
