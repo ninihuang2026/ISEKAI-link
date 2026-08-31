@@ -251,6 +251,20 @@ pub struct Capability {
 pub struct RelayInfo {
     pub masque_uri: String,
     pub session_id: String,
+    /// The relay this connection was routed to, when the control plane chose a
+    /// registered one.
+    ///
+    /// **This, not the shape of `masque_uri`, is what says to dial elsewhere.**
+    /// The URI always carries an authority — with no registered relay it is
+    /// built from `--p2p-relay-base-url`, whose default is a hardcoded
+    /// production host — so treating "has an authority" as "go there" sends a
+    /// local development client, and its Endpoint Token, to that host.
+    #[serde(default)]
+    pub dp_id: Option<String>,
+    /// SHA-256 of the relay's TLS SubjectPublicKeyInfo, base64url. Several
+    /// during a certificate rotation; empty when nothing is pinned.
+    #[serde(default)]
+    pub spki_sha256: Vec<String>,
 }
 
 /// Which leg of a relay a ticket is for (spec §8.14.1).
@@ -1110,6 +1124,15 @@ pub struct PeerConnection {
     pub ticket: Option<RelayTicket>,
     #[serde(default)]
     pub relay_session_id: Option<String>,
+    /// Where this connection's relay answers, when the control plane chose a
+    /// registered one.
+    ///
+    /// **The target's only way to learn it.** The initiator is handed a
+    /// `masque_uri`; a listener sees connections and nothing else, so without
+    /// this it has nowhere to bind but the control plane — which is not where
+    /// its ticket may be redeemed.
+    #[serde(default)]
+    pub relay_base_url: Option<String>,
     /// The loopback FQDN the initiator should dial for the video QUIC over the
     /// relay, so it can validate the per-endpoint certificate the listener
     /// downloaded. `None` when the proxy has relay certificates disabled — in

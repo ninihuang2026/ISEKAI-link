@@ -460,7 +460,14 @@ impl ListenerSession {
     ///
     /// This used to say the opposite, and believing it is what let a second
     /// viewer's leg be advertised to the first viewer's connection.
-    pub async fn bind(&mut self, connection_id: &str) -> anyhow::Result<()> {
+    /// `relay_base_url` is where this connection's relay answers, from the
+    /// connection view. `None` — no registered relay — keeps the old
+    /// behaviour of binding against the control plane's own data path.
+    pub async fn bind(
+        &mut self,
+        connection_id: &str,
+        relay_base_url: Option<&str>,
+    ) -> anyhow::Result<()> {
         if self.binds.contains_key(connection_id) {
             return Ok(());
         }
@@ -508,8 +515,13 @@ impl ListenerSession {
                 }
             },
         };
+        // **The relay the ticket names, not the proxy we registered with.**
+        // A leg opened against the control plane carries a ticket for another
+        // relay, and the data path refuses it — correctly, and confusingly,
+        // because the refusal names a ticket problem when the mistake was the
+        // host we dialled.
         let session = open_bind_session(
-            &self.proxy_url,
+            relay_base_url.unwrap_or(&self.proxy_url),
             // The current one, not the one the session started with: a leg
             // opened an hour in carries a token issued minutes ago.
             &self.proxy.endpoint_token(),
@@ -685,7 +697,13 @@ impl ListenerSession {
                 });
                 continue;
             }
-            match self.bind(&connection.connection_id).await {
+            match self
+                .bind(
+                    &connection.connection_id,
+                    connection.relay_base_url.as_deref(),
+                )
+                .await
+            {
                 Ok(()) => {
                     state.bound.insert(connection.connection_id.clone());
                     events.push(SignalingEvent::Bound {
@@ -1171,7 +1189,25 @@ pub async fn run(
                     let _ = reply.send(result);
                 }
                 Some(ListenerCommand::Bind { connection_id, reply }) => {
-                    let result = session.bind(&connection_id).await;
+                    // Read the connection first: a bind asked for by id alone
+                    // still has to land on the relay the ticket names, and
+                    // only the connection view says which that is.
+                    //
+                    // **A failed read is not "no relay".** Swallowing it would
+                    // bind against the control plane while the ticket names
+                    // the registered relay, which the data path then refuses
+                    // for naming another relay — the exact confusion this
+                    // change exists to remove, reintroduced by a `.ok()`.
+                    let result = match session.proxy.get_connection(&connection_id).await {
+                        Ok(c) => {
+                            session
+                                .bind(&connection_id, c.relay_base_url.as_deref())
+                                .await
+                        }
+                        Err(e) => Err(anyhow::anyhow!(
+                            "could not read {connection_id} to find its relay: {e}"
+                        )),
+                    };
                     let _ = reply.send(result);
                 }
                 Some(ListenerCommand::ShowPairingCode { ttl, reply }) => {
