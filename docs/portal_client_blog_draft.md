@@ -22,7 +22,8 @@ catalogue entry differs.
 
 ## The Catalogue Is the Whole Policy
 
-The Jetson's `portal-server` is started with a service catalogue that declares exactly one
+The Jetson (an NVIDIA edge board — small enough to sit on a desk, with enough GPU to run a
+local LLM) runs `portal-server`, started with a service catalogue that declares exactly one
 entry:
 
 ```toml
