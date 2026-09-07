@@ -523,7 +523,9 @@ impl ListenerSession {
         let (ticket, renewable) = match self.proxy.issue_relay_ticket(connection_id).await {
             Ok(ticket) => (Some(ticket), true),
             Err(e) => match crate::relay_lease::verdict(&e) {
-                crate::relay_lease::Verdict::Refused | crate::relay_lease::Verdict::LegGone => {
+                crate::relay_lease::Verdict::Refused
+                | crate::relay_lease::Verdict::LegGone
+                | crate::relay_lease::Verdict::Elsewhere => {
                     return Err(anyhow::anyhow!(
                         "the proxy will not authorize a relay leg for {connection_id}: {e}"
                     ));
