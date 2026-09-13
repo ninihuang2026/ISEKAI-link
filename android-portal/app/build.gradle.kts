@@ -116,6 +116,21 @@ tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile>().configureEach 
     dependsOn(generateUniFfiBindings)
 }
 
+// `generateJniLibs` was registered but nothing ever depended on it, so
+// `assembleDebug`/`installDebug` packaged whatever happened to already be
+// sitting in `src/main/jniLibs` -- nothing, on a fresh checkout -- and
+// produced an APK that launches fine (native calls are lazy) and then hits
+// `UnsatisfiedLinkError: library "libportal_client_ffi.so" not found` the
+// first time one actually runs (confirmed live: Pair crashed the process
+// outright). Every AGP variant has its own `merge<Variant>JniLibFolders` task
+// that gathers `src/main/jniLibs` right before packaging; hooking there
+// (rather than `KotlinCompile`, like the bindings above) keeps a Kotlin-only
+// compile from requiring the NDK, per `generateJniLibs`'s own doc comment,
+// while still guaranteeing every real build actually has the library it
+// needs to run.
+tasks.matching { it.name.startsWith("merge") && it.name.endsWith("JniLibFolders") }
+    .configureEach { dependsOn(generateJniLibs) }
+
 dependencies {
     implementation("net.java.dev.jna:jna:5.14.0@aar")
 
