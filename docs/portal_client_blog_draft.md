@@ -52,7 +52,7 @@ path go quiet.
 ## Model Choice Is Just a Config String
 
 The model running this time is `qwen3.5:4b` — chosen because it fits comfortably in this
-Jetson's GPU memory alongside everything else sharing the box, not because anything
+Jetson Orin Nano's GPU memory alongside everything else sharing the box, not because anything
 upstream of Ollama cares which model it is. Neither `portal-core`'s forwarding nor the
 client's HTTP layer look at the model name beyond passing it through in the `/api/chat`
 request body. Any open-weights model works as a drop-in replacement, as long as it fits the
