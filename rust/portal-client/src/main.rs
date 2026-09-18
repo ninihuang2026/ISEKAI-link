@@ -124,9 +124,14 @@ struct Args {
     device_name: Option<String>,
     /// path to this Endpoint's signing key. Generated on first use; keep it,
     /// because a new one is a new Endpoint ID and the capability you were
-    /// issued stops meaning anything
-    #[argh(option, default = "PathBuf::from(\"portal-client.pem\")")]
-    key: PathBuf,
+    /// issued stops meaning anything. Defaults to `portal-client.pem`, and is
+    /// refused with --agent, whose key never reaches the filesystem
+    #[argh(option)]
+    key: Option<PathBuf>,
+    /// run one task as the signed-in person, under a key that lives only for
+    /// it. Needs --auth0-tokens, and refuses --key
+    #[argh(switch)]
+    agent: bool,
     /// print this Endpoint's ID and exit -- what the server needs for --allow
     #[argh(switch)]
     whoami: bool,
@@ -271,6 +276,14 @@ struct Args {
     note: Option<String>,
 }
 
+/// Where a stored key lives when `--key` said nothing.
+///
+/// **The default moved off the argument on purpose.** As an argh default,
+/// `--key` could not tell "the operator named this path" from "nobody said
+/// anything", and agent mode has to: naming a path is a refusal, and a path
+/// this constant supplied is not.
+const DEFAULT_KEY: &str = "portal-client.pem";
+
 /// The audience the **proxy** checks a binding assertion against (§8.13.4).
 const PROXY_AUDIENCE: &str = "isekai-proxy";
 
@@ -335,10 +348,35 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()> {
+    // **First, because the rest of this function reads the key's path.** Agent
+    // mode has none, and what the token store defaults to is the first thing
+    // that would quietly paper over that.
+    portal_core::agent::check_args(
+        args.agent,
+        args.key.is_some(),
+        args.auth0_tokens.is_some(),
+        args.auth0_token.is_some(),
+        args.enroll,
+    )?;
+    // **Stops here until P2, and here rather than beside the key it is about.**
+    // Several modes return before the key is ever loaded — signing in, and the
+    // whole account-admin path — so a refusal further down would let
+    // `--agent --endpoints` run the admin command and exit 0, having accepted
+    // the flag and dropped it. `--agent` is the one flag whose entire subject
+    // is how long this Endpoint lives, and silently ignoring it is the same
+    // confusion `check_args` is here to prevent. It also keeps the "generating
+    // a new Endpoint key" notice from naming a file agent mode never makes.
+    if args.agent {
+        anyhow::bail!(
+            "--agent is accepted but not connected yet: the task key and its revocation \
+             are the next step (docs/portal_agent_plan.md P2)"
+        );
+    }
+    let key_path = args.key.clone().unwrap_or_else(|| PathBuf::from(DEFAULT_KEY));
     let tokens = args
         .auth0_tokens
         .clone()
-        .unwrap_or_else(|| portal_core::login::tokens_beside(&args.key));
+        .unwrap_or_else(|| portal_core::login::tokens_beside(&key_path));
     // **Before the key**, which signing in does not need — and a corrupt
     // `portal-client.pem` should not block the one command that has nothing to
     // do with it. `portal-server` orders these the same way.
@@ -421,10 +459,10 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
     // directory than last time silently makes a *second* Endpoint — and the
     // failure is `capability-endpoint-mismatch` from the proxy, several steps
     // later, naming nothing that points back here.
-    if !args.key.exists() {
-        tracing::info!(path = %args.key.display(), "generating a new Endpoint key");
+    if !key_path.exists() {
+        tracing::info!(path = %key_path.display(), "generating a new Endpoint key");
     }
-    let key = load_or_generate_key(&args.key)?;
+    let key = load_or_generate_key(&key_path)?;
     if args.whoami {
         // Before any network call: this is what the operator needs in order to
         // ask the other side for a capability, and it costs nothing to answer.
