@@ -232,6 +232,50 @@ impl Table {
         self.entries.values()
     }
 
+    /// What each Endpoint is allowed, for matching an arriving connection.
+    ///
+    /// **The smallest `max_concurrent` among that Endpoint's leases**, because
+    /// two policies covering one agent do not add up to permission for more —
+    /// the tighter one is a limit the looser one does not lift.
+    ///
+    /// `None` against a name means the leases set no limit. An Endpoint absent
+    /// from the map has no policy here at all, which is a different answer
+    /// again and the one that will be refused once enforcement exists.
+    ///
+    /// # Two things this is coarser than the table
+    ///
+    /// **Keyed on the Endpoint alone, though rows are per
+    /// `(endpoint, protocol)`.** A connection notification names the peer and
+    /// not the protocol, so that is all there is to match on — which means a
+    /// tight limit on one class caps another class's connections too. Erring
+    /// tight is the right direction while nothing is enforced, and the
+    /// enforcement phase will need the protocol carried through to do better.
+    ///
+    /// **And it counts rows that have lapsed but not yet been swept**, up to
+    /// the sweep interval. The same direction: a moment of saying "covered"
+    /// about something just expired, rather than of refusing something live.
+    pub fn limits(&self) -> BTreeMap<String, Option<u32>> {
+        let mut out: BTreeMap<String, Option<u32>> = BTreeMap::new();
+        for entry in self.entries.values() {
+            match out.entry(entry.allowed_endpoint.clone()) {
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert(entry.max_concurrent);
+                }
+                std::collections::btree_map::Entry::Occupied(mut slot) => {
+                    let tighter = match (*slot.get(), entry.max_concurrent) {
+                        (Some(a), Some(b)) => Some(a.min(b)),
+                        // One lease setting no limit does not lift another's.
+                        (Some(a), None) => Some(a),
+                        (None, Some(b)) => Some(b),
+                        (None, None) => None,
+                    };
+                    slot.insert(tighter);
+                }
+            }
+        }
+        out
+    }
+
     /// What is held for `allowed_endpoint`, which is what a connection is
     /// matched against.
     pub fn for_endpoint<'a>(&'a self, endpoint: &'a str) -> impl Iterator<Item = &'a Entry> {
@@ -783,6 +827,41 @@ mod tests {
             ttl <= 200 - GRANT_TTL_MARGIN as u64,
             "with 200s of lease left the grant asked for {ttl}s",
         );
+    }
+
+    #[test]
+    fn the_tighter_limit_is_the_one_that_holds() {
+        // Two policies covering one agent do not add up to permission for more.
+        let mut a = granted("al_1", 1);
+        a.constraints.as_mut().unwrap().max_concurrent = Some(5);
+        let mut b = granted("al_2", 1);
+        b.constraints.as_mut().unwrap().max_concurrent = Some(2);
+
+        let mut table = Table::new();
+        table.apply(&a, &policy()).unwrap();
+        table.apply(&b, &policy()).unwrap();
+        assert_eq!(table.limits()["ep:a7"], Some(2));
+    }
+
+    #[test]
+    fn a_lease_with_no_limit_does_not_lift_another() {
+        let mut a = granted("al_1", 1);
+        a.constraints.as_mut().unwrap().max_concurrent = Some(2);
+        let mut b = granted("al_2", 1);
+        b.constraints.as_mut().unwrap().max_concurrent = None;
+
+        let mut table = Table::new();
+        table.apply(&a, &policy()).unwrap();
+        table.apply(&b, &policy()).unwrap();
+        assert_eq!(table.limits()["ep:a7"], Some(2));
+    }
+
+    #[test]
+    fn an_endpoint_with_no_policy_is_absent_rather_than_unlimited() {
+        // Absent and "no limit" are different answers, and the first is the one
+        // enforcement will refuse.
+        let table = Table::new();
+        assert!(!table.limits().contains_key("ep:a7"));
     }
 
     #[test]
