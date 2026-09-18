@@ -1011,6 +1011,119 @@ impl<T: ControlPlaneTransport> IdentityClient<T> {
     /// **Revoked rows are hidden unless asked for**, which is why
     /// [`EndpointList::revoked_count`] exists and why anything showing this
     /// should show that too.
+    /// `GET /v1/policies/stream` — the changes, as they happen
+    /// (identity spec §8.10.3).
+    ///
+    /// `after` is the `cursor` from a snapshot. **Omit it and the whole of what
+    /// is in force streams first**, which is a second way to get the same
+    /// answer `list_policies` gives — so pass the cursor unless that is what
+    /// you want.
+    ///
+    /// # It ends, and that is not a fault
+    ///
+    /// **The server closes this at the expiry of the token that opened it.**
+    /// A PoP covers one request, so an indefinite stream would be authenticated
+    /// once and then trusted forever; ending it forces the check to be made
+    /// again, and bounds how much can be missed to one token lifetime. A caller
+    /// that treats the end as an error logs a fault every fifteen minutes; the
+    /// right response is to reconcile and open a new one.
+    ///
+    /// # It is the fast path, not the record
+    ///
+    /// Nothing is replayed and a slow reader is cut off. Correctness comes from
+    /// [`list_policies`](Self::list_policies), which is what a reconnect reads.
+    /// **And expiry never appears here at all** — a lapsed lease is silent, so
+    /// a subscriber that waits to be told will wait forever.
+    pub async fn policy_stream(
+        &self,
+        endpoint_token: &str,
+        key: &EndpointKey,
+        after: Option<i64>,
+    ) -> Result<tokio::sync::mpsc::Receiver<PolicyEvent>, IdentityError>
+    where
+        T: crate::proxy::EventStreamTransport,
+    {
+        let path = match after {
+            Some(cursor) => format!("/v1/policies/stream?after={cursor}"),
+            None => "/v1/policies/stream".to_owned(),
+        };
+        // **Signed over the path the request is actually made on**, query string
+        // and all. Signing the bare path would leave the cursor unprotected,
+        // and it is what decides how much history arrives.
+        let pop = pop::sign_request(key, "GET", &path, &[]);
+        let mut headers = vec![(
+            "authorization".to_owned(),
+            format!("Bearer {endpoint_token}"),
+        )];
+        headers.extend(
+            pop.as_pairs()
+                .map(|(name, value)| (name.to_owned(), value.to_owned())),
+        );
+        let (status, mut chunks) = self
+            .transport
+            .open_stream("GET", &path, &headers)
+            .await
+            .map_err(IdentityError::Transport)?;
+        if status != 200 {
+            let mut body = Vec::new();
+            while body.len() < MAX_POLICY_LINE {
+                match chunks.recv().await {
+                    Some(Ok(chunk)) => body.extend_from_slice(&chunk),
+                    _ => break,
+                }
+            }
+            return Err(IdentityError::Api {
+                status,
+                body: String::from_utf8_lossy(&body).into_owned(),
+                // **None because this path cannot see headers**, not because
+                // there are none to read. `open_stream` returns a status and a
+                // body, so a `Retry-After` on `503 policy-stream-capacity` is
+                // not available here; the caller's own backoff is what paces a
+                // retry. Widening the trait to carry them is the fix if that
+                // stops being enough.
+                retry_after: None,
+            });
+        }
+
+        let (events, receiver) = tokio::sync::mpsc::channel(32);
+        tokio::spawn(async move {
+            let mut buffer = Vec::new();
+            while let Some(chunk) = chunks.recv().await {
+                match chunk {
+                    Ok(bytes) => buffer.extend_from_slice(&bytes),
+                    Err(e) => {
+                        tracing::debug!("the policy stream ended: {e}");
+                        break;
+                    }
+                }
+                // **Drained first, then measured.** The cap is on one
+                // unterminated line, not on how much arrives at once: a full
+                // replay (`after = None`) can deliver far more than this in a
+                // single chunk, all of it complete lines, and checking first
+                // ended the stream on a buffer that was about to be emptied.
+                let mut ready = Vec::new();
+                drain_policy_lines(&mut buffer, &mut ready);
+                if buffer.len() > MAX_POLICY_LINE {
+                    tracing::warn!(
+                        "a policy line exceeded {MAX_POLICY_LINE} bytes; ending the stream"
+                    );
+                    break;
+                }
+                for event in ready {
+                    if events.send(event).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+        Ok(receiver)
+    }
+
+    /// §8.1.3 — the Endpoints this caller owns.
+    ///
+    /// **Revoked rows are hidden unless asked for**, which is why
+    /// [`EndpointList::revoked_count`] exists and why anything showing this
+    /// should show that too.
     pub async fn list_endpoints(
         &self,
         auth0_token: &str,
@@ -1088,6 +1201,16 @@ impl<T: ControlPlaneTransport> IdentityClient<T> {
             .await
     }
 
+    /// §8.7 — revoke an Endpoint, as its owner or as itself.
+    ///
+    /// [`RevokeAuth`] carries the asymmetry: the Auth0 route states a reason,
+    /// the key route states none and gets `enrollment_released`. The key route
+    /// signs a PoP, which is what confines it to **this** Endpoint — a leaked
+    /// key alone stops nothing, including the other Endpoints it grew.
+    ///
+    /// **Best-effort at the end of a job.** The idle sweep is behind this, so a
+    /// failure here costs a slot until then and nothing else; it is not a
+    /// reason to fail work that otherwise succeeded.
     pub async fn revoke_endpoint(
         &self,
         auth: RevokeAuth<'_>,
@@ -1378,6 +1501,35 @@ fn now_rfc3339() -> Result<String, IdentityError> {
     OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .map_err(|_| IdentityError::Time)
+}
+
+/// The largest policy line worth buffering.
+///
+/// A line that never ends would grow the buffer without limit. Ending the
+/// stream is what every other failure here does, so the caller already knows
+/// how to recover — by reconciling and opening a new one.
+const MAX_POLICY_LINE: usize = 64 * 1024;
+
+/// Split what has arrived into whole lines, dropping `keepalive` and anything
+/// unreadable.
+///
+/// **One bad line does not end the stream.** The next may be fine, and the
+/// reconciliation is what this is checked against in any case.
+fn drain_policy_lines(buffer: &mut Vec<u8>, out: &mut Vec<PolicyEvent>) {
+    while let Some(end) = buffer.iter().position(|b| *b == b'\n') {
+        let line: Vec<u8> = buffer.drain(..=end).collect();
+        let line = &line[..line.len() - 1];
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_slice::<PolicyEvent>(line) {
+            Ok(event) => out.push(event),
+            // `keepalive` has no lease and lands here. It carries nothing, and
+            // its only meaning is that the stream is still open — which is
+            // already said by the fact that a chunk arrived.
+            Err(e) => tracing::trace!("ignoring a policy line: {e}"),
+        }
+    }
 }
 
 #[cfg(test)]

@@ -106,6 +106,61 @@ pub async fn list_policies(
     }
 }
 
+/// Subscribe to the policy stream (identity §8.10.3).
+///
+/// **Only the H3 transport could do this until now.** `EventStreamTransport`
+/// is implemented for both since this phase, so the branch here is the same
+/// runtime choice every other Identity call makes rather than a limitation.
+pub async fn policy_stream(
+    cfg: &P2pConfig,
+    endpoint_token: &str,
+    after: Option<i64>,
+) -> anyhow::Result<PolicyStream> {
+    if cfg.identity_http3 {
+        let client = IdentityClient::new(MasqueH3Transport::connect(&cfg.identity_url)?);
+        let events = client
+            .policy_stream(endpoint_token, &cfg.key, after)
+            .await?;
+        Ok(PolicyStream {
+            events,
+            _transport: Box::new(client),
+        })
+    } else {
+        let client = IdentityClient::new(HttpsTransport::connect(&cfg.identity_url)?);
+        let events = client
+            .policy_stream(endpoint_token, &cfg.key, after)
+            .await?;
+        Ok(PolicyStream {
+            events,
+            _transport: Box::new(client),
+        })
+    }
+}
+
+/// A policy stream, and the client it is being read over.
+///
+/// **The client has to outlive the stream.** Returning the receiver alone left
+/// the `IdentityClient` — and with it the last handle on the H3 channel — to be
+/// dropped at the end of the call that opened it, tearing the QUIC connection
+/// down while the stream was still being read. `listener_events` escapes this
+/// only because its caller happens to keep the client alive.
+///
+/// The HTTPS transport survives either way, since `reqwest`'s response owns
+/// what it needs — which is exactly why this would have gone unnoticed on the
+/// deployment it was tested against.
+pub struct PolicyStream {
+    events: tokio::sync::mpsc::Receiver<isekai_p2p_core::identity::PolicyEvent>,
+    /// Held, not read.
+    _transport: Box<dyn std::any::Any + Send>,
+}
+
+impl PolicyStream {
+    /// The next event, or `None` when the stream has ended.
+    pub async fn recv(&mut self) -> Option<isekai_p2p_core::identity::PolicyEvent> {
+        self.events.recv().await
+    }
+}
+
 /// Give an unattended Endpoint's slot back (§8.7 with an Enrollment Key).
 ///
 /// **Only meaningful on [`Credential::Enrollment`]**, and an error on anything
