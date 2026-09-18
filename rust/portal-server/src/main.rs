@@ -341,6 +341,64 @@ async fn administer_grants(args: &Args, tokens: &std::path::Path) -> anyhow::Res
 
 /// The P2P configuration these arguments describe, authenticated however this
 /// installation is.
+/// Read what the control plane says is in force, and build the table from it.
+///
+/// **P1 of `docs/portal_gateway_plan.md`: this makes no grant.** It reads,
+/// checks every row against the operator's envelope, and says what it found —
+/// so that a deployment can see what is being handed out before anything acts
+/// on it. Holding the table without enforcing it is the point of the phase.
+///
+/// Reconciling is also the correctness guarantee rather than the stream, which
+/// is why this runs at startup and (in a later phase) once per token lifetime.
+async fn reconcile_policies(
+    cfg: &P2pConfig,
+    policy: &portal_core::gateway::GatewayPolicy,
+) -> anyhow::Result<()> {
+    let token = isekai_p2p::issue_endpoint_token(cfg).await?.endpoint_token;
+
+    // **Propagated, never rendered as an empty snapshot.** An empty list is an
+    // instruction to drop every row, so turning a failed read into one would
+    // delete a live policy over one bad moment -- which is the failure
+    // Identity's own spec warns about by name.
+    let snapshot = isekai_p2p::list_policies(cfg, &token)
+        .await
+        .context("read the policies in force")?;
+
+    // **The one field that is confirmation rather than content.** There is no
+    // way to ask for another Gateway's rows, so a mismatch is not a permission
+    // problem -- it means this is not the answer to the question that was
+    // asked, and applying it would hold to somebody else's policy.
+    let me = cfg.endpoint_id();
+    anyhow::ensure!(
+        snapshot.gateway == me,
+        "the control plane answered with policy for {}, not for this endpoint ({me})",
+        snapshot.gateway,
+    );
+
+    let mut table = portal_core::gateway::Table::new();
+    let outcome = table.reconcile(&snapshot, policy);
+
+    tracing::info!(
+        gateway = %snapshot.gateway,
+        cursor = snapshot.cursor,
+        offered = snapshot.items.len(),
+        applied = outcome.applied,
+        refused = outcome.refused.len(),
+        "policy: reconciled with the control plane"
+    );
+    // **Each refusal named, not just counted.** A row the centre believes is in
+    // force and this Gateway will not apply is a disagreement between two
+    // configurations, and it is the number worth knowing before enforcement is
+    // switched on.
+    for (lease, why) in &outcome.refused {
+        tracing::warn!(lease, "policy: not applied: {why}");
+    }
+    // **The table is dropped here on purpose.** Nothing consults it yet, and
+    // keeping one alive would invite something to start. It is held for the
+    // life of the process from P2, when the stream has somewhere to write.
+    Ok(())
+}
+
 async fn config(args: &Args, tokens: &std::path::Path) -> anyhow::Result<P2pConfig> {
     // **Authentication first, then the key.** The struct literal this replaced
     // evaluated the token before the key, so a run with neither a sign-in nor a
@@ -831,18 +889,22 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
     // pattern that does not compile, is refused *here* rather than the first
     // time an operation runs, which with the PEP deferred is not in this
     // release at all.
-    if let Some(path) = &args.gateway_config {
-        let policy = portal_core::gateway::load(path)?;
-        for protocol in policy.protocols() {
-            let class = policy.protocol(protocol).expect("just listed");
-            tracing::info!(
-                protocol,
-                operations = class.operations().count(),
-                windows = class.windows().count(),
-                "gateway policy: serving a protocol class"
-            );
+    let gateway_policy = match &args.gateway_config {
+        Some(path) => {
+            let policy = portal_core::gateway::load(path)?;
+            for protocol in policy.protocols() {
+                let class = policy.protocol(protocol).expect("just listed");
+                tracing::info!(
+                    protocol,
+                    operations = class.operations().count(),
+                    windows = class.windows().count(),
+                    "gateway policy: serving a protocol class"
+                );
+            }
+            Some(policy)
         }
-    }
+        None => None,
+    };
 
     // **Before the catalogue and before any listener**, because neither is
     // needed to answer them: grants belong to this Endpoint rather than to a
@@ -947,6 +1009,10 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
     // From here on this Endpoint may exist, so every way out owes a slot back.
     if args.enroll {
         *enrolled = Some(cfg.clone());
+    }
+
+    if let Some(policy) = &gateway_policy {
+        reconcile_policies(&cfg, policy).await?;
     }
 
     let shutdown = CancellationToken::new();
