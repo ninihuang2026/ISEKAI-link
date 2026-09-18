@@ -143,10 +143,7 @@ struct Args {
     #[argh(switch)]
     identity_http3: bool,
     /// proxy base URL. Defaults to the deployment the camera apps use
-    #[argh(
-        option,
-        default = "String::from(\"https://link.isekai.tools:6443\")"
-    )]
+    #[argh(option, default = "String::from(\"https://link.isekai.tools:6443\")")]
     proxy_url: String,
     /// auth0 access token, used only to obtain the Endpoint Token. Cannot be
     /// refreshed -- `--login` is what keeps a long-running server working.
@@ -190,6 +187,14 @@ struct Args {
     /// print a starter catalogue on stdout and exit
     #[argh(switch)]
     example_config: bool,
+    /// path to the gateway policy: which protocol classes this server serves
+    /// as a Gateway, and what the control plane may say about them. Checked at
+    /// startup; nothing is enforced yet. See --example-gateway-config
+    #[argh(option)]
+    gateway_config: Option<PathBuf>,
+    /// print a starter gateway policy on stdout and exit
+    #[argh(switch)]
+    example_gateway_config: bool,
     /// print a pairing code and exit, letting whoever redeems it in for good.
     /// This is the one to use: a redeemed code is a Grant, which is reusable
     /// and survives this server restarting. Needs no server running, so a
@@ -806,6 +811,37 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
         // runs when they have none of the three yet.
         print!("{}", portal_core::config::EXAMPLE);
         return Ok(());
+    }
+    if args.example_gateway_config {
+        print!("{}", portal_core::gateway::EXAMPLE);
+        return Ok(());
+    }
+
+    // **Before every way out of this function, not beside the catalogue.**
+    // `--login` and the grant administration below both return early, so a
+    // policy read further down would be accepted and silently ignored on those
+    // runs -- `--pair --gateway-config typo.toml` exiting happily without ever
+    // opening the file. This file refuses flags it will not act on in three
+    // other places for exactly that reason; the sixth recurrence of that shape
+    // in this work is not the one to leave.
+    //
+    // Nothing consults the policy yet -- the policy source and the PEP are
+    // later phases (`docs/portal_gateway_plan.md`). What reading it buys today
+    // is that a statement with three placeholders and two bindings, or a
+    // pattern that does not compile, is refused *here* rather than the first
+    // time an operation runs, which with the PEP deferred is not in this
+    // release at all.
+    if let Some(path) = &args.gateway_config {
+        let policy = portal_core::gateway::load(path)?;
+        for protocol in policy.protocols() {
+            let class = policy.protocol(protocol).expect("just listed");
+            tracing::info!(
+                protocol,
+                operations = class.operations().count(),
+                windows = class.windows().count(),
+                "gateway policy: serving a protocol class"
+            );
+        }
     }
 
     // **Before the catalogue and before any listener**, because neither is
