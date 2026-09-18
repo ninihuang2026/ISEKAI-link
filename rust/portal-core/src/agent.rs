@@ -1,15 +1,19 @@
-//! What agent mode refuses before it starts (`docs/portal_agent_plan.md` P1).
+//! Agent mode: what it refuses before starting (P1), and how it puts its
+//! Endpoint away afterwards (P4). See `docs/portal_agent_plan.md`.
 //!
-//! **Only the arguments.** Agent mode runs one task under a key that never
-//! reaches the filesystem, and the combinations that contradict that are facts
-//! about the command line — knowable before a single byte is spent. Refused
-//! here, the operator reads one sentence naming the flag; refused later, they
-//! read whatever failed first and fix the wrong thing.
+//! **The refusals are about the arguments only.** Agent mode runs one task
+//! under a key that never reaches the filesystem, and the combinations that
+//! contradict that are facts about the command line — knowable before a single
+//! byte is spent. Refused here, the operator reads one sentence naming the
+//! flag; refused later, they read whatever failed first and fix the wrong
+//! thing.
 //!
 //! **Accepting a flag and dropping it is the failure this file exists to
 //! prevent**, so the list is long on purpose: `portal-client` has several modes
 //! that return before a key is ever made, and `--agent` means nothing to any of
 //! them.
+
+use anyhow::Context as _;
 
 /// Which of the flags agent mode cares about were given.
 ///
@@ -155,6 +159,109 @@ pub fn check_args(given: Given) -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// Revoke the Endpoint this task ran as (`docs/portal_agent_plan.md` P4).
+///
+/// **Not `ci::release_the_slot`, and it could not be.** That one calls
+/// `release_enrollment`, whose first line refuses anything but
+/// `Credential::Enrollment` — so an agent run reusing it would warn that it
+/// could not return a slot, leave the sweep to handle it, and revoke nothing.
+/// Tidying up that looks like it happened is worse than tidying up that did
+/// not.
+///
+/// **Errors are returned, not swallowed.** `release_the_slot` never changes an
+/// exit code because the idle sweep is behind it, costing a slot until then
+/// and nothing else. Nothing is behind this: `endpoint_idle_ttl` belongs to
+/// Enrollment Keys, and an Endpoint registered on the Auth0 route has none, so
+/// a failed revocation leaves it registered **indefinitely**. Reachability does
+/// end — the Grants lapse with the lease once this process stops renewing
+/// (plan §2.5) — but the registration stays, and nobody learns that from a
+/// warning in a log that scrolled past.
+pub async fn revoke_the_task_endpoint(cfg: &isekai_p2p::P2pConfig) -> anyhow::Result<()> {
+    // **The whole thing is bounded, not just the HTTP call.** Getting a current
+    // Auth0 token is itself a round trip — behind a lock the token renewal may
+    // be holding across its own refresh — so a timeout around the revocation
+    // alone would leave the wind-down free to sit for minutes on a blackholed
+    // route, which is the hang this is shaped to avoid.
+    tokio::time::timeout(REVOKE_TIMEOUT, revoke_now(cfg))
+        .await
+        .map_err(|_| anyhow::anyhow!("Identity did not answer within {REVOKE_TIMEOUT:?}"))?
+}
+
+async fn revoke_now(cfg: &isekai_p2p::P2pConfig) -> anyhow::Result<()> {
+    use isekai_p2p::agent::RevokeReason;
+
+    // Only what this run actually registered. A task that failed before its
+    // first token has nothing to revoke, and asking anyway buys a round trip
+    // to be told so.
+    let Some(endpoint_id) = cfg.credential.registered_endpoint() else {
+        return Ok(());
+    };
+    let token = cfg
+        .credential
+        .current_auth0_token()
+        .await
+        .context("could not obtain an Auth0 token to revoke with")?
+        .context("agent mode revokes as the signed-in person, and this run has no Auth0 token")?;
+    let identity = isekai_p2p::enrollment::Identity::new(&cfg.identity_url, cfg.identity_http3);
+    let revoked = isekai_p2p::endpoints::revoke(
+        &identity,
+        &token,
+        endpoint_id,
+        // **The word that says this was not an exception.** Without it the only
+        // fit was `endpoint_deleted`, which is what an operator removing a
+        // device writes — and a task-scoped Endpoint revokes itself on every
+        // successful run, so those would have buried the deletions worth
+        // finding (ISEKAI-identity#44).
+        RevokeReason::TaskFinished,
+        None,
+    )
+    .await
+    .with_context(|| format!("revoke {endpoint_id}"))?;
+
+    // **A `200` does not mean the Endpoint stopped** (§8.7). Identity's own
+    // record is settled either way; whether the proxy heard is a separate fact,
+    // and it is the one that decides whether anything is still reachable. An
+    // agent run that reported success here while the proxy kept honouring the
+    // Grants would be announcing exactly the outcome P4 exists to prevent.
+    let detail = revoked.proxy_notification_detail.as_deref().unwrap_or("-");
+    match revoked.proxy_notification.as_deref() {
+        Some("delivered") => {
+            tracing::info!(endpoint = %endpoint_id, "revoked this task's Endpoint");
+            Ok(())
+        }
+        // **Not an error.** A deployment with no `PROXY_INTERNAL_URL` has
+        // nothing to tell, and failing every task on a configuration that is
+        // deliberate would make agent mode unusable there.
+        Some("disabled") => {
+            tracing::info!(
+                endpoint = %endpoint_id,
+                "revoked this task's Endpoint; this deployment notifies no proxy",
+            );
+            Ok(())
+        }
+        Some("failed") => anyhow::bail!(
+            "{endpoint_id} is revoked at Identity but the proxy was not told ({detail}), so its \
+             grants and listeners for this Endpoint stand"
+        ),
+        Some("partial") => anyhow::bail!(
+            "{endpoint_id} is revoked and the proxy was told, but its revocation set is full \
+             ({detail}), so this Endpoint keeps getting through until the proxy restarts"
+        ),
+        other => anyhow::bail!(
+            "{endpoint_id} is revoked at Identity, but it did not say whether the proxy was \
+             told (`{}`), so whether anything is still reachable is unknown",
+            other.unwrap_or("not reported"),
+        ),
+    }
+}
+
+/// How long to wait for the revocation before calling it failed.
+///
+/// Longer than `release_the_slot`'s three seconds, because the two answer to
+/// different things: a slot comes back on its own at the next sweep, and this
+/// does not come back at all.
+const REVOKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[cfg(test)]
 mod tests {
@@ -310,6 +417,29 @@ mod tests {
             let e = check_args(given).expect_err("refused");
             assert!(e.to_string().contains(want), "{e}");
         }
+    }
+
+    /// **A run that registered nothing has nothing to revoke**, and asking
+    /// anyway would buy a round trip to be told so — on a path that is reached
+    /// when Identity is already the thing that was not working. The identity
+    /// URL here points nowhere, so a call would fail rather than pass.
+    #[tokio::test]
+    async fn a_run_that_never_registered_revokes_nothing() {
+        let cfg = isekai_p2p::P2pConfig {
+            identity_url: "http://127.0.0.1:1".to_owned(),
+            identity_http3: false,
+            proxy_url: String::new(),
+            credential: isekai_p2p::Credential::auth0("AUTH0_AT", None, true),
+            protocol: "isekai-portal-v1".to_owned(),
+            device_name: None,
+            token_ttl: None,
+            key: isekai_p2p::agent::EndpointKey::generate(),
+            narrowing: Default::default(),
+        };
+        assert!(cfg.credential.registered_endpoint().is_none());
+        revoke_the_task_endpoint(&cfg)
+            .await
+            .expect("nothing to do, and no attempt to make");
     }
 
     #[test]

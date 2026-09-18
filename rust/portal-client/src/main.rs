@@ -277,7 +277,8 @@ struct Args {
     #[argh(option)]
     revoke_endpoint: Option<String>,
     /// why an Endpoint is being retired: `device_lost`, `endpoint_deleted`,
-    /// `admin_revoke` or `security_incident`. It lands in the audit log
+    /// `admin_revoke`, `security_incident` or `task_finished`. It lands in the
+    /// audit log
     #[argh(option)]
     reason: Option<String>,
     /// free text kept with the revocation, for whoever reads the audit log
@@ -344,7 +345,10 @@ async fn main() -> anyhow::Result<()> {
     // **Filled in by `run` once an Endpoint exists**, so that returning the
     // slot does not depend on which way `run` left.
     let mut enrolled: Option<P2pConfig> = None;
-    let code = match run(args, &mut enrolled).await {
+    // **Taken by `run` when it revokes**, which it does before folding the
+    // connection. What stays here is every way out that never got that far.
+    let mut task: Option<P2pConfig> = None;
+    let mut code = match run(args, &mut enrolled, &mut task).await {
         Ok(()) => 0,
         Err(e) => {
             // Printed here because `_exit` skips the reporting `main` would
@@ -361,10 +365,44 @@ async fn main() -> anyhow::Result<()> {
     if let Some(cfg) = enrolled {
         portal_core::ci::release_the_slot(&cfg).await;
     }
+    // The same reasoning for the task Endpoint, for the returns that happen
+    // before the ordinary revocation point.
+    if let Some(cfg) = task {
+        code = revoke_or_report(&cfg, code).await;
+    }
     portal_core::shutdown::leave(code).await
 }
 
-async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()> {
+/// Revoke the task's Endpoint, and let a failure reach the exit code.
+///
+/// **Unlike returning an enrolment slot, this is not best effort.** A slot
+/// comes back by itself at the next idle sweep; an Endpoint registered on the
+/// Auth0 route has no sweep behind it at all (plan §2.4), so a revocation that
+/// did not happen leaves it registered for good. The task's own result is kept
+/// when it failed — an exit code already saying "this went wrong" should not be
+/// overwritten by a second reason — but a task that succeeded and could not put
+/// its Endpoint away did not entirely succeed.
+async fn revoke_or_report(cfg: &P2pConfig, code: i32) -> i32 {
+    match portal_core::agent::revoke_the_task_endpoint(cfg).await {
+        Ok(()) => code,
+        Err(e) => {
+            eprintln!(
+                "Error: the task ran but its Endpoint could not be revoked: {e:#}\n\
+                 It stays registered -- nothing sweeps Endpoints registered this way -- \
+                 though its Grants lapse when the lease does. Revoke it by hand with \
+                 `portal-client --revoke-endpoint {} --reason task_finished`",
+                cfg.key.endpoint_id(),
+            );
+            if code == 0 { 1 } else { code }
+        }
+    }
+}
+
+async fn run(
+    args: Args,
+    enrolled: &mut Option<P2pConfig>,
+    task: &mut Option<P2pConfig>,
+) -> anyhow::Result<()> {
     // **First, because the rest of this function reads the key's path.** Agent
     // mode has none, and what the token store defaults to is the first thing
     // that would quietly paper over that.
@@ -488,18 +526,6 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
             task = args.task.as_deref().unwrap_or("-"),
             "made a key for this task; it is not written anywhere",
         );
-        // **Said every time, until P4 lands.** Revoking on the way out is what
-        // makes a task-scoped Endpoint disappear, and it is not written yet.
-        // Nor is there a sweep behind it: `endpoint_idle_ttl` belongs to
-        // Enrollment Keys, and this Endpoint has none — so it stays registered
-        // indefinitely. The Grants go within a lease TTL once this process
-        // stops renewing, so reachability does end; the registration does not.
-        tracing::warn!(
-            endpoint_id = %key.endpoint_id(),
-            "this Endpoint is not revoked when the task ends yet \
-             (docs/portal_agent_plan.md P4); its Grants lapse with the lease, \
-             but the registration stays",
-        );
         key
     } else {
         // **Said out loud, because a generated key looks exactly like a loaded
@@ -598,6 +624,12 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
     // From here on this Endpoint may exist, so every way out owes a slot back.
     if args.enroll {
         *enrolled = Some(cfg.clone());
+    }
+    // And every way out of an agent run owes a revocation. The clone shares the
+    // credential, so it sees the registration cell the first issue fills in —
+    // which is what says whether there is anything to revoke.
+    if args.agent {
+        *task = Some(cfg.clone());
     }
 
     if args.relays {
@@ -750,7 +782,21 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
         }
     }
     if interrupted {
+        // **Armed before the revocation, not after.** Nothing polls the signal
+        // handlers once the `select!` has returned, so a revocation placed
+        // ahead of this would make the process deaf for the whole of its
+        // window — a second Ctrl+C doing nothing, and a CI runner's SIGTERM
+        // grace period running out into a SIGKILL. A second press means "stop
+        // now", and that answer has to keep working.
         portal_core::shutdown::hard_exit_on_second_signal();
+        // **Before the close, and only here.** `connected.close()` reports the
+        // connection closed and can wait out its timeout, which is exactly
+        // what the hatch above exists to escape — so on a forced stop the
+        // revocation has to come first or it does not come at all (plan §2.6).
+        // The cost is that the close then reports under a revoked Endpoint and
+        // warns about the listener's leg, which the proxy expires on its own;
+        // an Endpoint nothing sweeps is the more expensive of the two.
+        revoke_if_pending(task).await;
     }
     // **Told to stop before it is dropped.** Dropping the keeper aborts it,
     // which can cut a redemption mid-request and leave msquic a handle the
@@ -758,7 +804,32 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
     // and return.
     shutdown.cancel();
     connected.close().await;
+    if !interrupted {
+        // **After the close on an ordinary ending**, because revoking first
+        // would make `report_state` fail on every successful run: it goes
+        // through the auth layer that just stopped honouring this Endpoint, so
+        // the close would wait out its timeout and warn that the listener's leg
+        // stays reserved -- every time, for nothing. Nothing is racing the
+        // wind-down here, so the ordering §2.6 asks for costs nothing to give
+        // up.
+        revoke_if_pending(task).await;
+    }
     Ok(())
+}
+
+/// Revoke the task's Endpoint if there is one, leaving it for the way out if
+/// that fails.
+///
+/// **Failing does not report here.** `main` tries once more — after the
+/// connection is closed, seconds later and past whatever was in the way — and
+/// says so then. Two bounded attempts are cheap against an Endpoint that stays
+/// registered for good.
+async fn revoke_if_pending(task: &mut Option<P2pConfig>) {
+    let Some(cfg) = task.take() else { return };
+    if let Err(e) = portal_core::agent::revoke_the_task_endpoint(&cfg).await {
+        tracing::debug!("revoking the task Endpoint failed, will try once more: {e:#}");
+        *task = Some(cfg);
+    }
 }
 
 /// `--relays` — measure this Endpoint's relay candidates and print them.
@@ -1420,8 +1491,9 @@ fn revoke_reason(args: &Args) -> anyhow::Result<isekai_p2p::agent::RevokeReason>
     use isekai_p2p::agent::RevokeReason;
     let Some(reason) = args.reason.as_deref() else {
         anyhow::bail!(
-            "--revoke-endpoint needs --reason: device_lost, endpoint_deleted, admin_revoke \
-             or security_incident. It goes in the audit log, so it is not guessed for you"
+            "--revoke-endpoint needs --reason: device_lost, endpoint_deleted, admin_revoke, \
+             security_incident or task_finished. It goes in the audit log, so it is not \
+             guessed for you"
         );
     };
     match reason {
@@ -1429,6 +1501,10 @@ fn revoke_reason(args: &Args) -> anyhow::Result<isekai_p2p::agent::RevokeReason>
         "endpoint_deleted" => Ok(RevokeReason::EndpointDeleted),
         "admin_revoke" => Ok(RevokeReason::AdminRevoke),
         "security_incident" => Ok(RevokeReason::SecurityIncident),
+        // **The one that is not an exception.** An agent run writes this for
+        // itself; by hand it is for finishing what a run could not
+        // (`revoke_or_report` prints this command when its own attempt failed).
+        "task_finished" => Ok(RevokeReason::TaskFinished),
         // Named rather than lumped in with a typo: somebody reaching for these
         // has read them in a listing, and the answer is that Identity writes
         // them and a request may not.
@@ -1437,8 +1513,8 @@ fn revoke_reason(args: &Args) -> anyhow::Result<isekai_p2p::agent::RevokeReason>
              returning its slot, a key being revoked. A request cannot claim one"
         ),
         other => anyhow::bail!(
-            "unknown --reason `{other}`: device_lost, endpoint_deleted, admin_revoke \
-             or security_incident"
+            "unknown --reason `{other}`: device_lost, endpoint_deleted, admin_revoke, \
+             security_incident or task_finished"
         ),
     }
 }
