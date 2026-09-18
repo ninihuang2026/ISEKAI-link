@@ -12,6 +12,7 @@ use std::time::Duration;
 use anyhow::Context as _;
 use isekai_p2p_core::endpoint::EndpointKey;
 use isekai_p2p_core::https::HttpsTransport;
+use isekai_p2p_core::identity::Narrowing;
 use isekai_p2p_core::identity::{EndpointToken, IdentityAuth, IdentityClient, RevokeAuth};
 use isekai_p2p_core::proxy::{ControlPlaneTransport, ProxyClient};
 use isekai_p2p_core::transport::MasqueH3Transport;
@@ -45,6 +46,16 @@ pub struct P2pConfig {
     pub token_ttl: Option<i64>,
     /// The Endpoint keypair, proven on every proxy request via PoP.
     pub key: EndpointKey,
+    /// What the Endpoint Token should be narrowed to, and which Gateways
+    /// should hear about this Endpoint.
+    ///
+    /// **The two halves travel differently.** A renewal cannot widen, so the
+    /// remembered axes — permissions and protocols — are asked for once, at
+    /// issue. The selector is not remembered and goes out again at every
+    /// renewal; see `IdentityClient::refresh_token`. Leaving this at its
+    /// default is what every caller before agent mode did, and gets the
+    /// ceiling.
+    pub narrowing: Narrowing,
 }
 
 impl P2pConfig {
@@ -241,13 +252,26 @@ async fn issue<T: ControlPlaneTransport>(
                     .context("could not obtain a current Auth0 token")?,
                 None => token.clone(),
             };
+            // **The narrowing goes to both arms.** It used to reach neither:
+            // `issue_token` was called with `None, None` and
+            // `register_and_issue` ended the same way, so a caller that had
+            // asked for one protocol got a token carrying every protocol its
+            // user is entitled to. An agent runtime registers a fresh key for
+            // every task, so it takes the `register` arm every time — the one
+            // where the narrowing was furthest from reaching the wire.
             let token = if *register {
                 client
-                    .register_and_issue(&auth0, &cfg.key, cfg.device_name.as_deref(), cfg.token_ttl)
+                    .register_and_issue(
+                        &auth0,
+                        &cfg.key,
+                        cfg.device_name.as_deref(),
+                        &cfg.narrowing,
+                        cfg.token_ttl,
+                    )
                     .await?
             } else {
                 client
-                    .issue_token(&auth0, &cfg.key, None, None, cfg.token_ttl)
+                    .issue_token(&auth0, &cfg.key, &cfg.narrowing, cfg.token_ttl)
                     .await?
             };
             Ok(token)
@@ -418,7 +442,18 @@ async fn refresh<T: ControlPlaneTransport>(
         .await
         .context("could not obtain a renewal challenge")?;
     client
-        .refresh_token(auth, &cfg.key, &challenge, cfg.token_ttl)
+        // **The selector is re-sent, unlike the other two axes.** The server
+        // remembers a narrowing of permissions and protocols and does not
+        // remember this one, so a renewal that stayed quiet about it would
+        // renew the lease at every Gateway offering the class — undoing at the
+        // first renewal what the issue had asked for.
+        .refresh_token(
+            auth,
+            &cfg.key,
+            &challenge,
+            cfg.narrowing.gateways.as_deref(),
+            cfg.token_ttl,
+        )
         .await
         .context("could not renew the endpoint token")
 }
