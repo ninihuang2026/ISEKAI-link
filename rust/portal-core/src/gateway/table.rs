@@ -55,6 +55,77 @@ pub struct Entry {
     pub grant_ttl: Option<u32>,
 }
 
+/// The shortest grant the proxy will make. Anything below is clamped up to it,
+/// which is why a lease shorter than [`MIN_LEASE_SECS`] cannot be served.
+pub const GRANT_TTL_FLOOR: u64 = 60;
+
+/// How much shorter than its lease a grant is made.
+///
+/// **The grant must expire before the policy row does**, so that the window
+/// where a grant is live and no policy describes it cannot open. Reconciliation
+/// closes it too, but only on its own schedule.
+pub const GRANT_TTL_MARGIN: i64 = 60;
+
+/// The shortest lease that can be served at all.
+///
+/// `GRANT_TTL_FLOOR + GRANT_TTL_MARGIN`: below this there is no grant TTL both
+/// shorter than the lease and above the proxy's floor.
+pub const MIN_LEASE_SECS: i64 = GRANT_TTL_FLOOR as i64 + GRANT_TTL_MARGIN;
+
+impl Entry {
+    /// How long a grant for this row should live.
+    ///
+    /// **Shorter than the lease, always.** Identity says the Gateway makes the
+    /// grant with a TTL below the policy's `ttl`; the centre's own
+    /// `constraints.grant_ttl` is an upper bound on top of that, not a licence
+    /// to exceed it.
+    ///
+    /// **Never `None`.** `create_grant` reads that as "until revoked", and a
+    /// policy-driven grant that outlives every trace of its policy is the one
+    /// thing this must not produce.
+    pub fn grant_ttl(&self, now: OffsetDateTime) -> Result<u64, Refusal> {
+        // **From the deadline, not from `ttl`.** `ttl` is what the lease had
+        // left *when the row was issued*, and a grant is re-created on every
+        // settle pass — which the proxy treats as an update, pushing the
+        // deadline out by that stale figure each time. A grant so refreshed
+        // walks past the lease it was derived from, which is the inversion this
+        // whole rule exists to prevent.
+        let lease = match self.remaining(now) {
+            Some(left) => left,
+            None => return Err(Refusal::NoDeadline),
+        };
+        if lease < MIN_LEASE_SECS {
+            return Err(Refusal::LeaseTooShort { ttl: lease });
+        }
+        let under_lease = (lease - GRANT_TTL_MARGIN).max(GRANT_TTL_FLOOR as i64) as u64;
+        let capped = match self.grant_ttl {
+            Some(asked) => under_lease.min(u64::from(asked)),
+            None => under_lease,
+        };
+        Ok(capped.max(GRANT_TTL_FLOOR))
+    }
+
+    /// Seconds of lease left at `now`, from the deadline the centre stated.
+    ///
+    /// `None` when there is no deadline to work from — `ttl` alone cannot say,
+    /// because it was measured at some earlier instant nobody recorded.
+    pub fn remaining(&self, now: OffsetDateTime) -> Option<i64> {
+        let text = self.expires_at.as_deref()?;
+        let at = OffsetDateTime::parse(text, &Rfc3339).ok()?;
+        Some((at - now).whole_seconds())
+    }
+
+    /// What a grant for this row is keyed by, at the proxy.
+    ///
+    /// **Not the lease.** The proxy keys a grant on
+    /// `(owner, allowed_endpoint, protocol)`, so two leases for the same pair
+    /// are one grant — which is why the ledger counts leases per pair rather
+    /// than assuming one each.
+    pub fn grant_key(&self) -> (&str, &str) {
+        (&self.allowed_endpoint, &self.protocol)
+    }
+}
+
 /// Why a row was not applied.
 ///
 /// **Refusals are values rather than logs**, because the count of them is the
@@ -73,6 +144,20 @@ pub enum Refusal {
     UnknownWindow { window: String },
     /// An attribute is missing, undeclared, or outside its range.
     Attribute(AttributeRefusal),
+    /// There is no deadline to bound a grant by.
+    ///
+    /// **Not "too short".** `ttl` alone was measured at an instant nobody
+    /// recorded, so it cannot say how long is left; saying "a lease of 0s"
+    /// would name an invented cause for a row that may carry a perfectly good
+    /// `expires_at` this could not read.
+    NoDeadline,
+    /// The lease is too short for a grant to be made that outlives it.
+    ///
+    /// The proxy clamps a grant's TTL to at least 60 seconds, so a lease
+    /// shorter than [`MIN_LEASE_SECS`] cannot be given a grant that expires
+    /// first — and a grant outliving the row that asked for it inverts the
+    /// direction the whole design leans.
+    LeaseTooShort { ttl: i64 },
     /// A `version` older than one already seen.
     ///
     /// Keyed on `access_lease_id`, because `version` is a per-lease sequence.
@@ -91,6 +176,16 @@ impl std::fmt::Display for Refusal {
                 write!(f, "window `{window}` is not one this gateway understands")
             }
             Self::Attribute(inner) => write!(f, "{inner}"),
+            Self::NoDeadline => write!(
+                f,
+                "no `expires_at` to bound a grant by; `ttl` alone cannot say how \
+                 much is left",
+            ),
+            Self::LeaseTooShort { ttl } => write!(
+                f,
+                "a lease of {ttl}s is too short: a grant cannot be clamped below \
+                 {GRANT_TTL_FLOOR}s, so it would outlive the policy",
+            ),
             Self::Stale { seen } => write!(f, "version is older than {seen}"),
         }
     }
@@ -304,16 +399,17 @@ impl Table {
     }
 }
 
+/// Fixtures shared with `grants`'s tests.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests_support {
     use super::*;
     use isekai_p2p::agent::PolicyConstraints;
 
-    fn policy() -> GatewayPolicy {
-        super::super::parse(super::super::EXAMPLE).expect("the example parses")
+    pub fn policy() -> GatewayPolicy {
+        crate::gateway::parse(crate::gateway::EXAMPLE).expect("the example parses")
     }
 
-    fn granted(lease: &str, version: i64) -> PolicyEvent {
+    pub fn granted(lease: &str, version: i64) -> PolicyEvent {
         PolicyEvent {
             kind: "policy.granted".into(),
             access_lease_id: lease.into(),
@@ -332,6 +428,37 @@ mod tests {
             reason: None,
         }
     }
+
+    /// A table holding one row per `(lease, endpoint, protocol, ttl)`.
+    pub fn table_with(rows: &[(&str, &str, &str, i64)]) -> Table {
+        let mut table = Table::new();
+        for (lease, endpoint, protocol, ttl) in rows {
+            let mut event = granted(lease, 1);
+            event.allowed_endpoint = (*endpoint).to_owned();
+            event.protocol = (*protocol).to_owned();
+            event.ttl = Some(*ttl);
+            // A deadline that matches the lease, since `grant_ttl` reads the
+            // deadline rather than the seconds-at-issue.
+            event.expires_at = Some(
+                (OffsetDateTime::now_utc() + time::Duration::seconds(*ttl))
+                    .format(&Rfc3339)
+                    .expect("formats"),
+            );
+            // The fixtures ask for a grant longer than the lease on purpose, so
+            // that the lease is what bounds it.
+            event.constraints.as_mut().unwrap().grant_ttl = Some(86_400);
+            // A short lease is refused by `grant_ttl`, not by `apply`, so it
+            // still belongs in the table.
+            let _ = table.apply(&event, &policy());
+        }
+        table
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tests_support::{granted, policy};
+    use super::*;
 
     fn snapshot(items: Vec<PolicyEvent>) -> PolicySnapshot {
         PolicySnapshot {
@@ -552,6 +679,110 @@ mod tests {
             table.apply(&granted("al_1", 4), &policy()),
             Err(Refusal::Stale { seen: 5 })
         ));
+    }
+
+    fn entry(ttl: Option<i64>, grant_ttl: Option<u32>) -> Entry {
+        let mut event = granted("al_1", 1);
+        event.ttl = ttl;
+        event.expires_at = ttl.map(|t| {
+            (OffsetDateTime::now_utc() + time::Duration::seconds(t))
+                .format(&Rfc3339)
+                .expect("formats")
+        });
+        event.constraints.as_mut().unwrap().grant_ttl = grant_ttl;
+        let mut table = Table::new();
+        table.apply(&event, &policy()).expect("inside the envelope");
+        let entry = table.entries().next().unwrap().clone();
+        entry
+    }
+
+    #[test]
+    fn a_grant_expires_before_the_policy_that_asked_for_it() {
+        // The direction the whole design leans: the grant goes first, so a
+        // window where it is live and no policy describes it cannot open.
+        let e = entry(Some(1800), None);
+        let ttl = e.grant_ttl(OffsetDateTime::now_utc()).unwrap();
+        // The property, not the arithmetic: the grant goes first, by at least
+        // the margin. An exact number would pin the second the test ran in.
+        assert!(ttl <= 1800 - GRANT_TTL_MARGIN as u64, "grant {ttl}s");
+        assert!(ttl > 1800 - 2 * GRANT_TTL_MARGIN as u64, "grant {ttl}s");
+    }
+
+    #[test]
+    fn the_centres_cap_is_an_upper_bound_and_not_a_licence() {
+        // A shorter `grant_ttl` is honoured...
+        assert_eq!(
+            entry(Some(1800), Some(300))
+                .grant_ttl(OffsetDateTime::now_utc())
+                .unwrap(),
+            300
+        );
+        // ...and a longer one does not let the grant outlive the lease.
+        let ttl = entry(Some(1800), Some(86_400))
+            .grant_ttl(OffsetDateTime::now_utc())
+            .unwrap();
+        assert!(
+            ttl < 1800,
+            "the centre talked the grant past its lease: {ttl}s"
+        );
+    }
+
+    #[test]
+    fn a_lease_too_short_to_serve_is_refused() {
+        // **The proxy clamps a grant up to 60s**, so below this there is no TTL
+        // both shorter than the lease and above that floor -- the grant would
+        // outlive the policy, which is the inversion this refuses rather than
+        // quietly accepts.
+        for lease in [1, 59, 60, MIN_LEASE_SECS - 1] {
+            assert!(
+                matches!(
+                    entry(Some(lease), None).grant_ttl(OffsetDateTime::now_utc()),
+                    Err(Refusal::LeaseTooShort { .. })
+                ),
+                "a {lease}s lease was served"
+            );
+        }
+        assert!(entry(Some(MIN_LEASE_SECS + 1), None)
+            .grant_ttl(OffsetDateTime::now_utc())
+            .is_ok());
+    }
+
+    #[test]
+    fn a_row_with_no_deadline_gets_no_grant() {
+        // `None` on `create_grant` means "until revoked". A policy-driven grant
+        // that outlives every trace of its policy is the one thing this must
+        // not make.
+        assert!(matches!(
+            entry(None, Some(3600)).grant_ttl(OffsetDateTime::now_utc()),
+            Err(Refusal::NoDeadline)
+        ));
+    }
+
+    #[test]
+    fn a_refreshed_grant_cannot_walk_past_its_lease() {
+        // **The regression.** A grant is re-created on every settle pass, which
+        // the proxy treats as an update -- so a TTL taken from `ttl`, the
+        // seconds left *when the row was issued*, pushed the deadline out again
+        // each time until the grant outlived the lease it came from.
+        let mut event = granted("al_1", 1);
+        event.ttl = Some(1800);
+        let deadline = OffsetDateTime::now_utc() + time::Duration::seconds(1800);
+        event.expires_at = Some(deadline.format(&Rfc3339).expect("formats"));
+        event.constraints.as_mut().unwrap().grant_ttl = None;
+
+        let mut table = Table::new();
+        table.apply(&event, &policy()).unwrap();
+        let e = table.entries().next().unwrap();
+
+        // Later in the lease, the same row asks for a proportionally shorter
+        // grant rather than the full span over again.
+        // 200s left: under the old rule this asked for 1740 all over again.
+        let late = deadline - time::Duration::seconds(200);
+        let ttl = e.grant_ttl(late).unwrap();
+        assert!(
+            ttl <= 200 - GRANT_TTL_MARGIN as u64,
+            "with 200s of lease left the grant asked for {ttl}s",
+        );
     }
 
     #[test]
