@@ -117,6 +117,47 @@ if the application has the organization prompt turned on.
 `ISEKAI_AUTH0_ORGANIZATION` does the same for the camera apps, which have no
 field to type it into.
 
+### Moving an Endpoint to an organization
+
+**A registration cannot follow a sign-in.** An Endpoint ID is derived from its
+keypair, and one key registers once — Identity refuses the same key in a second
+tenant. So a machine that was signed in personally and is now signed in to an
+organization keeps pointing at an Endpoint the new tenant does not contain, and
+every call fails with:
+
+```
+Error: Identity could not verify ep:… . It answers this both for a bad signature
+and for an Endpoint it does not find in the tenant the Auth0 token names, …
+: Identity API returned 401: {"type":".../problems/pop-signature-invalid", …}
+```
+
+which is Identity hiding the truth from a stranger and, incidentally, from its
+owner: it answers the same thing for a bad signature and for an Endpoint it
+cannot find. The signature was fine.
+
+Moving means a **new key, registered under the organization**:
+
+```sh
+portal-client --revoke-endpoint ep:… --reason endpoint_deleted   # while still personal
+portal-client --login --organization org_…
+mv portal-client.pem portal-client.pem.personal
+portal-client --register --map …
+```
+
+**Revoke before signing in to the organization**, because revoking resolves its
+tenant from the Auth0 token as well: once the sign-in names an organization, the
+old Endpoint answers `404` from that machine, for the same reason as above.
+
+Out of order is not a dead end — revoking is a Route A command and needs no key,
+so `--login` back to a personal session, revoke, and sign in to the organization
+again. But left alone the Endpoint stays registered: **nothing sweeps Endpoints
+on this route**, so "I will get to it" means "for good".
+
+Everything that named the old Endpoint has to be redone against the new one:
+pairing, capabilities, tickets, and the entitlements that decide its ceiling —
+those are keyed by tenant as well, so the ones written while personal do not
+apply to the organization.
+
 ### Signing in over SSH
 
 The redirect goes to `127.0.0.1` on the machine that is signing in, which a
