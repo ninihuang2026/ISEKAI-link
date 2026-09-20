@@ -109,13 +109,66 @@ portal-client --login --organization org_…
 
 **An Endpoint is filed under the organization its sign-in named.** Identity
 reads the `org_id` claim, and a token without one is filed personally — so a
-machine signed in without an organization registers into the individual tenant,
-and nothing later says so. Pass the `org_…` id (Auth0 shows it under
-Organizations; the *name* is refused). Leaving it out lets Universal Login ask,
-if the application has the organization prompt turned on.
+machine signed in without an organization registers into the individual tenant.
 
-`ISEKAI_AUTH0_ORGANIZATION` does the same for the camera apps, which have no
-field to type it into.
+**Better than typing the id: let Auth0 ask.** With *Display Organization
+Prompt* turned on for the application, omitting `--organization` makes Universal
+Login ask which organization to sign in to, **by name**, and the claim reaches
+the token just the same. `org_a1b2c3` is not something anyone can check by
+looking at it; a name in a browser is.
+
+Pass the id when the choice has to be made without a person — a script, an
+unattended machine, or a tenant with no prompt. Auth0 shows it under
+Organizations, and the *name* is not accepted in its place.
+
+`ISEKAI_AUTH0_ORGANIZATION` names one for the camera apps, which have no field
+to type it into. It is read wherever the flag would be, so the sign-in checks
+what arrived against it the same way.
+
+**The sign-in says which organization it landed in**, by name where the tenant
+sends one:
+
+```
+Signed in to seera-networks (org_a1b2c3).
+```
+
+and says so plainly when it landed in none. Asking for one and getting another —
+or none — is a warning, not a silence. Afterwards, `--whoami` answers the same
+question without signing in again:
+
+```
+$ portal-client --whoami
+ep:8c3f28d3…
+organization: seera-networks (org_a1b2c3)
+```
+
+The Endpoint ID is on stdout and the organization on stderr, so
+`EP=$(portal-client --whoami)` still yields the id and nothing else.
+
+**The id is read from the access token**, which is the same claim Identity reads
+to decide the tenant — so this answers for machines that signed in before any of
+this existed, with no second sign-in.
+
+**The name is harder, and may need one line in Auth0.** Auth0 puts `org_id` in
+the tokens; whether it puts `org_name` beside it depends on the tenant, and on
+this one it does not. Without a name there is only the id, which is the one
+thing nobody can check by looking at it. So an Action can supply it:
+
+```js
+// Auth0 → Actions → Login flow, beside whatever already sets tenant_roles
+exports.onExecutePostLogin = async (event, api) => {
+  if (event.organization) {
+    api.accessToken.setCustomClaim(
+      "https://identity.isekai.tools/org_name",
+      event.organization.name,
+    );
+  }
+};
+```
+
+Read from the access token it needs no recording and no second sign-in: the next
+token refresh carries it, and `--whoami` starts printing the name. `org_name`,
+where a tenant does send it, is used the same way.
 
 ### Moving an Endpoint to an organization
 

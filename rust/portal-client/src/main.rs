@@ -561,6 +561,18 @@ async fn run(
         // Before any network call: this is what the operator needs in order to
         // ask the other side for a capability, and it costs nothing to answer.
         println!("{}", key.endpoint_id());
+        // **And which organization this run belongs to**, which is the other
+        // half of "who am I here": it decides the tenant an Endpoint registers
+        // into, and it was previously knowable only by decoding a token by
+        // hand.
+        //
+        // **On stderr, because stdout is the answer.** `EP=$(portal-client
+        // --whoami)` is how the guide tells people to use this, and a second
+        // line on stdout would put a sentence inside their Endpoint ID.
+        eprintln!(
+            "organization: {}",
+            portal_core::login::signed_in_organization(&tokens, args.auth0_token.as_deref()),
+        );
         return Ok(());
     }
 
