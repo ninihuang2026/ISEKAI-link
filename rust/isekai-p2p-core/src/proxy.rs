@@ -323,7 +323,12 @@ pub struct RelayTicket {
 }
 
 /// Where a Public UDP Listener is reachable from the outside (spec §7.7.1).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// **Comparable, because the comparison is the only alarm there is.** What was
+/// published last time against what a fresh ticket names is how a client learns
+/// its data plane retired and its address moved (plan §3.3); nothing else
+/// reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PublicAddress {
     /// The name the proxy advertises, when it has one to advertise.
     ///
@@ -334,6 +339,51 @@ pub struct PublicAddress {
     pub hostname: Option<String>,
     pub ip: String,
     pub port: u16,
+}
+
+impl std::fmt::Display for PublicAddress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // **Bracketed when it has to be.** An IPv6 address written bare beside
+        // a port — `2001:db8::1:10042` — is ambiguous about where the address
+        // ends, and cannot be pasted anywhere that takes a `SocketAddr`. This
+        // string is what the warnings about a moved address print, and those
+        // are the only alarm this route has; one nobody can copy is half an
+        // alarm.
+        let host = if self.ip.contains(':') {
+            format!("[{}]", self.ip)
+        } else {
+            self.ip.clone()
+        };
+        // **The name as well as the pair**, because what somebody handed out
+        // may have been either, and a message about an address that changed has
+        // to be recognisable as the one they gave.
+        match &self.hostname {
+            Some(hostname) => write!(f, "{hostname} ({host}:{})", self.port),
+            None => write!(f, "{host}:{}", self.port),
+        }
+    }
+}
+
+#[cfg(test)]
+mod public_address_tests {
+    use super::*;
+
+    #[test]
+    fn an_ipv6_address_is_printed_so_it_can_be_pasted() {
+        let v6 = PublicAddress {
+            hostname: None,
+            ip: "2001:db8::1".to_owned(),
+            port: 10042,
+        };
+        assert_eq!(v6.to_string(), "[2001:db8::1]:10042");
+        assert!(v6.to_string().parse::<std::net::SocketAddr>().is_ok());
+        let v4 = PublicAddress {
+            hostname: Some("udp-ap1.isekai.tools".to_owned()),
+            ip: "203.0.113.9".to_owned(),
+            port: 10042,
+        };
+        assert_eq!(v4.to_string(), "udp-ap1.isekai.tools (203.0.113.9:10042)");
+    }
 }
 
 /// The UDP service this Endpoint is declaring, inside itself.
