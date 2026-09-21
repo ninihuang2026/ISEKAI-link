@@ -35,6 +35,12 @@ pub enum Message {
     ),
     RegisterContextId(u64, Option<SocketAddr>, oneshot::Sender<anyhow::Result<()>>),
     UnregisterContextId(u64, oneshot::Sender<anyhow::Result<()>>),
+    /// Drop a source's socket because it was evicted, not because it died.
+    ///
+    /// **The same teardown the read error takes.** Both end with the socket
+    /// out of the receive group and a `SocketDisconnected` on its way back, so
+    /// there is one way for a socket to stop existing rather than two.
+    RetireSocket(SocketAddr, oneshot::Sender<anyhow::Result<()>>),
     Finish(oneshot::Sender<anyhow::Result<()>>),
 }
 
@@ -112,6 +118,18 @@ impl Controller {
         resp_rx
             .await
             .map_err(|_| anyhow::anyhow!("Failed to receive UnregisterContextId response"))?
+    }
+
+    /// Retire a source's socket: stop reading it and tell the other side.
+    pub async fn retire_socket(&self, addr: SocketAddr) -> anyhow::Result<()> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(Message::RetireSocket(addr, resp_tx))
+            .await
+            .map_err(|_| anyhow::anyhow!("Failed to send RetireSocket Message"))?;
+        resp_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("Failed to receive RetireSocket response"))?
     }
 
     pub async fn finish(&self) -> anyhow::Result<()> {
@@ -254,6 +272,28 @@ pub async fn thread(
                         }
                         if resp_tx.send(anyhow::Ok(())).is_err() {
                             tracing::debug!("UnregisterContextId response receiver dropped");
+                        }
+                    }
+                    Some(Message::RetireSocket(addr, resp_tx)) => {
+                        // **Drop it, and say nothing back.**
+                        //
+                        // A socket that *died* is news: the side that forwards
+                        // has to hear so it can stop and blackhole. An eviction
+                        // is not news to anybody — it was that side's decision,
+                        // and it has already forgotten the socket. Answering it
+                        // with a notification closed a cycle: this task would
+                        // push `SocketDisconnected` into a channel that only
+                        // the event loop drains, while that loop was waiting on
+                        // the reply to this very message. One sweep of a
+                        // thousand idle sources was enough to reach it, and
+                        // both tasks would have waited forever.
+                        if let Some(key) = udp_recv_keys.remove(&addr) {
+                            udp_recv_group.remove(key);
+                        }
+                        compression_info.remove(&addr);
+                        tracing::info!("retired the UDP socket for {}", addr);
+                        if resp_tx.send(anyhow::Ok(())).is_err() {
+                            tracing::debug!("RetireSocket response receiver dropped");
                         }
                     }
                     Some(Message::Finish(resp_tx)) => {
