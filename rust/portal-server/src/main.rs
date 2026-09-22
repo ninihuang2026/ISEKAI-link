@@ -356,10 +356,11 @@ async fn administer_grants(args: &Args, tokens: &std::path::Path) -> anyhow::Res
 /// installation is.
 /// Read what the control plane says is in force, and build the table from it.
 ///
-/// **P1 of `docs/portal_gateway_plan.md`: this makes no grant.** It reads,
-/// checks every row against the operator's envelope, and says what it found —
-/// so that a deployment can see what is being handed out before anything acts
-/// on it. Holding the table without enforcing it is the point of the phase.
+/// **This one makes no grant.** It reads, checks every row against the
+/// operator's envelope, and says what it found; `settle_grants` is what acts on
+/// the table afterwards. Keeping the two apart is what lets the read be the
+/// correctness guarantee — a pass that granted as it went could not tell a row
+/// it had just learnt from one it had held all along.
 ///
 /// Reconciling is also the correctness guarantee rather than the stream, which
 /// is why this runs at startup and (in a later phase) once per token lifetime.
@@ -426,9 +427,11 @@ async fn reconcile_policies(
 /// and replays nothing, so a dropped line is repaired by the next read rather
 /// than by anything in here.
 ///
-/// **Nothing consults the table yet.** Grants are P3 and enforcement is later
-/// still; what this phase buys is that a deployment can watch what the control
-/// plane is handing out, and what this Gateway refuses, before either acts.
+/// **The table is what the grants are settled against**, on every pass and
+/// every event, and what the connection side is matched against. Enforcement of
+/// the policy's own limits is not in yet: a connection over `max_concurrent` is
+/// counted and logged rather than refused, so that a deployment can see how
+/// many would be turned away before that is switched on.
 async fn follow_policies(
     cfg: P2pConfig,
     policy: portal_core::gateway::GatewayPolicy,
@@ -695,6 +698,55 @@ fn forget_connection(live: &mut BTreeMap<String, BTreeSet<String>>, connection_i
         held.remove(connection_id);
         !held.is_empty()
     });
+}
+
+/// Refuse a policy whose classes this server does not serve.
+///
+/// **A grant names a protocol, and so does a Peer Listener.** The Gateway's
+/// grants are for its own Endpoint, so the agent that holds one looks for a
+/// listener of this server under that same string — and this process opens
+/// exactly one, under `--protocol`. Name a class here that `--protocol` does
+/// not, and every grant it produces is for something nobody is listening on.
+///
+/// **It fails silently and expensively.** The Gateway logs `policy: granted`,
+/// the agent logs `no Grant yet`, and thirty seconds later the agent reports
+/// that nothing is reachable — which is also what a server that is not running
+/// looks like. The two logs agree that everything worked and the connection
+/// does not happen.
+///
+/// A file may declare several classes and this serves one of them; the rest are
+/// named as unreachable rather than refused, because a deployment that runs one
+/// process per class has one file and a different `--protocol` each time.
+fn check_serves_its_own_classes(
+    policy: &portal_core::gateway::GatewayPolicy,
+    protocol: &str,
+) -> anyhow::Result<()> {
+    let mut served = false;
+    for class in policy.protocols() {
+        if class == protocol {
+            served = true;
+        } else {
+            tracing::warn!(
+                protocol = class,
+                serving = protocol,
+                "gateway policy: no listener for this class here; its grants reach nothing \
+                 from this process",
+            );
+        }
+    }
+    anyhow::ensure!(
+        served,
+        "this server listens on `{protocol}` and the gateway policy declares {}. A grant \
+         this Gateway makes is for its own Endpoint under the policy's protocol, and an \
+         agent holding one looks for a listener of exactly that -- so none of these grants \
+         would reach anything. Pass --protocol with the class you mean",
+        policy
+            .protocols()
+            .map(|p| format!("`{p}`"))
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    Ok(())
 }
 
 /// Publish what the table now allows, for the signaling loop to match against.
@@ -1414,12 +1466,12 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
     // other places for exactly that reason; the sixth recurrence of that shape
     // in this work is not the one to leave.
     //
-    // Nothing consults the policy yet -- the policy source and the PEP are
-    // later phases (`docs/portal_gateway_plan.md`). What reading it buys today
-    // is that a statement with three placeholders and two bindings, or a
-    // pattern that does not compile, is refused *here* rather than the first
-    // time an operation runs, which with the PEP deferred is not in this
-    // release at all.
+    // Reading it here rather than where it is used buys the other half: a
+    // statement with three placeholders and two bindings, or a pattern that
+    // does not compile, is refused *here* rather than the first time an
+    // operation runs -- which, with the PEP deferred, is not in this release at
+    // all. What the policy *is* consulted for from the moment it loads is
+    // whether each row the control plane sends may be applied.
     let gateway_policy = match &args.gateway_config {
         Some(path) => {
             let policy = portal_core::gateway::load(path)?;
@@ -1432,6 +1484,7 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
                     "gateway policy: serving a protocol class"
                 );
             }
+            check_serves_its_own_classes(&policy, &args.protocol)?;
             Some(policy)
         }
         None => None,
@@ -1693,6 +1746,29 @@ mod tests {
             assert!(d >= POLICY_RETRY_MIN, "backed off to {d:?}");
             assert!(d <= POLICY_RETRY_MAX, "backed off to {d:?}");
         }
+    }
+
+    /// **A grant names a protocol and so does a listener**, and this process
+    /// opens exactly one. A policy class that `--protocol` does not name
+    /// produces grants for something nobody is listening on — and the failure
+    /// is silent on both sides: `policy: granted` here, "nothing reachable
+    /// after 30s" there, thirty seconds apart and neither saying why.
+    #[test]
+    fn a_policy_this_server_cannot_serve_is_refused() {
+        let policy = portal_core::gateway::parse(portal_core::gateway::EXAMPLE).expect("example");
+        // The class the example declares. Serving it is the whole point.
+        check_serves_its_own_classes(&policy, "pg-sales-ro-v1").expect("the class it declares");
+
+        // The default, and what an operator who read only `--gateway-config`
+        // would still be running under.
+        let refused = check_serves_its_own_classes(&policy, "isekai-portal-v1")
+            .expect_err("no listener would answer these grants");
+        let text = format!("{refused:#}");
+        // Both strings, because the mistake is that they differ and naming one
+        // leaves the reader to guess which end to change.
+        assert!(text.contains("isekai-portal-v1"), "{text}");
+        assert!(text.contains("pg-sales-ro-v1"), "{text}");
+        assert!(text.contains("--protocol"), "{text}");
     }
 
     fn args_with(oidc: Option<&str>, subject: Option<&str>) -> Args {
