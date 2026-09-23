@@ -93,6 +93,7 @@ fn build_p2p_config(
         device_name: Some("portal-client-android".to_owned()),
         token_ttl: None,
         key,
+        narrowing: Default::default(),
     }
 }
 
@@ -380,6 +381,7 @@ pub fn connect(
     let auth0: Option<Arc<dyn Auth0TokenSource>> = refresh_token.map(|refresh_token| {
         let tokens = Auth0Tokens {
             access_token: config.auth0_token.clone(),
+            recorded_organization: None,
             refresh_token: Some(refresh_token),
             expires_at_unix: access_token_expires_at_unix,
         };
@@ -406,7 +408,7 @@ pub fn connect(
         async move {
             let connected = tokio::time::timeout(
                 APP_CONNECT_DEADLINE,
-                session_connect(&cfg, Reach::Grant { peer: peer.as_deref() }, &shutdown),
+                session_connect(&cfg, Reach::Grant { peer: peer.as_deref(), wait: None }, &shutdown),
             )
             .await
             .map_err(|_| {
