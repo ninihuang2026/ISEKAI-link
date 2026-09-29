@@ -770,13 +770,30 @@ where
     /// wildcard bind path — and needs no `proxy-public-address` header or
     /// COMPRESSION_ASSIGN capsules. `headers` carries the data-path
     /// `Authorization` (Auth0) and `seera-signaling-session-id`.
+    /// Returns a token cancelled when the bridge stops, whatever stopped it —
+    /// `shutdown_token` on the way out, or the tunnel ending underneath it.
+    ///
+    /// **The second is the one worth having.** A leg that stops forwarding
+    /// takes the relay with it, and nothing above could tell: the connection
+    /// riding it simply goes quiet. Knowing *that* it has gone is what lets the
+    /// holder say so, and it is not observable any other way — the bridge runs
+    /// on the executor and is not handed back.
+    ///
+    /// **What "the tunnel ending" reaches is the whole connection, not one
+    /// stream.** The bridge learns of it through its inbound channel closing,
+    /// and that sender is dropped when `from_quic_to_udp`'s task exits — which
+    /// happens when the QUIC connection is lost, since nothing removes a
+    /// stream's entry on its own. A relay restarting is the connection going,
+    /// so it is reported; a relay that ends *just this CONNECT-UDP stream* and
+    /// keeps the H3 connection up is not, and the bridge waits for datagrams
+    /// that will not come.
     pub async fn start_connect_udp(
         &mut self,
         target_path: &str,
         headers: Vec<(String, String)>,
         socket: std::sync::Arc<tokio::net::UdpSocket>,
         shutdown_token: CancellationToken,
-    ) -> Result<(), h3_util::Error> {
+    ) -> Result<CancellationToken, h3_util::Error> {
         let (req_body_tx, req_body_rx) =
             tokio::sync::mpsc::channel::<Result<Frame<Bytes>, ReqBodyErr>>(1);
         let mut req_build = Request::builder()
@@ -827,6 +844,8 @@ where
             .map_err(|e| anyhow::anyhow!("failed to register connect-udp stream: {e}"))?;
 
         let tx = crate::masque::connect_udp::QuicDatagramTx(datagram_sender);
+        let ended = CancellationToken::new();
+        let ending = ended.clone();
         self.executor.execute(async move {
             // Keep the request-body sender and response alive so the H3 request
             // stream — and the datagram flow — stays open for the session.
@@ -837,8 +856,13 @@ where
             {
                 tracing::error!("connect-udp bridge exited with error: {e}");
             }
+            // **Cancelled however it ended**, including the error above: from
+            // out here the leg has stopped carrying traffic either way, and a
+            // signal that fired only on the tidy path would be silent in
+            // exactly the case worth reporting.
+            ending.cancel();
         });
-        Ok(())
+        Ok(ended)
     }
 
     pub async fn start(
