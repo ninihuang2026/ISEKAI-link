@@ -408,7 +408,12 @@ pub fn connect(
         async move {
             let connected = tokio::time::timeout(
                 APP_CONNECT_DEADLINE,
-                session_connect(&cfg, Reach::Grant { peer: peer.as_deref(), wait: None }, &shutdown),
+                session_connect(
+                    &cfg,
+                    Reach::Grant { peer: peer.as_deref(), wait: None },
+                    portal_core::session::Routing::PreferDirect,
+                    &shutdown,
+                ),
             )
             .await
             .map_err(|_| {
@@ -432,6 +437,9 @@ pub fn connect(
             // direct path once one validates; it returns when the connection
             // is no longer usable, which doubles as the "peer gone" signal.
             let ended = connected.session.ended();
+            // Where the relay leg is as it moves, so the path watcher neither
+            // falls back to a relay that has gone nor misses its replacement.
+            let relay_leg = connected.session.relay_leg();
             let peer_conn = connected.peer.connection().clone();
             let watch_shutdown = shutdown.clone();
             tokio::spawn(async move {
@@ -440,7 +448,7 @@ pub fn connect(
                     _ = ended.cancelled() => {
                         tracing::warn!("the session ended; the forward is going with it");
                     }
-                    _ = portal_core::path::keep_on_the_best_path(peer_conn, watch_shutdown.clone()) => {
+                    _ = portal_core::path::keep_on_the_best_path(peer_conn, watch_shutdown.clone(), relay_leg) => {
                         tracing::warn!("the peer connection closed; the forward is going with it");
                     }
                 }
