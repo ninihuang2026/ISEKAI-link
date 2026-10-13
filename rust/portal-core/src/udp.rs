@@ -59,7 +59,9 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::UdpSocket;
 use tokio_util::sync::CancellationToken;
 
-use crate::datagram::{decode, encode, Drops, Push, Queue, MAX_PAYLOAD};
+use crate::datagram::{
+    decode, encode, Drops, Push, Queue, MAX_PAYLOAD, MAX_STREAM_PAYLOAD, SENDABLE_PAYLOAD,
+};
 use crate::frame::{read_status, write_open, write_status, Open, Status};
 
 /// How long a session may go without traffic in either direction before it is
@@ -175,7 +177,7 @@ impl PeerOversize {
 /// truncates to the buffer and says nothing about it, so a buffer sized to what
 /// can be forwarded would turn "too large, dropped and counted" into "silently
 /// cut short" — the exact failure [`crate::datagram`] exists to prevent.
-const RECV_BUFFER: usize = 65_536;
+pub(crate) const RECV_BUFFER: usize = 65_536;
 
 /// Every UDP session on one peer connection, and the pump that feeds them.
 ///
@@ -261,6 +263,11 @@ impl Sessions {
         });
         tokio::spawn({
             let sessions = Arc::clone(&sessions);
+            let shutdown = shutdown.clone();
+            async move { sessions.pump_streams(shutdown).await }
+        });
+        tokio::spawn({
+            let sessions = Arc::clone(&sessions);
             async move { sessions.pump(shutdown).await }
         });
         sessions
@@ -316,6 +323,9 @@ impl Sessions {
                 malformed = self.drops.malformed.load(Ordering::Relaxed),
                 unsent = self.drops.unsent.load(Ordering::Relaxed),
                 sessions_full = self.drops.sessions_full.load(Ordering::Relaxed),
+                stream_malformed = self.drops.stream_malformed.load(Ordering::Relaxed),
+                stream_too_big = self.drops.stream_too_big.load(Ordering::Relaxed),
+                stream_lost = self.drops.stream_lost.load(Ordering::Relaxed),
                 failed_opens,
                 "UDP forwarding lost traffic on this connection",
             );
@@ -327,11 +337,164 @@ impl Sessions {
         }
     }
 
+    /// Accept unidirectional streams and read one oversize datagram from each.
+    ///
+    /// **A second loop rather than an arm of [`pump`](Self::pump)**: reading a
+    /// stream takes many polls and a whole datagram has to be assembled before
+    /// any of it can be delivered, so doing it inline would let one 64 KB
+    /// arrival hold up every datagram on the connection — which is the
+    /// head-of-line objection `crate::datagram`'s header raises against
+    /// streams, reintroduced in the one place it would really bite.
+    ///
+    /// **Everything accepted is read.** Declining to accept does not save
+    /// memory: MsQuic has already created the stream and granted its receive
+    /// window, and an unaccepted one sits in an unbounded queue inside
+    /// `msquic-async`. So the bound is the transport's `PeerUnidiStreamCount`
+    /// (100, `isekai-p2p::peer`), which with [`MAX_STREAM_PAYLOAD`] is 6.4 MB
+    /// in flight for one connection. Lowering that is a transport setting, not
+    /// something this loop can do.
+    async fn pump_streams(self: Arc<Self>, shutdown: CancellationToken) {
+        loop {
+            let accepted = tokio::select! {
+                _ = shutdown.cancelled() => break,
+                accepted = std::future::poll_fn(|cx| {
+                    self.conn.poll_accept_inbound_uni_stream(cx)
+                }) => accepted,
+            };
+            match accepted {
+                Ok(stream) => {
+                    let sessions = Arc::clone(&self);
+                    let shutdown = shutdown.clone();
+                    tokio::spawn(async move {
+                        sessions.read_big_datagram(stream, shutdown).await;
+                    });
+                }
+                // The connection ending is how this is meant to finish.
+                Err(e) => {
+                    tracing::debug!("no longer accepting portal streams: {e}");
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Read one oversize datagram from `stream` and hand it to its session.
+    ///
+    /// Assembled whole before it is delivered, because a datagram is
+    /// indivisible — there is nothing partial to pass on.
+    ///
+    /// **Both bounds are load-bearing, and neither was here at first.** A read
+    /// parks until the peer finishes, resets, or the connection dies, and none
+    /// of those is `shutdown`:
+    ///
+    /// - **`shutdown`**, because this task holds an `Arc<Sessions>` and so a
+    ///   `Connection` clone, which is a handle `RegistrationClose` blocks on —
+    ///   the hazard `start_with_idle` and `session::Connected::close` both
+    ///   describe. A peer that writes the head and then stops left `close`
+    ///   cancelling, dropping its handles, and timing out its five-second
+    ///   drain.
+    /// - **A deadline**, because a peer can hold a stream without the
+    ///   connection being in any trouble, and the transport allows a hundred of
+    ///   them: without one, a peer that stalls them all stops every oversize
+    ///   datagram on the connection and nothing ever says why. [`Sessions`]'s
+    ///   own `idle` is the bound used, which is generous for any real link
+    ///   (65507 bytes needs under a second on anything that is working) and is
+    ///   already a parameter so a test need not wait a minute for it.
+    async fn read_big_datagram(
+        &self,
+        mut stream: msquic_async::ReadStream,
+        shutdown: CancellationToken,
+    ) {
+        let read = tokio::select! {
+            _ = shutdown.cancelled() => return,
+            _ = tokio::time::sleep(self.idle) => {
+                self.drops.stream_lost.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(
+                    after = ?self.idle,
+                    "an oversize datagram's stream did not finish in time; dropped",
+                );
+                return;
+            }
+            read = self.assemble_big_datagram(&mut stream) => read,
+        };
+        let Some((session, payload)) = read else {
+            return;
+        };
+        self.deliver_payload(session, payload);
+    }
+
+    /// The read itself, so [`read_big_datagram`](Self::read_big_datagram) can
+    /// wrap it in a `select!` and keep the bounds in one place.
+    ///
+    /// `None` when nothing is deliverable; by then it has been counted.
+    async fn assemble_big_datagram(
+        &self,
+        stream: &mut msquic_async::ReadStream,
+    ) -> Option<(u32, Bytes)> {
+        let session = match crate::frame::read_big_datagram_head(stream).await {
+            Ok(session) => session,
+            Err(e) => {
+                if self.drops.stream_malformed.fetch_add(1, Ordering::Relaxed) == 0 {
+                    tracing::warn!(
+                        "a stream did not carry an oversize datagram: {e:#}; \
+                         further ones on this connection are counted, not logged",
+                    );
+                } else {
+                    tracing::debug!("another stream did not carry one: {e:#}");
+                }
+                return None;
+            }
+        };
+        // **One byte past the cap, deliberately.** Reading exactly the cap
+        // cannot tell a payload at the limit from one over it, and the
+        // difference decides whether this is delivered or counted.
+        let mut payload = Vec::new();
+        let read = tokio::io::AsyncReadExt::read_to_end(
+            &mut tokio::io::AsyncReadExt::take(stream, MAX_STREAM_PAYLOAD as u64 + 1),
+            &mut payload,
+        )
+        .await;
+        match read {
+            Ok(_) if payload.len() > MAX_STREAM_PAYLOAD => {
+                self.drops.stream_too_big.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(
+                    session,
+                    limit = MAX_STREAM_PAYLOAD,
+                    "an oversize datagram was larger than UDP allows; dropped",
+                );
+                None
+            }
+            Ok(_) => Some((session, Bytes::from(payload))),
+            // **Ordinary as well as a fault.** A sender that asked not to have
+            // its data retransmitted has its stream aborted on the first
+            // detected loss, and this is what that looks like from here.
+            Err(e) => {
+                self.drops.stream_lost.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(
+                    session,
+                    "an oversize datagram's stream ended before its end: {e}",
+                );
+                None
+            }
+        }
+    }
+
     fn deliver(&self, datagram: Bytes) {
         let Some((id, payload)) = decode(&datagram) else {
             self.drops.malformed.fetch_add(1, Ordering::Relaxed);
             return;
         };
+        self.deliver_payload(id, payload);
+    }
+
+    /// Hand one assembled payload to its session.
+    ///
+    /// **The two carriers meet here and nowhere else.** A datagram arrives with
+    /// its session id in a four-byte header and a stream arrives with the same
+    /// id in a six-byte one; past this point there is one queue, one bound and
+    /// one set of counters, which is what keeps the second carrier from being a
+    /// second pipeline.
+    fn deliver_payload(&self, id: u32, payload: Bytes) {
         let queue = self
             .table
             .lock()
@@ -340,8 +503,13 @@ impl Sessions {
             .cloned();
         match queue.map(|queue| queue.push(payload)) {
             Some(Push::Queued) => {}
-            Some(Push::Evicted) => {
-                self.drops.overflow.fetch_add(1, Ordering::Relaxed);
+            // **Counted by how many, not by how often.** One oversize arrival
+            // can displace several small ones, and `overflow` is meant to say
+            // how much was lost.
+            Some(Push::Evicted(dropped)) => {
+                self.drops
+                    .overflow
+                    .fetch_add(dropped as u64, Ordering::Relaxed);
             }
             // Ordinary when a session is swept while the peer is still sending,
             // which is why neither of these is louder than a counter.
@@ -358,7 +526,7 @@ impl Sessions {
     /// nothing for a datagram to wait for.
     fn send(&self, session: u32, payload: &[u8]) -> bool {
         let Some(framed) = encode(session, payload) else {
-            self.oversize(session, payload.len());
+            self.oversize(Some(session), payload.len());
             return false;
         };
         match self.conn.send_datagram(&framed) {
@@ -399,7 +567,11 @@ impl Sessions {
     /// would bury everything else the forward has to say — but an operator who
     /// never sees the first one has no way to know why a service that "works"
     /// loses exactly its large messages.
-    fn oversize(&self, session: u32, len: usize) {
+    /// `session` is `None` when the payload was refused before a session
+    /// existed — at the local read, where the size is already known.
+    /// **Not zero standing in for it**: a session id of zero in a log is meant
+    /// to be a bug, which is what `next` starting at 1 is for.
+    fn oversize(&self, session: Option<u32>, len: usize) {
         if self.drops.oversize.fetch_add(1, Ordering::Relaxed) == 0 {
             // **Says whose limit it is, and this end's comes first.** Once
             // oversize payloads can travel on streams, "too large to forward"
@@ -417,14 +589,14 @@ impl Sessions {
                 }
             };
             tracing::warn!(
-                session,
+                ?session,
                 len,
                 limit = MAX_PAYLOAD,
                 "a UDP payload is too large to forward and was dropped: {why}; \
                  further ones on this connection are counted, not logged",
             );
         } else {
-            tracing::debug!(session, len, "another oversize UDP payload dropped");
+            tracing::debug!(?session, len, "another oversize UDP payload dropped");
         }
     }
 
@@ -696,6 +868,17 @@ pub async fn forward(
                     break;
                 }
             };
+            // **Refused here rather than at the send.** A payload over
+            // `SENDABLE_PAYLOAD` is dropped whatever happens, and queueing one
+            // first used to cost a 64th of the depth -- under `QUEUE_BYTES` a
+            // 64 KB payload that can never leave takes half the session's
+            // budget and evicts the small datagrams waiting behind it. The
+            // counter is the same one `Sessions::send` would have reached;
+            // what changes is that the budget stays for traffic that can go.
+            if n > SENDABLE_PAYLOAD {
+                sessions.oversize(None, n);
+                continue;
+            }
             let payload = Bytes::copy_from_slice(&buf[..n]);
 
             // An established session takes it without this loop awaiting
@@ -710,8 +893,11 @@ pub async fn forward(
             if let Some(outbound) = established {
                 match outbound.push(payload.clone()) {
                     Push::Queued => continue,
-                    Push::Evicted => {
-                        sessions.drops.overflow.fetch_add(1, Ordering::Relaxed);
+                    Push::Evicted(dropped) => {
+                        sessions
+                            .drops
+                            .overflow
+                            .fetch_add(dropped as u64, Ordering::Relaxed);
                         continue;
                     }
                     // Swept between the lookup and the push. Falls through and
