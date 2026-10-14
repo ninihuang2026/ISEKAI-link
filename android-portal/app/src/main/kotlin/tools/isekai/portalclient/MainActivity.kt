@@ -19,14 +19,18 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
 import uniffi.portal_client_ffi.PortalConfig
@@ -66,6 +70,31 @@ private const val MODEL = "qwen3.5:4b"
 // a dead session is noticed well inside a person's next "why isn't this
 // answering" moment, long enough not to matter next to an FFI call this cheap.
 private const val SESSION_HEALTH_POLL_MS = 4_000L
+
+/**
+ * How long to wait before trying to reconnect again, by attempt.
+ *
+ * Capped rather than unbounded: the thing being waited for is usually a
+ * network that is already back, and a wait that grows past a few seconds
+ * starts to read as "broken" to whoever is holding the phone. The last entry
+ * repeats for every attempt after it.
+ */
+private val RECONNECT_BACKOFF_MS = listOf(1_000L, 2_000L, 4_000L, 8_000L, 15_000L)
+
+/** What one connect attempt leaves behind, for the retry loop to read. */
+private enum class Attempt {
+    Connected,
+
+    /** Worth another go: a network that was not there, a relay that was busy. */
+    Failed,
+
+    /**
+     * Not worth another go until a person does something. Only `AuthError`:
+     * no token, or one that expired. Retrying that every few seconds would
+     * spin forever and bury the one message that says what to do.
+     */
+    GiveUp,
+}
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -170,6 +199,32 @@ fun PortalScreen(keyFile: File) {
     var statusIsError by remember { mutableStateOf(false) }
     var busy by remember { mutableStateOf(false) }
 
+    /**
+     * Whether a session is wanted — true from Connect until Disconnect.
+     *
+     * **This is the intent `session == null` used to stand in for**, and the
+     * substitution is the bug: a reconnect that has just failed leaves
+     * `session` null too, so the one event that could have retried declined to.
+     */
+    var wanted by remember { mutableStateOf(false) }
+
+    /**
+     * Bumped whenever something happens that makes retrying worth doing now —
+     * a network arriving, or Connect being tapped while a retry is waiting.
+     * A retry sitting in its backoff watches this and stops waiting.
+     */
+    var wakeRetry by remember { mutableStateOf(0) }
+
+    /**
+     * Whether a connect attempt is in flight.
+     *
+     * Separate from `busy`, which Pair and Send also use: see
+     * `connectSession`. Deliberately **not** what Disconnect is gated on —
+     * stopping has to stay available while an attempt is running, or the only
+     * way out of a retry is to kill the app.
+     */
+    var connecting by remember { mutableStateOf(false) }
+
     var prompt by remember { mutableStateOf("") }
     var chatLog by remember { mutableStateOf(listOf<Pair<String, String>>()) } // (who, text)
 
@@ -203,8 +258,14 @@ fun PortalScreen(keyFile: File) {
     // the session" sequence, and having two copies is how they'd drift.
     // `reason` only changes what's shown on failure, so a dropped network
     // mid-reconnect doesn't read as if the button itself failed.
-    suspend fun connectSession(reason: String) {
-        busy = true
+    suspend fun connectSession(reason: String): Attempt {
+        // **Its own flag, not `busy`.** `busy` is shared with Pair and Send,
+        // and a Send stream can run for a minute. If the redialer cleared it
+        // on the way out, the prompt would come back live while the first
+        // stream was still collecting, and two concurrent `Send`s both edit
+        // the last `chatLog` entry -- they would interleave into one line and
+        // clobber each other's tokens.
+        connecting = true
         try {
             val token = currentAuth0Token()
             val stored = authStore.tokens.value
@@ -216,29 +277,121 @@ fun PortalScreen(keyFile: File) {
                     accessTokenExpiresAtUnix = ((stored?.expiresAt ?: 0L) / 1000).toULong(),
                 )
             }
+            if (!wanted) {
+                // Stopped while this was in flight. `portalConnect` is a
+                // blocking FFI call that cancellation cannot interrupt, so by
+                // the time anyone could say stop it has already built a live
+                // session -- adopting it would reconnect somebody who just
+                // asked not to be. `NonCancellable` because this coroutine is
+                // very likely already cancelled, and a session dropped without
+                // `disconnect()` leaves the tunnel up on the far side.
+                withContext(NonCancellable + Dispatchers.IO) { s.disconnect() }
+                return Attempt.Failed
+            }
             session = s
             localPort = s.localPort().toInt()
             statusIsError = false
             status = "Connected -- forwarding to \"$SERVICE\" on 127.0.0.1:${localPort}"
+            return Attempt.Connected
+        } catch (e: CancellationException) {
+            // Not a failure of the connect, and not the retry loop's business:
+            // caught by the generic clause below it would be written to the
+            // status and classified as worth another go, which is a lie about
+            // what happened.
+            throw e
+        } catch (e: AuthError) {
+            // Nothing out here will fix this one, so the retry stops and the
+            // message stays put instead of being overwritten every few seconds.
+            statusIsError = true
+            status = "$reason failed: ${e.message}"
+            return Attempt.GiveUp
         } catch (e: Exception) {
             statusIsError = true
             status = "$reason failed: ${e.message}"
+            return Attempt.Failed
         } finally {
-            busy = false
+            connecting = false
         }
     }
 
-    // Auto-reconnect when the OS switches the default network out from under
-    // an active session (WiFi <-> cellular). The underlying QUIC connection
-    // does not survive that on its own: the local socket a session opened
-    // dies with the network it was on, and nothing today makes the session
-    // migrate -- so without this, the UI sits on a stale "Connected" long
-    // after the tunnel is dead, and the first sign anything is wrong is the
-    // next send failing with "Failed to connect to /127.0.0.1:<port>" (#211).
-    // Handled here rather than deeper in the Rust core because noticing a
-    // network change is Android's job to report and the app's to act on --
-    // and a plain redial is enough because pairing produced a standing
-    // grant, not a one-shot capability.
+    // **One place redials, and it keeps trying.**
+    //
+    // What this replaces: two separate paths each called `connectSession`
+    // exactly once and gave up if it failed, and the network-change callback
+    // then declined to help because it tested `session == null` -- which is
+    // just as true after a failed reconnect as after a deliberate Disconnect.
+    // So a Wi-Fi -> cellular switch *with a gap in the middle* -- the phone on
+    // no usable network for a few seconds, the ordinary shape of a handover --
+    // left the app sitting on "Reconnect failed" with a working network and
+    // nothing retrying. Measured on an emulator: 87 seconds in, still stuck,
+    // ping to the control plane fine, and one tap of Connect fixed it
+    // instantly. A switch with no gap recovered on its own, which is why the
+    // demo and every casual test looked right.
+    //
+    // `wanted` is the intent that `session == null` was standing in for, and
+    // the two callbacks below now only ever *clear* a session. Having one
+    // redialer also retires the `busy` dance the two of them needed, which was
+    // a race rather than a fix.
+    LaunchedEffect(wanted, session) {
+        if (!wanted || session != null) return@LaunchedEffect
+        var attempt = 0
+        while (isActive && wanted && session == null) {
+            // **Read before the attempt, not after.** A wake that lands while
+            // the attempt is in flight is the important one: the attempt was
+            // begun with no network and is doomed, and the network arriving
+            // mid-flight is exactly the news worth acting on. Sampling after
+            // it returns folds that wake into the baseline and sleeps out the
+            // whole backoff with a working network -- the symptom this change
+            // exists to remove, just time-boxed.
+            val waking = wakeRetry
+            val outcome = connectSession(if (attempt == 0) "Connect" else "Reconnect")
+            if (outcome == Attempt.Connected) break
+            // Kept, because the countdown below is about to overwrite it in
+            // this same continuation -- so without this the failure never
+            // reaches a frame, and a connect that keeps failing shows nothing
+            // but a timer.
+            val why = status
+            attempt++
+            if (outcome == Attempt.GiveUp) {
+                // **Waits instead of returning.** Breaking out would leave this
+                // effect finished with `wanted` still true and `session` still
+                // null -- neither key changes when Connect is tapped, so the
+                // effect would never restart and the button would do nothing.
+                // Waiting here keeps the one thing that redials alive and lets
+                // a tap, or a network arriving after a sign-in, start it again.
+                // The auth message stays on screen until then.
+                snapshotFlow { wakeRetry }.first { it != waking }
+                attempt = 0
+                continue
+            }
+            val wait = RECONNECT_BACKOFF_MS[
+                minOf(attempt - 1, RECONNECT_BACKOFF_MS.lastIndex)
+            ]
+            statusIsError = false
+            status = "Reconnecting in ${wait / 1000}s... ($why)"
+            // A network arriving is reason to stop waiting -- that wait is the
+            // only thing left between a returning network and a working tunnel.
+            // Raced against the delay rather than cancelling this effect on it:
+            // a connect in flight is a blocking FFI call that cancellation
+            // cannot actually stop, so a cancelled one would run to completion
+            // and drop its session without disconnecting it.
+            withTimeoutOrNull(wait) {
+                snapshotFlow { wakeRetry }.first { it != waking }
+            }
+        }
+    }
+
+    // Notice when the OS moves the default network out from under a session
+    // (Wi-Fi <-> cellular). The underlying QUIC connection does not survive
+    // that on its own: the local socket a session opened dies with the network
+    // it was on, and nothing today makes the session migrate -- so without
+    // this, the UI sits on a stale "Connected" long after the tunnel is dead,
+    // and the first sign anything is wrong is the next send failing with
+    // "Failed to connect to /127.0.0.1:<port>" (#211). Handled here rather
+    // than deeper in the Rust core because noticing a network change is
+    // Android's job to report and the app's to act on -- and a plain redial is
+    // enough because pairing produced a standing grant, not a one-shot
+    // capability.
     DisposableEffect(Unit) {
         val connectivityManager = context.getSystemService(ConnectivityManager::class.java)
         // Plain var, not Compose state: this is bookkeeping the callback
@@ -249,25 +402,29 @@ fun PortalScreen(keyFile: File) {
             override fun onAvailable(network: Network) {
                 val previous = lastNetwork
                 lastNetwork = network
-                // The very first call just reports the network already in
-                // use when the callback registers -- nothing to recover from
-                // yet. Only a *change* from one already seen, with a session
-                // actually up, means the connection under it just went stale.
-                if (previous == null || previous == network || session == null) return
+                // On the main thread, because everything it touches is Compose
+                // state and this runs on a callback thread of the framework's
+                // choosing.
                 scope.launch {
-                    status = "Network changed -- reconnecting..."
+                    // **Unconditionally**, before any of the tests below: a
+                    // retry waiting out its backoff needs to hear that the
+                    // ground moved even -- especially -- when there is no
+                    // session left to replace.
+                    wakeRetry++
+                    // The very first call just reports the network already in
+                    // use when the callback registers; nothing to recover from.
+                    if (previous == null || previous == network) return@launch
+                    val old = session ?: return@launch
                     statusIsError = false
-                    val old = session
+                    status = "Network changed -- reconnecting..."
                     session = null
                     localPort = null
                     // Best-effort: the old session's transport is almost
                     // certainly already dead on the network that just went
-                    // away, so this is tidying up local state, not something
-                    // a failure here should block the reconnect on.
-                    if (old != null) {
-                        runCatching { withContext(Dispatchers.IO) { old.disconnect() } }
-                    }
-                    connectSession("Reconnect")
+                    // away, so this is tidying up local state, not something a
+                    // failure here should block the reconnect on. Clearing
+                    // `session` above is what starts the redial.
+                    runCatching { withContext(Dispatchers.IO) { old.disconnect() } }
                 }
             }
         }
@@ -275,31 +432,28 @@ fun PortalScreen(keyFile: File) {
         onDispose { connectivityManager?.unregisterNetworkCallback(callback) }
     }
 
-    // Auto-reconnect when the session dies for any *other* reason than a
-    // network change -- #211's fix above only fires on a
-    // ConnectivityManager callback, but a session can just as well die while
-    // the network never changed (#212: a relay leg the control plane moved
-    // elsewhere, or a direct path that stalls with no working relay behind
-    // it). Keyed on `session` itself: a new session restarts this loop for
-    // it, and setting `session = null` -- what both the Disconnect button and
-    // the network-change handler above do -- cancels it immediately, before
-    // its next poll, so a deliberate disconnect is never mistaken for a dead
-    // session and reconnected out from under the person who asked for it.
+    // Notice a session that died for any *other* reason than a network change:
+    // a relay leg the control plane moved elsewhere, or a direct path that
+    // stalls with no working relay behind it (#212). Keyed on `session` itself,
+    // so a new session restarts this for it and clearing one stops it.
     LaunchedEffect(session) {
         val watched = session ?: return@LaunchedEffect
         while (isActive) {
             delay(SESSION_HEALTH_POLL_MS)
             if (!watched.isClosed()) continue
-            // `busy` means something else (the network-change handler, a
-            // manual Connect) is already mid-reconnect for this same session
-            // going away -- that call already owns clearing `session` and
-            // redialing, so this loop only has to step aside.
-            if (!busy) {
-                status = "Session ended -- reconnecting..."
+            // Clearing it is the whole job here -- the redialer above owns
+            // trying again. `===` because by now `session` may already be a
+            // newer one, and clearing that would disconnect something live.
+            // `wanted` as well as the identity check: Disconnect sets `wanted`
+            // false and only clears `session` once `disconnect()` returns,
+            // which takes a few seconds, and a tick inside that window would
+            // announce "Session ended -- reconnecting..." about a session the
+            // person deliberately tore down.
+            if (wanted && session === watched) {
                 statusIsError = false
+                status = "Session ended -- reconnecting..."
                 session = null
                 localPort = null
-                connectSession("Reconnect")
             }
             break
         }
@@ -447,21 +601,42 @@ fun PortalScreen(keyFile: File) {
                         }
                     }
                 },
-                enabled = !busy && canAuthenticate && pairingCode.isNotBlank() && session == null,
+                enabled = !busy && !connecting && canAuthenticate &&
+                    pairingCode.isNotBlank() && session == null,
             ) { Text("Pair") }
 
             Button(
                 onClick = {
                     status = ""
-                    scope.launch { connectSession("Connect") }
+                    // Says what is wanted; the redialer above does it. Waking
+                    // it too, so tapping Connect during a backoff tries now
+                    // rather than waiting the rest of it out -- and so the tap
+                    // does something visible even when `wanted` was already
+                    // true.
+                    wanted = true
+                    wakeRetry++
                 },
-                enabled = !busy && paired && session == null,
+                enabled = !busy && !connecting && paired && session == null,
             ) { Text("Connect") }
 
             Button(
                 onClick = {
-                    val s = session ?: return@Button
+                    // **Before anything else.** This is the one thing that
+                    // stops the redialer, and it has to be false before
+                    // `session` goes null or it would read that as a session
+                    // to recover.
+                    wanted = false
                     status = ""
+                    val s = session
+                    if (s == null) {
+                        // Retrying rather than connected. There is nothing to
+                        // tear down; clearing `wanted` above is the whole of
+                        // it, and saying so is what tells the person it
+                        // stopped.
+                        statusIsError = false
+                        status = "Disconnected"
+                        return@Button
+                    }
                     busy = true
                     scope.launch {
                         // disconnect() now waits (bounded, up to a few
@@ -478,7 +653,10 @@ fun PortalScreen(keyFile: File) {
                         busy = false
                     }
                 },
-                enabled = session != null && !busy,
+                // **`wanted` too, and not gated on `connecting`.** While the
+                // redialer is retrying there is no session, so gating on one
+                // left the only way to stop it being to kill the app.
+                enabled = (session != null || wanted) && !busy,
             ) { Text("Disconnect") }
         }
 
