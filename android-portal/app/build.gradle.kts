@@ -33,20 +33,91 @@ val generateUniFfiBindings by tasks.registering(Exec::class) {
     )
 }
 
+/** cargo's target triple for each Android ABI name. */
+val rustTargetOf = mapOf(
+    "arm64-v8a" to "aarch64-linux-android",
+    "x86_64" to "x86_64-linux-android",
+    "armeabi-v7a" to "armv7-linux-androideabi",
+    "x86" to "i686-linux-android",
+)
+
+/**
+ * Which ABIs to cross-compile for.
+ *
+ * **`arm64-v8a` alone is what a phone needs, and what every release should
+ * carry.** An emulator on an x86_64 host needs `x86_64` as well, and an arm64
+ * system image is not an answer there: there is no hardware acceleration for
+ * it, so the image falls back to full instruction emulation. Running this app
+ * against an emulator -- which is the only way to exercise it without a phone
+ * in hand, and the only way to drive a network change on demand -- therefore
+ * means building a second ABI:
+ *
+ *     ./gradlew -PportalAbis=arm64-v8a,x86_64 assembleDebug
+ *
+ * A property rather than a second hardcoded entry, because each ABI is a full
+ * native build of msquic and quictls: paying for both on every phone build
+ * would be minutes for nothing.
+ */
+val portalAbis: List<String> = run {
+    // `-PportalAbis=` and a trailing comma both yield an empty element, which
+    // would reach `cargo ndk -t "" build`. A bare `-PportalAbis=` is a
+    // non-null empty string, so a `?:` on the property alone does not catch
+    // it; the default has to be applied after the blanks are gone.
+    val asked = (findProperty("portalAbis") as String? ?: "")
+        .split(",").map { it.trim() }.filter { it.isNotEmpty() }
+    val abis = asked.ifEmpty { listOf("arm64-v8a") }
+    // **Checked here, not in `doLast`.** cargo-ndk's `-t` takes an ABI name or
+    // a target triple, so `-PportalAbis=aarch64-linux-android` builds happily
+    // for minutes before the triple lookup below fails. Configuration time
+    // costs a second.
+    val unknown = abis.filter { it !in rustTargetOf }
+    if (unknown.isNotEmpty()) {
+        throw GradleException(
+            "unknown ABI(s) ${unknown.joinToString(", ")} in -PportalAbis. " +
+                "Known: ${rustTargetOf.keys.joinToString(", ")}"
+        )
+    }
+    abis
+}
+
 val generateJniLibs by tasks.registering(Exec::class) {
     group = "build"
     description = "Cross-compile portal-client-ffi into app/src/main/jniLibs"
     workingDir = file("$rustDir/portal-client-ffi")
+    doFirst {
+        // **Sweep the ABIs we are not building.** `src/main/jniLibs` is a
+        // source directory: cargo-ndk and the copy below only ever write into
+        // it, and nothing cleans it, so a `.so` from an earlier build with a
+        // different `-PportalAbis` simply stays and gets packaged.
+        //
+        // That is not cosmetic. Build both ABIs for an emulator, change the
+        // Rust, then run a plain `./gradlew installDebug` (default
+        // `arm64-v8a`): the x86_64 pair is left untouched, AGP packages it,
+        // and on an x86_64 emulator the loader prefers it -- so the emulator
+        // runs the **previous** native build while reporting success. A
+        // wrong-architecture `.so` fails loudly at install; a stale
+        // right-architecture one is the quiet kind of wrong this file's other
+        // comments are all about.
+        file("src/main/jniLibs").listFiles()
+            ?.filter { it.isDirectory && it.name !in portalAbis }
+            ?.forEach {
+                logger.lifecycle("generateJniLibs: removing stale ${it.name} libraries")
+                it.deleteRecursively()
+            }
+    }
     commandLine(
-        "cargo", "ndk",
-        "-t", "arm64-v8a",
-        // Same floor as the camera app, same reason: seera-msquic's
-        // selfsign_openssl.c needs glob()/globfree(), bionic only declares
-        // those from API 28, and the whole native cross-compile targets 29
-        // for consistency with quictls's own hardcoded sub-build API level.
-        "--platform", "29",
-        "-o", file("src/main/jniLibs").absolutePath,
-        "build",
+        listOf("cargo", "ndk") +
+            portalAbis.flatMap { listOf("-t", it) } +
+            listOf(
+                // Same floor as the camera app, same reason: seera-msquic's
+                // selfsign_openssl.c needs glob()/globfree(), bionic only
+                // declares those from API 28, and the whole native
+                // cross-compile targets 29 for consistency with quictls's own
+                // hardcoded sub-build API level.
+                "--platform", "29",
+                "-o", file("src/main/jniLibs").absolutePath,
+                "build",
+            ),
     )
     doLast {
         // cargo-ndk only copies portal-client-ffi's own cdylib. As of the
@@ -58,15 +129,23 @@ val generateJniLibs by tasks.registering(Exec::class) {
         // swallowed at startup by endpointIdOf's runCatching, so the app
         // looked fine until Pair/Connect crashed the process outright). Copy
         // it in by hand alongside the crate's own .so.
-        val libmsquic = fileTree("$rustDir/portal-client-ffi/target/aarch64-linux-android/debug/build") {
-            include("**/out/lib/libmsquic.so")
-        }.files.maxByOrNull { it.lastModified() }
-            ?: throw GradleException(
-                "libmsquic.so not found under portal-client-ffi's aarch64-linux-android build output"
-            )
-        copy {
-            from(libmsquic)
-            into(file("src/main/jniLibs/arm64-v8a"))
+        //
+        // **Per ABI.** Each one builds its own msquic, and a .so from the
+        // wrong architecture in a jniLibs directory is an install-time
+        // failure rather than a build one.
+        for (abi in portalAbis) {
+            // Non-null: `portalAbis` is validated against this map above.
+            val triple = rustTargetOf.getValue(abi)
+            val libmsquic = fileTree("$rustDir/portal-client-ffi/target/$triple/debug/build") {
+                include("**/out/lib/libmsquic.so")
+            }.files.maxByOrNull { it.lastModified() }
+                ?: throw GradleException(
+                    "libmsquic.so not found under portal-client-ffi's $triple build output"
+                )
+            copy {
+                from(libmsquic)
+                into(file("src/main/jniLibs/$abi"))
+            }
         }
     }
 }
