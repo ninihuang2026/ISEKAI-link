@@ -350,6 +350,38 @@ impl Connected {
         // cost a bug report rather than a bisect.
         tracing::debug!("closing: cancelling the forwards");
         shutdown.cancel();
+        // **Before anything releases the peer connection.** Doing that kills
+        // the relay leg underneath it, and a supervisor that has not been told
+        // why reads a dead leg as the relay failing: it asks the control plane
+        // for a new connection to stand a replacement on, backs off, and asks
+        // again. The far listener binds a leg for each of those rows and
+        // unbinds it moments later, so a plain disconnect arrives at the other
+        // end as a burst of connections -- measured at two per disconnect,
+        // five and eight seconds after the tap, with the session already gone.
+        //
+        // Not `session.close()`, which is still last: that cancels the
+        // supervisor's `shutdown`, which retires the attachment at once. This
+        // says only "stop replacing it" and leaves the leg where it is.
+        //
+        // **The reason it is last is not the reason this comment first gave.**
+        // It said the peer connection was still draining *through* the leg.
+        // The drain is what kills the leg: `peer.drain` is
+        // `reg.shutdown(); reg.wait_idle()`, and the leg's own QUIC connection
+        // is on that same registration (this file hands it over in
+        // `RelayOptions`). Worse, `wait_idle` then waits for a handle the leg
+        // will not release until `retire`, which `session.close()` below only
+        // reaches afterwards -- so the drain cannot succeed. Measured: seven
+        // consecutive disconnects, every one of them 5.00s from "waiting for
+        // msquic" to `msquic still had live handles after 5s`, which is
+        // `PeerSession::drain`'s failure branch and its
+        // `mem::forget(registration)`. **One leaked registration per
+        // connect/disconnect cycle**, which is the leak
+        // `portal-client-ffi`'s own doc says it is trying to avoid.
+        //
+        // Not fixed here. Reporting the leg closed has to happen before or
+        // alongside the drain, which is a different change from this one and
+        // wants its own measurement.
+        session.stop_replacing_the_leg();
         // **Dropped before the wait, not after it.** `Sessions` holds a
         // `Connection` clone of its own, and the drain below is a wait for
         // msquic to have no live handles left — one held by a value still in
