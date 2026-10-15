@@ -630,3 +630,50 @@ pub async fn create_forward_masque_connection(
     });
     Ok(())
 }
+
+/// Print `name version` and exit, if this invocation asked for it.
+///
+/// Only when it is the **first** argument — see the note inside on why.
+///
+/// **Called before anything else a `main` does**, which is the whole point.
+/// `portal-client` run with no arguments generates an Endpoint key on its way
+/// to telling you what it wanted instead; a `--version` that did that would
+/// leave a file behind for answering a question. Asking argh after it parses
+/// would be tidier to read and would still come after whatever the binary
+/// does first, so this reads the arguments itself.
+///
+/// Here rather than four times over: the four shipped binaries print the one
+/// string people paste into a bug report, and four copies is how they come to
+/// disagree. The argh binaries also declare a `--version` switch so `--help`
+/// lists it; this is what actually answers.
+pub fn print_version_if_asked(name: &str, version: &str) {
+    // **`args_os`, not `args`.** The latter panics on an argument that is not
+    // valid Unicode, and this runs before anything else, so a path like
+    // `--key /tmp/<invalid>.pem` would abort with a backtrace where argh used
+    // to print one line and exit 1. The camera binaries never touched argv at
+    // all before this; they are not going to start by panicking on one.
+    //
+    // **The first argument only.** Scanning them all cannot tell a flag from a
+    // value: argh takes an option's value verbatim even when it starts with
+    // `-`, so `--note -V` would print a version and exit 0 while the operator
+    // believed a revocation ran, and `-- --version` would answer something
+    // argh would have rejected. Nothing here knows which options take values,
+    // and guessing wrong turns a real command into a silent no-op. Requiring
+    // it first is a restriction that can be written down; the other is a trap.
+    let Some(first) = std::env::args_os().nth(1) else {
+        return;
+    };
+    if first == *std::ffi::OsStr::new("--version") || first == *std::ffi::OsStr::new("-V") {
+        println!("{name} {version}");
+        std::process::exit(0);
+    }
+}
+
+/// [`print_version_if_asked`] for the calling crate, which is what every
+/// caller wants: `CARGO_PKG_*` are expanded where the macro is used, not here.
+#[macro_export]
+macro_rules! version_if_asked {
+    () => {
+        $crate::print_version_if_asked(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
+    };
+}

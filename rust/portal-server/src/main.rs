@@ -136,6 +136,18 @@ ISEKAI_PROVISIONING_KEY -- see 'Letting a CI job in' in docs/portal.md, and note
 that the job also needs an Enrollment Key from the Identity side."
 )]
 struct Args {
+    // **A `//` comment, not a `///` one.** argh_derive joins every doc line
+    // into the description it prints, so a rationale written above this field
+    // as documentation ends up in `--help` as a paragraph about a macro the
+    // reader cannot see. This file learned that the hard way.
+    //
+    // `version_if_asked!` at the top of `main` is what answers, before argh
+    // runs and before anything with a side effect. The switch is declared here
+    // only so `--help` lists it, which is why nothing reads it.
+    /// print the version and exit. Must be the first argument; -V also works
+    #[argh(switch)]
+    #[allow(dead_code)]
+    version: bool,
     /// agree to the privacy policy and carry on. It is recorded, so this is
     /// asked once rather than on every run -- and again when the policy changes
     #[argh(switch)]
@@ -1421,6 +1433,7 @@ async fn grant_admin(
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    isekai_link_utils::version_if_asked!();
     // **stderr, and `info` unless `RUST_LOG` says otherwise.**
     //
     // Two fixes in one. `fmt()` writes to *stdout* by default, which puts log
