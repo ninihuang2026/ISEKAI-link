@@ -351,7 +351,7 @@ impl Narrowing {
 }
 
 /// Response of `POST /v1/tokens/endpoint` (§8.2.1).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct EndpointToken {
     pub endpoint_token: String,
     pub token_type: String,
@@ -362,6 +362,15 @@ pub struct EndpointToken {
     #[serde(default)]
     pub protocols: Vec<String>,
 }
+crate::redacted_debug!(
+    EndpointToken {
+        token_type,
+        expires_in,
+        endpoint_id,
+        permissions,
+        protocols,
+    } redacting { endpoint_token }
+);
 
 /// Response of `POST /v1/endpoints/enroll` (§8.8.5) — registration and the
 /// first Endpoint Token in one round trip.
@@ -372,7 +381,7 @@ pub struct EndpointToken {
 /// *succeeded*: a slot is spent, the Challenge is consumed, and — because one
 /// key registers exactly one Endpoint — **that keypair can never be registered
 /// again**. Every retry is `409`. A missing `device_id` is not worth that.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct Enrolled {
     pub endpoint_id: String,
     pub endpoint_token: String,
@@ -403,6 +412,22 @@ pub struct Enrolled {
     #[serde(default)]
     pub protocols: Vec<String>,
 }
+crate::redacted_debug!(
+    Enrolled {
+        endpoint_id,
+        expires_in,
+        device_id,
+        tenant_id,
+        user_id,
+        status,
+        registered_at,
+        enrollment_key_id,
+        ephemeral,
+        expires_at,
+        permissions,
+        protocols,
+    } redacting { endpoint_token }
+);
 
 impl Enrolled {
     /// The Endpoint Token, in the shape the rest of this crate passes around.
@@ -502,7 +527,7 @@ impl NewEnrollmentKey {
 /// Lax for the same reason [`Enrolled`] is: `key` is **returned by this call
 /// only and never re-fetchable**, so a response this cannot parse is a key the
 /// server has minted, counted against the quota, and will never show again.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct IssuedEnrollmentKey {
     /// The secret, `enr1_`-prefixed. Store it now or lose it.
     ///
@@ -547,6 +572,23 @@ pub struct IssuedEnrollmentKey {
     #[serde(default)]
     pub warnings: Vec<String>,
 }
+crate::redacted_debug!(
+    IssuedEnrollmentKey {
+        key_id,
+        owner_sub,
+        tenant_id,
+        permissions,
+        protocols,
+        ephemeral,
+        endpoint_idle_ttl,
+        max_live_endpoints,
+        binding,
+        label,
+        created_at,
+        expires_at,
+        warnings,
+    } redacting { key }
+);
 
 /// One row of `GET /v1/enrollment-keys` (§8.8.9) — the issue response without
 /// the secret, plus how full it is.

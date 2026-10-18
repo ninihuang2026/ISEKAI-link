@@ -60,6 +60,10 @@ pub mod peer;
 /// Measuring the relays so a near one is chosen (`relay_proximity_plan.md`).
 pub mod relay_rtt;
 
+/// `Debug` that leaves secrets out; for the FFI crates, which reach
+/// `isekai-p2p-core` only through this one.
+pub use isekai_p2p_core::redacted_debug;
+
 /// Re-exports of the `isekai-p2p-core` items that appear in this crate's API.
 pub mod agent {
     pub use isekai_p2p_core::attestation::{attest, verify, Attestation, AttestationError};

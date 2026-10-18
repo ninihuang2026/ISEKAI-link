@@ -56,7 +56,7 @@ pub enum PortalError {
 /// now, and `portal_core::session::connect` picks TLS verification itself
 /// from what the peer's relay certificate says (`session.rs`'s
 /// `open_the_peer_connection`).
-#[derive(Debug, Clone, uniffi::Record)]
+#[derive(Clone, uniffi::Record)]
 pub struct PortalConfig {
     pub identity_url: String,
     pub proxy_url: String,
@@ -66,6 +66,16 @@ pub struct PortalConfig {
     pub expected_endpoint: String,
     pub register: bool,
 }
+isekai_p2p::redacted_debug!(
+    PortalConfig {
+        identity_url,
+        proxy_url,
+        protocol,
+        service,
+        expected_endpoint,
+        register,
+    } redacting { auth0_token }
+);
 
 #[uniffi::export]
 pub fn generate_endpoint_key_pem() -> Result<String, PortalError> {

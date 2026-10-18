@@ -235,7 +235,7 @@ pub struct PeerListener {
     pub active_connections: Option<i64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Capability {
     pub capability_id: String,
     /// The opaque token — hand this to the initiator out of band.
@@ -246,6 +246,16 @@ pub struct Capability {
     pub protocol: String,
     pub expires_at: String,
 }
+crate::redacted_debug!(
+    Capability {
+        capability_id,
+        listener_id,
+        owner_endpoint,
+        allowed_endpoint,
+        protocol,
+        expires_at,
+    } redacting { capability }
+);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelayInfo {
@@ -311,7 +321,7 @@ pub enum RelayRole {
 /// [`lease_expires_at`](Self::lease_expires_at) is how long the *leg* it buys
 /// will live — tens of minutes. **Renewal is timed off the second**; a client
 /// that watched the first would re-ticket every half minute for nothing.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct RelayTicket {
     /// The ES256 JWT itself.
     pub ticket: String,
@@ -321,6 +331,7 @@ pub struct RelayTicket {
     /// When the leg it materializes lapses, unless renewed before then.
     pub lease_expires_at: String,
 }
+crate::redacted_debug!(RelayTicket { role, expires_at, lease_expires_at } redacting { ticket });
 
 /// Where a Public UDP Listener is reachable from the outside (spec §7.7.1).
 ///
@@ -584,7 +595,7 @@ struct GrantList {
 }
 
 /// A pairing code to display (spec §8.9.1). Returned once and not re-fetchable.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct PairingCode {
     /// Eight characters, shown as `XXXX-XXXX`.
     pub code: String,
@@ -593,6 +604,7 @@ pub struct PairingCode {
     pub protocol: String,
     pub expires_at: String,
 }
+crate::redacted_debug!(PairingCode { owner_endpoint, protocol, expires_at } redacting { code });
 
 /// A Ticket, as returned by issuing one (spec §8.12.2).
 ///
@@ -600,7 +612,7 @@ pub struct PairingCode {
 /// screen, a Ticket is a 256-bit secret handed over out of band, and **several
 /// can be live for the same protocol at once** — which is the half of §8.12
 /// that pairing cannot do. Whoever redeems it binds themselves to it.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct Ticket {
     /// The secret itself, `tkt1_`-prefixed. **Returned by this call only and
     /// never re-fetchable** — the proxy keeps a SHA-256 of it and nothing more.
@@ -628,6 +640,17 @@ pub struct Ticket {
     #[serde(default)]
     pub expires_at: Option<String>,
 }
+crate::redacted_debug!(
+    Ticket {
+        ticket_id,
+        owner_endpoint,
+        protocol,
+        grant_ttl,
+        label,
+        created_at,
+        expires_at,
+    } redacting { ticket }
+);
 
 /// One row of `GET /v1/peer/tickets` (spec §8.12.5) — the issue response
 /// without the secret, plus who used it.
@@ -753,7 +776,7 @@ pub struct BindingView {
 /// The plaintext field is `key` here and `key_plaintext` on the Identity side.
 /// The two servers genuinely differ, and Identity's §8.8.2 says why it does not
 /// follow this one.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct ProvisioningKey {
     /// The secret, `pvk1_`-prefixed. **Store it now or lose it.**
     ///
@@ -795,6 +818,21 @@ pub struct ProvisioningKey {
     #[serde(default)]
     pub expires_at: Option<String>,
 }
+crate::redacted_debug!(
+    ProvisioningKey {
+        key_id,
+        owner_endpoint,
+        protocol,
+        grant_ttl,
+        max_live_grants,
+        live_grants,
+        redemption_count,
+        binding,
+        label,
+        created_at,
+        expires_at,
+    } redacting { key }
+);
 
 /// One row of `GET /v1/peer/provisioning-keys` (spec §8.13.7) — the issue
 /// response without the secret, plus how full the key is.
@@ -995,7 +1033,7 @@ pub fn proxy_authority(proxy_url: &str) -> &str {
 }
 
 /// A Ticket together with where to redeem it (spec §8.12.8).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct TicketTransfer {
     /// Where to redeem it: an **authority**, not a URL —
     /// `link.isekai.tools:6443`. The scheme is always `https`.
@@ -1013,6 +1051,7 @@ pub struct TicketTransfer {
     /// The `tkt1_` secret.
     pub ticket: String,
 }
+crate::redacted_debug!(TicketTransfer { proxy } redacting { ticket });
 
 #[derive(Serialize, Deserialize)]
 struct TicketTransferBody {
