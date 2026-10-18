@@ -821,9 +821,34 @@ async fn run(
         true => portal_core::session::Routing::RelayOnly,
         false => portal_core::session::Routing::PreferDirect,
     };
-    let connected = portal_core::session::connect(&cfg, reach, routing, &shutdown)
-        .await
-        .context("connect to the portal server")?;
+    // **A stop during the connect ends the connect.** `terminate_signal` is an
+    // `async fn`, so nothing is registered until it is first polled, and that
+    // used to be the `select!` further down. A SIGTERM during the connect met
+    // the default disposition and killed the process on the spot (exit 143),
+    // before `main` could return the enrolment slot, which then stayed out until
+    // the idle sweep -- two in a row filled the canary's key for a quarter of an
+    // hour (2026-10-17). Polled here, it is registered as the connect starts,
+    // and a server that never answers cannot hold the stop either: leaving
+    // through an error is the way out that returns the slot.
+    //
+    // The hatch is armed on receipt, as below and for the same reason
+    // (`hard_exit_on_second_signal`), and the token cancelled so the grant
+    // keeper finishes what it is doing before it is dropped.
+    let connected = tokio::select! {
+        connected = portal_core::session::connect(&cfg, reach, routing, &shutdown) => {
+            connected.context("connect to the portal server")?
+        }
+        _ = tokio::signal::ctrl_c() => {
+            portal_core::shutdown::hard_exit_on_second_signal();
+            shutdown.cancel();
+            anyhow::bail!("interrupted before the connection to the portal server was up");
+        }
+        _ = &mut terminate => {
+            portal_core::shutdown::hard_exit_on_second_signal();
+            shutdown.cancel();
+            anyhow::bail!("stopped (SIGTERM) before the connection to the portal server was up");
+        }
+    };
     println!("connection id: {}", connected.session.connection_id());
 
     // **Closed on the way out of a failure, not dropped.** A `?` here — and
