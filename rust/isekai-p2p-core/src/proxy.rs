@@ -457,7 +457,7 @@ pub struct RelayLease {
 /// (`GET /v1/peer/certificate`). The listener presents it on the video QUIC so
 /// the initiator, dialing the matching [`PeerConnection::video_host`] FQDN, can
 /// validate it instead of skipping certificate checks.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct CertBundle {
     /// The FQDN the certificate is issued for (resolves to loopback).
     pub hostname: String,
@@ -470,6 +470,8 @@ pub struct CertBundle {
     #[serde(default)]
     pub pkcs12: String,
 }
+
+crate::redacted_debug!(CertBundle { hostname, cert_pem } redacting { key_pem, pkcs12 });
 
 /// What the proxy needs from a caller before it will issue a certificate, and
 /// what it currently holds for this Endpoint (spec §8.6.1).

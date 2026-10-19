@@ -296,9 +296,6 @@ final class ViewerModel: ObservableObject {
         }
     }
 
-    /// The settings as the core wants them, shared by connecting and by the
-    /// control-plane calls so the two cannot describe the same session
-    /// differently.
     /// Whether "Skip TLS verification" exists at all: Debug builds only. On a
     /// release build anyone on the same network could otherwise take the Auth0
     /// token, so a value saved by a Debug build is ignored rather than honoured.
@@ -310,6 +307,9 @@ final class ViewerModel: ObservableObject {
         #endif
     }()
 
+    /// The settings as the core wants them, shared by connecting and by the
+    /// control-plane calls so the two cannot describe the same session
+    /// differently.
     private func clientConfig() -> ClientConfig {
         ClientConfig(
             identityUrl: settings.identityURL.trimmed,
