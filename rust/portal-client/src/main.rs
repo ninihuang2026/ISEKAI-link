@@ -806,14 +806,11 @@ async fn run(
         },
     };
 
-    // **Installed before the connect, and the hatch armed with it.**
-    // Registering it replaces SIGTERM's default disposition for the rest of the
-    // process, so from here a `kill` does nothing unless something polls — and
-    // the select below is a long way off, past a proxy connect that can hang.
-    // Registering early means a SIGTERM arriving during the connect is queued
-    // and delivered the moment the select starts, which is a clean stop with
-    // the slot returned; arming the hatch means a second one leaves at once
-    // even if the connect never returns.
+    // **Created here, registered only when first polled.** `terminate_signal`
+    // is an `async fn`: making and pinning the future runs none of its body, so
+    // SIGTERM keeps its default disposition until a `select!` polls it. That is
+    // why the connect below polls it too, rather than leaving it to the later
+    // `select!`. Pinned once so both can poll the same handler.
     let terminate = terminate_signal();
     tokio::pin!(terminate);
 
