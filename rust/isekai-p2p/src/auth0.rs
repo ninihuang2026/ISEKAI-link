@@ -202,7 +202,7 @@ fn default_interval() -> u64 {
 }
 
 /// Tokens from a login or a refresh.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Auth0Tokens {
     pub access_token: String,
     /// What the sign-in reported about its organization, if anything.
@@ -225,6 +225,12 @@ pub struct Auth0Tokens {
     /// being written to disk and read back later.
     pub expires_at_unix: u64,
 }
+isekai_p2p_core::redacted_debug!(
+    Auth0Tokens {
+        recorded_organization,
+        expires_at_unix,
+    } redacting { access_token, refresh_token }
+);
 
 impl Auth0Tokens {
     /// Which organization these tokens belong to, if any.

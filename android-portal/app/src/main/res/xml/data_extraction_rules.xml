@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Nothing of this app's leaves the phone: not to a cloud backup, and not in a
+  phone-to-phone transfer.
+
+  `android:allowBackup="false"` covers only the first on Android 12 and later
+  (targetSdk 31+); device-to-device transfer ignores it and reads these rules
+  instead. Without them a transfer would copy the Endpoint key, putting the
+  same device identity on two phones, and the encrypted Auth0 store, whose
+  Keystore key does not travel with it and so could not be opened on the new
+  phone. A new phone signs in and pairs as a new device.
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="root" path="." />
+        <exclude domain="file" path="." />
+        <exclude domain="database" path="." />
+        <exclude domain="sharedpref" path="." />
+        <exclude domain="external" path="." />
+        <exclude domain="device_root" path="." />
+        <exclude domain="device_file" path="." />
+        <exclude domain="device_database" path="." />
+        <exclude domain="device_sharedpref" path="." />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="root" path="." />
+        <exclude domain="file" path="." />
+        <exclude domain="database" path="." />
+        <exclude domain="sharedpref" path="." />
+        <exclude domain="external" path="." />
+        <exclude domain="device_root" path="." />
+        <exclude domain="device_file" path="." />
+        <exclude domain="device_database" path="." />
+        <exclude domain="device_sharedpref" path="." />
+    </device-transfer>
+</data-extraction-rules>

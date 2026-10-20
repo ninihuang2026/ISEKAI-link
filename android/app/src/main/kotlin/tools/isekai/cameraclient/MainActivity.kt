@@ -291,8 +291,10 @@ private fun ViewerScreen(model: ViewerModel = viewModel()) {
 
         // --- Development ----------------------------------------------
         Text("Development", style = MaterialTheme.typography.titleMedium)
-        CheckedRow("Skip TLS verification", settings.insecureSkipVerify) {
-            model.updateSettings { s -> s.copy(insecureSkipVerify = it) }
+        if (model.allowsInsecureTls) {
+            CheckedRow("Skip TLS verification", settings.insecureSkipVerify) {
+                model.updateSettings { s -> s.copy(insecureSkipVerify = it) }
+            }
         }
         CheckedRow("Direct path", settings.enableMigration) { model.updateSettings { s -> s.copy(enableMigration = it) } }
         LabeledField("Log filter (RUST_LOG syntax)", settings.logFilter) {

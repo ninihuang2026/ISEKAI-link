@@ -29,6 +29,7 @@ pub mod identity;
 pub mod mtu;
 pub mod pop;
 pub mod proxy;
+mod redact;
 
 /// msquic HTTP/3 transport for the proxy control plane (feature `msquic`).
 #[cfg(feature = "msquic")]

@@ -15,13 +15,15 @@ use tokio_util::sync::CancellationToken;
 use tower::{Service, ServiceBuilder, ServiceExt};
 use tower_http::auth::AddAuthorizationLayer;
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(serde::Deserialize)]
 pub struct CertificateResponse {
     pub hostname: String,
     pub cert_pem: String,
     pub key_pem: String,
     pub pkcs12: String,
 }
+
+isekai_p2p_core::redacted_debug!(CertificateResponse { hostname, cert_pem } redacting { key_pem, pkcs12 });
 
 /// Body for `PUT /udp_mode`.
 ///

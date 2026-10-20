@@ -62,7 +62,7 @@ pub enum ConnectionState {
 }
 
 /// Connection settings (mirrors the desktop GUI's P2P fields).
-#[derive(Debug, Clone, uniffi::Record)]
+#[derive(Clone, uniffi::Record)]
 pub struct ClientConfig {
     pub identity_url: String,
     pub proxy_url: String,
@@ -103,6 +103,19 @@ pub struct ClientConfig {
     /// `RUST_LOG` on, so this is the only way to see what the core is doing.
     pub log_filter: String,
 }
+isekai_p2p_core::redacted_debug!(
+    ClientConfig {
+        identity_url,
+        proxy_url,
+        protocol,
+        listener_id,
+        expected_endpoint,
+        register,
+        insecure_skip_verify,
+        enable_migration,
+        log_filter,
+    } redacting { capability }
+);
 
 /// One end-to-end route the video can take.
 #[derive(Debug, Clone, uniffi::Record)]
