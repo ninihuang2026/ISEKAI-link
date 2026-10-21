@@ -90,6 +90,33 @@ fn deliver_frame(
     Ok(std::ops::ControlFlow::Continue(()))
 }
 
+/// The name the privacy-policy agreement is recorded under — the window's
+/// `ConsentGate` and `--accept-privacy-policy` read and write the same record.
+const APP: &str = "camera-server";
+
+/// The one flag: `--accept-privacy-policy`, for a camera started by a
+/// supervisor rather than by a person (see [`ACCEPT_FLAG`]).
+const ACCEPT_FLAG: &str = "--accept-privacy-policy";
+
+/// Read the command line: whether `--accept-privacy-policy` was passed.
+///
+/// **Anything else is refused**, not ignored. There is one flag, and a typo in
+/// it that started the window as if nothing had been agreed — under a
+/// supervisor, with nobody to see the consent screen — would look exactly like
+/// a camera that came up and never opened.
+fn accepts_privacy_policy() -> bool {
+    let mut accept = false;
+    for arg in std::env::args().skip(1) {
+        if arg == ACCEPT_FLAG {
+            accept = true;
+        } else {
+            eprintln!("usage: camera-server [{ACCEPT_FLAG}] [--version]\nunknown argument: {arg}");
+            std::process::exit(2);
+        }
+    }
+    accept
+}
+
 #[tokio::main]
 async fn main() -> eframe::Result<()> {
     isekai_link_utils::version_if_asked!();
@@ -98,6 +125,28 @@ async fn main() -> eframe::Result<()> {
         .with_span_events(tracing_subscriber::fmt::format::FmtSpan::FULL)
         .with_writer(std::io::stderr)
         .init();
+
+    // **`--accept-privacy-policy` is the consent screen answered in advance**,
+    // by whoever wrote the command line — the person installing a systemd unit,
+    // who is the one the screen would have asked. It is recorded exactly as the
+    // Agree button records it, so the screen does not appear. And because it
+    // was answered before the window existed, the window then opens the
+    // listener and starts the camera by itself (`MyApp::open_on_start`): a
+    // camera started by a supervisor has nobody to press Open.
+    //
+    // This is what `P2P_AUTOSTART` (#151) got wrong: it opened before the
+    // consent gate had been answered at all. Here nothing opens unless the
+    // agreement to this version of the policy is on record.
+    let accepted = accepts_privacy_policy();
+    if accepted {
+        // Not fatal: the person has agreed, and the open below goes ahead on
+        // the flag either way. An unwritten record only means the screen comes
+        // back the next time the window is started by hand.
+        if let Err(e) = camera_core::privacy::save(APP, camera_core::privacy::Language::preferred())
+        {
+            tracing::warn!("could not record the agreement to the privacy policy: {e:#}");
+        }
+    }
 
     let reg = camera_core::new_registration().expect("open the msquic registration");
 
@@ -167,7 +216,7 @@ async fn main() -> eframe::Result<()> {
         // all — draws as a blank box.
         Box::new(|cc| {
             let japanese = camera_ui::install_japanese(&cc.egui_ctx);
-            Ok(Box::new(MyApp::new(
+            let mut app = MyApp::new(
                 japanese,
                 Arc::clone(&reg),
                 rx,
@@ -175,7 +224,9 @@ async fn main() -> eframe::Result<()> {
                 camera,
                 mjpeg_tx_holder,
                 Arc::clone(&p2p_finished),
-            )))
+            );
+            app.open_on_start = accepted;
+            Ok(Box::new(app))
         }),
     );
     tracing::debug!("eframe exited, stopping camera task");
@@ -449,6 +500,13 @@ struct MyApp {
     /// The privacy policy, until it has been agreed to. Nothing else in the
     /// window is reachable while it has not been.
     consent: camera_ui::ConsentGate,
+
+    /// Press Open and Start on the first frame, as `--accept-privacy-policy`
+    /// asks. Cleared once acted on, so closing by hand stays closed.
+    open_on_start: bool,
+
+    /// How often to repaint when nothing else asks: see [`repaint_interval`].
+    repaint_interval: Duration,
 }
 
 use camera_core::auth0::SignInState as Auth0State;
@@ -494,7 +552,9 @@ impl MyApp {
             cameras: Arc::new(Mutex::new(None)),
             scanning: Arc::new(AtomicBool::new(false)),
             log: "Ready.".to_string(),
-            consent: camera_ui::ConsentGate::new("camera-server", japanese),
+            consent: camera_ui::ConsentGate::new(APP, japanese),
+            open_on_start: false,
+            repaint_interval: repaint_interval(),
         }
         .with_stored_auth0()
     }
@@ -1284,6 +1344,27 @@ impl eframe::App for MyApp {
         let mut open_clicked = false;
         let mut close_clicked = false;
 
+        // After the consent gate above, so it can only happen once the
+        // agreement is on record. What it does is press the two buttons a
+        // person would; with no sign-in there is nothing to open with, and
+        // that is said where the person who comes to look will see it.
+        if std::mem::take(&mut self.open_on_start) {
+            if self.auth0_source.is_some() {
+                open_clicked = true;
+                self.is_streaming.store(true, Ordering::Relaxed);
+                *self.log_shared.lock().unwrap() =
+                    "Opened and started by --accept-privacy-policy.".to_string();
+            } else {
+                tracing::error!(
+                    "{ACCEPT_FLAG}: not signed in, so nothing was opened. Sign in from the \
+                     window once; the camera opens by itself from the next start"
+                );
+                *self.log_shared.lock().unwrap() = format!(
+                    "{ACCEPT_FLAG}: not signed in, so nothing was opened. Sign in, then press Open."
+                );
+            }
+        }
+
         egui::CentralPanel::default().show_inside(ui, |ui| {
             // The window runs out of room long before the content does — a QR,
             // a device list, an activity log and a video preview do not fit on a
@@ -1375,8 +1456,45 @@ impl eframe::App for MyApp {
             self.close();
         }
 
-        ctx.request_repaint();
+        // **Paced to the camera, not as fast as the machine will draw.** New
+        // frames arrive on a channel egui cannot see, so something has to ask
+        // for the next paint -- but an unconditional `request_repaint` asks
+        // for one the moment this one ends. With vsync that is the display's
+        // rate; with none, on a virtual display under systemd, it is every
+        // core the renderer can get (measured: 1.5 cores with the GPU, 4.4
+        // without, on a Jetson Orin). The camera delivers about 30 frames a
+        // second, so painting faster shows nothing new. Input still repaints
+        // at once.
+        ctx.request_repaint_after(self.repaint_interval);
     }
+}
+
+/// How often the window repaints on its own, from `CAMERA_PREVIEW_FPS`.
+///
+/// **30 by default, the camera's own rate**, so the preview on a desktop is
+/// as smooth as what is being sent. A window nobody looks at -- on a virtual
+/// display under systemd -- sets it low: each frame painted there costs about
+/// 2.5% of a core on a Jetson Orin, for a picture that is never seen. What is
+/// streamed to viewers does not depend on it.
+///
+/// An unreadable or out-of-range value is said once and the default used: a
+/// typo should cost smoothness, not the camera.
+fn repaint_interval() -> Duration {
+    const DEFAULT_FPS: u32 = 30;
+    let fps = match std::env::var("CAMERA_PREVIEW_FPS") {
+        Err(_) => DEFAULT_FPS,
+        Ok(value) => match value.trim().parse::<u32>() {
+            Ok(fps @ 1..=60) => fps,
+            _ => {
+                tracing::warn!(
+                    value,
+                    "CAMERA_PREVIEW_FPS wants a whole number from 1 to 60; using {DEFAULT_FPS}"
+                );
+                DEFAULT_FPS
+            }
+        },
+    };
+    Duration::from_secs(1) / fps
 }
 
 #[cfg(test)]
