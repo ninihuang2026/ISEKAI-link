@@ -203,6 +203,9 @@ async fn main() -> eframe::Result<()> {
     // Filled in when a session starts, taken after the window closes. See
     // `ServerHandle::finished`.
     let p2p_finished: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>> = Arc::new(Mutex::new(None));
+    // Set when the window closed itself because the session stopped. See
+    // `MyApp::exit_when_stopped`.
+    let gave_up: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1400.0, 1000.0]),
@@ -226,6 +229,8 @@ async fn main() -> eframe::Result<()> {
                 Arc::clone(&p2p_finished),
             );
             app.open_on_start = accepted;
+            app.exit_when_stopped = accepted;
+            app.gave_up = Arc::clone(&gave_up);
             Ok(Box::new(app))
         }),
     );
@@ -261,7 +266,12 @@ async fn main() -> eframe::Result<()> {
     if let Err(e) = &res {
         tracing::error!("camera server exited with an error: {e}");
     }
-    camera_core::shutdown_and_exit(&reg, MSQUIC_DRAIN_TIMEOUT, i32::from(res.is_err())).await
+    let gave_up = gave_up.lock().unwrap().take();
+    if let Some(reason) = &gave_up {
+        tracing::error!("camera server stopped: {reason}");
+    }
+    let failed = res.is_err() || gave_up.is_some();
+    camera_core::shutdown_and_exit(&reg, MSQUIC_DRAIN_TIMEOUT, i32::from(failed)).await
 }
 
 /// How long to wait for msquic handles to close before leaving anyway.
@@ -311,6 +321,11 @@ struct P2pShared {
     activity: VecDeque<String>,
     /// Last error from a control-plane action, shown until the next one.
     error: Option<String>,
+    /// Why the session stopped on its own, once it has: it never started, or
+    /// it gave up on the control plane. Not set by Close, which is asked for.
+    /// Under `--accept-privacy-policy` this ends the process (see
+    /// [`MyApp::exit_when_stopped`]).
+    stopped: Option<String>,
 }
 
 /// How many lines of binding activity the UI keeps.
@@ -505,6 +520,18 @@ struct MyApp {
     /// asks. Cleared once acted on, so closing by hand stays closed.
     open_on_start: bool,
 
+    /// Close the window when the session stops on its own, as
+    /// `--accept-privacy-policy` asks (#179).
+    ///
+    /// **A camera under a supervisor has nobody to press Open again.** Left
+    /// running with its listener stopped, it is a process systemd sees as
+    /// healthy and a camera no one can reach. Exiting with an error is what
+    /// lets the supervisor start it again, as portal-server does (#301). A
+    /// window someone is looking at stays open and says what happened.
+    exit_when_stopped: bool,
+    /// The reason it closed, for `main` to exit with.
+    gave_up: Arc<Mutex<Option<String>>>,
+
     /// How often to repaint when nothing else asks: see [`repaint_interval`].
     repaint_interval: Duration,
 }
@@ -554,6 +581,8 @@ impl MyApp {
             log: "Ready.".to_string(),
             consent: camera_ui::ConsentGate::new(APP, japanese),
             open_on_start: false,
+            exit_when_stopped: false,
+            gave_up: Arc::new(Mutex::new(None)),
             repaint_interval: repaint_interval(),
         }
         .with_stored_auth0()
@@ -639,12 +668,16 @@ impl MyApp {
         // Beside the Endpoint key, and just as much a long-term secret: the
         // video TLS key is generated on this device and never sent anywhere.
         let video_key_path = video_key_path_beside(&key_path);
+        // To tell a session that ended on its own from one Close ended.
+        let activity_shutdown = shutdown.clone();
 
         let handle = tokio::spawn(async move {
             let key = match camera_core::load_or_generate_key(std::path::Path::new(&key_path)) {
                 Ok(key) => key,
                 Err(e) => {
-                    shared.lock().unwrap().status = format!("key error: {e:#}");
+                    let mut s = shared.lock().unwrap();
+                    s.status = format!("key error: {e:#}");
+                    s.stopped = Some(s.status.clone());
                     return;
                 }
             };
@@ -707,9 +740,17 @@ impl MyApp {
                                         // bind all fail from here. The activity
                                         // line says what happened; this says
                                         // what is true now.
-                                        if matches!(event, SignalingEvent::Unreachable { .. }) {
+                                        if let SignalingEvent::Unreachable {
+                                            unreachable_for,
+                                            error,
+                                        } = &event
+                                        {
                                             s.status = "P2P: control plane unreachable; the listener has stopped — restart to reconnect"
                                                 .to_string();
+                                            s.stopped = Some(format!(
+                                                "the control plane was unreachable for {}s: {error}",
+                                                unreachable_for.as_secs()
+                                            ));
                                         }
                                     }
                                     // A peer that just bound may have paired a
@@ -729,7 +770,17 @@ impl MyApp {
                                     let mut s = activity_shared.lock().unwrap();
                                     s.activity.push_back(format!("({n} events missed)"));
                                 }
-                                Err(broadcast::error::RecvError::Closed) => break,
+                                // The session has ended. Without `Unreachable`
+                                // first, and not because Close asked, nothing
+                                // says why; it is stopped all the same.
+                                Err(broadcast::error::RecvError::Closed) => {
+                                    if !activity_shutdown.is_cancelled() {
+                                        activity_shared.lock().unwrap().stopped.get_or_insert_with(
+                                            || "the signaling session ended".to_string(),
+                                        );
+                                    }
+                                    break;
+                                }
                             }
                         }
                     });
@@ -744,7 +795,9 @@ impl MyApp {
                     load_grants(commands, shared).await;
                 }
                 Err(e) => {
-                    shared.lock().unwrap().status = format!("P2P error: {e:#}");
+                    let mut s = shared.lock().unwrap();
+                    s.status = format!("P2P error: {e:#}");
+                    s.stopped = Some(s.status.clone());
                 }
             }
         });
@@ -1454,6 +1507,17 @@ impl eframe::App for MyApp {
         }
         if close_clicked {
             self.close();
+        }
+
+        if self.exit_when_stopped {
+            let stopped = self.p2p_shared.lock().unwrap().stopped.take();
+            if let Some(reason) = stopped {
+                tracing::error!(
+                    "P2P session stopped: {reason}; exiting so the supervisor restarts it"
+                );
+                *self.gave_up.lock().unwrap() = Some(reason);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
         }
 
         // **Paced to the camera, not as fast as the machine will draw.** New

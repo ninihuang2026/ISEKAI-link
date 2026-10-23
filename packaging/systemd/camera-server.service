@@ -81,6 +81,10 @@ Environment=XDG_CONFIG_HOME=%S/camera-server
 # to viewers is the same either way.
 Environment=CAMERA_PREVIEW_FPS=2
 
+# Without it only errors reach the journal, and an outage is warnings first:
+# the reconnects that failed before the listener gave up.
+Environment=RUST_LOG=info
+
 # **--accept-privacy-policy on every start**, not once: the policy is revised
 # from time to time, and a window relying on the record alone would come up on
 # the consent screen that day, with nobody to see it.
@@ -91,7 +95,9 @@ ExecStart=/usr/bin/xvfb-run --auto-servernum --server-args="-screen 0 1400x1000x
     /usr/local/camera-apps/camera-server --accept-privacy-policy
 
 # Restarted when it exits with an error or is killed. A `systemctl stop` is
-# left stopped.
+# left stopped. With --accept-privacy-policy the window closes itself, with an
+# error, when its listener could not start or gave up on the control plane
+# (#179); xvfb-run passes that exit status on, and this brings it back.
 Restart=on-failure
 RestartSec=30
 RestartSteps=5
