@@ -69,6 +69,30 @@ pub type ObservedAddressWatch = watch::Receiver<Option<ObservedAddress>>;
 /// direct path can only be opened from an unconnected binding and must check,
 /// while a display of "this is the mapping the proxy sees" is true and useful
 /// either way. Filtering here would answer one of them by lying to the other.
+///
+/// # One slot, and a leg can now have several paths
+///
+/// `crate::transport` *offers* multipath on these connections — whether it is
+/// negotiated is up to the proxy, which has to send `initial_max_path_id` back
+/// — and where it is, a leg on a host with two usable addresses runs a path on
+/// each. The proxy then reports an observed address per path, each naming its
+/// own `local`, and this channel still holds one: what a reader sees is
+/// whichever arrived last.
+///
+/// **Kept this way on purpose, because the consumer that matters is additive.**
+/// `isekai_p2p::direct_path::reoffer` watches this and offers each new pair as
+/// a direct-path candidate, withdrawing only the entry a new one would be
+/// shadowed by — the one on the same address. Reports for genuinely different
+/// addresses therefore accumulate as candidates rather than replacing each
+/// other, which is what punching wants: more places the peer may reach this
+/// Endpoint at.
+///
+/// What it does cost is the two readers that take a single value. The candidate
+/// `prepare` offers before the handshake is whichever path reported first, and
+/// a display of "the mapping the proxy sees" shows one of several without
+/// saying so. Holding a report per local address would answer both, and would
+/// change every consumer's shape; it is worth doing when something needs the
+/// set rather than when it first becomes possible.
 pub fn spawn_observed_address_watch(
     mut conn_rx: mpsc::Receiver<Established>,
     shutdown: CancellationToken,
