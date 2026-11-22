@@ -39,6 +39,7 @@ use isekai_p2p::agent::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
+use isekai_p2p::agent::{set_excluded_local_prefixes, ExcludedPrefixes};
 use isekai_p2p::agent::{MasqueH3Transport, ProxyClient};
 use isekai_p2p::{load_or_generate_key, AcceptPolicy, P2pConfig};
 use tokio_util::sync::CancellationToken;
@@ -228,7 +229,7 @@ struct Args {
     cert_key: Option<PathBuf>,
     /// path to the service catalogue: what may be reached, and under what
     /// name. See the note below, or --example-config
-    #[argh(option, default = "PathBuf::from(\"portal-server.toml\")")]
+    #[argh(option, default = "PathBuf::from(DEFAULT_CONFIG)")]
     config: PathBuf,
     /// stay on the relay: advertise no direct-path candidate, so no peer
     /// probes this end and every byte crosses the relay. The client has the
@@ -239,6 +240,13 @@ struct Args {
     /// print a starter catalogue on stdout and exit
     #[argh(switch)]
     example_config: bool,
+    /// an address and prefix this host must not open its own connections from,
+    /// as `172.17.0.0/16`, or a bare address for a single one. Repeatable, and
+    /// **added to** the `[network]` section of --config rather than replacing
+    /// it. For interfaces the proxy and the relay cannot answer on -- a
+    /// container bridge, a VPN that does not route to them
+    #[argh(option)]
+    exclude_local: Vec<String>,
     /// path to the gateway policy: which protocol classes this server serves
     /// as a Gateway, and what the control plane may say about them. Checked at
     /// startup; nothing is enforced yet. See --example-gateway-config
@@ -1879,6 +1887,44 @@ async fn terminate_signal() {
     std::future::pending::<()>().await;
 }
 
+/// The path `--config` reads when nothing names one.
+///
+/// Named so the check in [`excluded_local`] can tell "the operator did not ask
+/// for a file" from "the operator named one that is not there".
+const DEFAULT_CONFIG: &str = "portal-server.toml";
+
+/// Everything excluded, from the command line and from the `[network]` section
+/// of `--config`, which is **both** rather than one winning.
+///
+/// See [`isekai_p2p_core::local_address::ExcludedPrefixes::union`] for why both:
+/// a flag that replaced the file would mean re-stating the file to add one line
+/// for a single run, and a file that won would mean the flag silently did
+/// nothing.
+fn excluded_local(args: &Args) -> anyhow::Result<ExcludedPrefixes> {
+    // **Only the section, and none of the catalogue's own rules.** This runs
+    // before `--login` and the grant administration return, and those have
+    // never needed a catalogue: reading it with `config::load` made a bad
+    // `target` -- or a file holding nothing but `[network]`, which is what the
+    // guide invites a client to write -- fail every one of those runs. The
+    // catalogue is still read strictly further down, where the services are
+    // what it is for.
+    let named = args.config != std::path::Path::new(DEFAULT_CONFIG);
+    let from_file = match (args.config.exists(), named) {
+        (true, _) => portal_core::network::load_section(&args.config)?.exclude_local,
+        // **A path the operator named has to be there.** Absent, the default is
+        // simply "no file", which is how `--grants` has always run; absent
+        // after being asked for by name is a typo, and letting it through would
+        // drop the exclusions silently -- the failure this flag is arranged
+        // against everywhere else.
+        (false, true) => anyhow::bail!(
+            "no configuration file at {} (--config named it)",
+            args.config.display(),
+        ),
+        (false, false) => Vec::new(),
+    };
+    ExcludedPrefixes::union(&args.exclude_local, &from_file)
+}
+
 async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()> {
     if args.example_config {
         // Before the key, the token and the catalogue: this is what somebody
@@ -1905,6 +1951,14 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
     // operation runs -- which, with the PEP deferred, is not in this release at
     // all. What the policy *is* consulted for from the moment it loads is
     // whether each row the control plane sends may be applied.
+    // **Before every way out, for the reason the gateway policy above is.** The
+    // same argument applies twice over: `--exclude-local` describes the host
+    // rather than this run, so a `--pair` that accepted it and then dialled the
+    // control plane from the very interface it names would be the
+    // silent-ignore shape again.
+    let excluded = excluded_local(&args)?;
+    set_excluded_local_prefixes(excluded)?;
+
     let gateway_policy = match &args.gateway_config {
         Some(path) => {
             let policy = portal_core::gateway::load(path)?;
@@ -2013,7 +2067,7 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
     // Read before anything else touches the network: a typo in the catalogue
     // should cost a message, not a registered Endpoint and a listener nobody
     // can use.
-    let catalogue = portal_core::config::load(&args.config)?;
+    let catalogue = portal_core::config::load(&args.config)?.catalogue;
 
     let cert_key = args.cert_key.clone().unwrap_or_else(|| {
         let mut path = args.key.clone();

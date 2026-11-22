@@ -289,7 +289,12 @@ impl MasqueH3Transport {
             measuring.is_some(),
             registration,
         )
-        .with_peer_certificate_callback(crate::hostname::refuse_other_hosts(host));
+        .with_peer_certificate_callback(crate::hostname::refuse_other_hosts(host))
+        // Read as the connector is built rather than passed in: what these
+        // describe is the host's network, and `connect` has a dozen callers
+        // that have no business knowing about it (see
+        // [`crate::local_address`]).
+        .with_local_address_policies(crate::local_address::current().as_policies());
         // Watched only where it is asked for, and read by the caller rather
         // than by a task of our own -- see [`landing`](Self::landing) for why
         // that is what makes it race-free.
@@ -787,9 +792,13 @@ pub(crate) fn make_client_config(
     // paths it cannot validate -- each costing a UDP binding and a destination
     // CID out of `QUIC_MAX_PATH_COUNT`, which is 4 and is also the active CID
     // limit. msquic rate-limits the resulting churn itself, and says why:
-    // retirement "can outrun the peer's NEW_CONNECTION_ID issuance". No
-    // setting narrows the address set; `AddAddressMode::MANUAL` and a policy
-    // written here is what would, and that is a different change.
+    // retirement "can outrun the peer's NEW_CONNECTION_ID issuance".
+    //
+    // **An operator can now narrow that set**, which is what this said was a
+    // different change and is no longer: `crate::local_address` carries the
+    // excluded prefixes and the connector above is given them. What is left of
+    // the cost is the host nobody has told anything about, where every address
+    // is still tried.
     //
     // **The single-address case trades an unthrottled migration for a
     // reconciler pass.** With one address -- a phone, or any host being
