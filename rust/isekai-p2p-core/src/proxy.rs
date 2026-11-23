@@ -235,7 +235,7 @@ pub struct PeerListener {
     pub active_connections: Option<i64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Capability {
     pub capability_id: String,
     /// The opaque token — hand this to the initiator out of band.
@@ -246,11 +246,30 @@ pub struct Capability {
     pub protocol: String,
     pub expires_at: String,
 }
+crate::redacted_debug!(
+    Capability {
+        capability_id,
+        listener_id,
+        owner_endpoint,
+        allowed_endpoint,
+        protocol,
+        expires_at,
+    } redacting { capability }
+);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelayInfo {
     pub masque_uri: String,
-    pub session_id: String,
+    /// The relay session a leg meets its peer on.
+    ///
+    /// **Absent for a public address** (phase-5 plan §4.2), and that absence
+    /// is the shape of the thing rather than a field the server forgot: a leg
+    /// is one of two halves that have to find each other, and a public address
+    /// is one socket with nobody to meet. The header carrying this is also
+    /// what makes the data plane treat a request as a leg, so a public bind
+    /// has nothing to put in it and must not invent one.
+    #[serde(default)]
+    pub session_id: Option<String>,
     /// The relay this connection was routed to, when the control plane chose a
     /// registered one.
     ///
@@ -265,6 +284,21 @@ pub struct RelayInfo {
     /// during a certificate rotation; empty when nothing is pinned.
     #[serde(default)]
     pub spki_sha256: Vec<String>,
+    /// The address family **both ends** should dial this relay in, `"v4"` or
+    /// `"v6"` — the intersection of the two parties' [`RelayReach`] sets.
+    ///
+    /// **Absent is the answer whenever there is no common family**, and that
+    /// absence is not a degraded case: with nothing in common the two ends
+    /// cannot reach each other directly whatever they dial, so relaying on is
+    /// correct and each end picks for itself exactly as it does today (plan
+    /// Q5). It is equally absent against a control plane that does not know
+    /// about this at all.
+    ///
+    /// **The initiator reads it here; the listener cannot.** A listener never
+    /// looks at `relay`, so the same value is repeated as
+    /// [`PeerConnection::relay_family`] — see that field (plan Q4).
+    #[serde(default)]
+    pub family: Option<String>,
 }
 
 /// Which leg of a relay a ticket is for (spec §8.14.1).
@@ -276,6 +310,15 @@ pub enum RelayRole {
     Initiator,
     /// The listener's side. Binds the edge itself.
     Target,
+    /// Not a leg at all: **a public address** (phase-5 plan §4.1). Binds the
+    /// `ip:port` a user holds on that data plane, for traffic from anyone.
+    ///
+    /// **The data plane refuses this role on the leg path and the other two on
+    /// the public path**, deciding which it is from the request rather than
+    /// from the ticket — otherwise a ticket would choose the check applied to
+    /// it, and a public address would end up in the pool that authorizes
+    /// CONNECT-UDP destinations.
+    Public,
 }
 
 /// **The proxy's signed statement that a relay leg may exist** (spec §8.14.1).
@@ -293,7 +336,7 @@ pub enum RelayRole {
 /// [`lease_expires_at`](Self::lease_expires_at) is how long the *leg* it buys
 /// will live — tens of minutes. **Renewal is timed off the second**; a client
 /// that watched the first would re-ticket every half minute for nothing.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct RelayTicket {
     /// The ES256 JWT itself.
     pub ticket: String,
@@ -302,6 +345,117 @@ pub struct RelayTicket {
     pub expires_at: String,
     /// When the leg it materializes lapses, unless renewed before then.
     pub lease_expires_at: String,
+}
+crate::redacted_debug!(RelayTicket { role, expires_at, lease_expires_at } redacting { ticket });
+
+/// Where a Public UDP Listener is reachable from the outside (spec §7.7.1).
+///
+/// **Comparable, because the comparison is the only alarm there is.** What was
+/// published last time against what a fresh ticket names is how a client learns
+/// its data plane retired and its address moved (plan §3.3); nothing else
+/// reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicAddress {
+    /// The name the proxy advertises, when it has one to advertise.
+    ///
+    /// **Only the control plane can say this.** The data plane reports its
+    /// advertised address as a `SocketAddr`, which has no room for a name, so
+    /// a client that learned its address from the bind alone would lose it.
+    #[serde(default)]
+    pub hostname: Option<String>,
+    pub ip: String,
+    pub port: u16,
+}
+
+impl std::fmt::Display for PublicAddress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // **Bracketed when it has to be.** An IPv6 address written bare beside
+        // a port — `2001:db8::1:10042` — is ambiguous about where the address
+        // ends, and cannot be pasted anywhere that takes a `SocketAddr`. This
+        // string is what the warnings about a moved address print, and those
+        // are the only alarm this route has; one nobody can copy is half an
+        // alarm.
+        let host = if self.ip.contains(':') {
+            format!("[{}]", self.ip)
+        } else {
+            self.ip.clone()
+        };
+        // **The name as well as the pair**, because what somebody handed out
+        // may have been either, and a message about an address that changed has
+        // to be recognisable as the one they gave.
+        match &self.hostname {
+            Some(hostname) => write!(f, "{hostname} ({host}:{})", self.port),
+            None => write!(f, "{host}:{}", self.port),
+        }
+    }
+}
+
+#[cfg(test)]
+mod public_address_tests {
+    use super::*;
+
+    #[test]
+    fn an_ipv6_address_is_printed_so_it_can_be_pasted() {
+        let v6 = PublicAddress {
+            hostname: None,
+            ip: "2001:db8::1".to_owned(),
+            port: 10042,
+        };
+        assert_eq!(v6.to_string(), "[2001:db8::1]:10042");
+        assert!(v6.to_string().parse::<std::net::SocketAddr>().is_ok());
+        let v4 = PublicAddress {
+            hostname: Some("udp-ap1.isekai.tools".to_owned()),
+            ip: "203.0.113.9".to_owned(),
+            port: 10042,
+        };
+        assert_eq!(v4.to_string(), "udp-ap1.isekai.tools (203.0.113.9:10042)");
+    }
+}
+
+/// The UDP service this Endpoint is declaring, inside itself.
+///
+/// **The proxy does not interpret it** (spec §7.7.3 — not "unimplemented",
+/// *not implemented on purpose*). It is an address inside the Endpoint, which
+/// is behind NAT by assumption, so nothing out there can reach it. The owner
+/// forwards to it at the end of its own tunnel; this field is how the owner,
+/// and whoever reads the listing, says what is being published.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublicTarget {
+    pub host: String,
+    pub port: u16,
+}
+
+/// A Public UDP Listener (spec §7.7), and where to go to serve it.
+///
+/// **`relay` and `ticket` are how this stopped being a control-plane thing.**
+/// The address belongs to a data plane now (phase-5), so the answer carries
+/// which one and the signed paper that binding it needs.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PublicListener {
+    pub listener_id: String,
+    pub owner_endpoint: String,
+    pub public_address: PublicAddress,
+    /// The region the address is **in**, not the one that was asked for.
+    ///
+    /// The allocation is one per user and permanent (§7.7.1), so a second
+    /// listener asking for somewhere else is recorded and gets the first
+    /// one's address anyway. Saying where it actually is is what stops the
+    /// two disagreeing in silence.
+    #[serde(default)]
+    pub region: Option<String>,
+    /// Which data plane holds the port — **absent means the control plane's
+    /// own data path**, whose bind is authorized by the session's Endpoint
+    /// Token and needs no ticket.
+    #[serde(default)]
+    pub relay: Option<RelayInfo>,
+    /// **Only on the `/ticket` route.** Creation is idempotent and its reply
+    /// is cached for 24 hours; a single-use ticket good for 45 seconds cannot
+    /// live in a reply like that, so the server refuses to bundle one.
+    #[serde(default)]
+    pub ticket: Option<RelayTicket>,
+    pub status: String,
+    pub created_at: String,
+    pub expires_at: String,
 }
 
 /// What `POST /v1/relay/sessions/{id}/renew` answers (spec §8.14.3).
@@ -318,7 +472,7 @@ pub struct RelayLease {
 /// (`GET /v1/peer/certificate`). The listener presents it on the video QUIC so
 /// the initiator, dialing the matching [`PeerConnection::video_host`] FQDN, can
 /// validate it instead of skipping certificate checks.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct CertBundle {
     /// The FQDN the certificate is issued for (resolves to loopback).
     pub hostname: String,
@@ -331,6 +485,8 @@ pub struct CertBundle {
     #[serde(default)]
     pub pkcs12: String,
 }
+
+crate::redacted_debug!(CertBundle { hostname, cert_pem } redacting { key_pem, pkcs12 });
 
 /// What the proxy needs from a caller before it will issue a certificate, and
 /// what it currently holds for this Endpoint (spec §8.6.1).
@@ -403,6 +559,46 @@ pub struct IssuedCertificate {
     pub not_after: Option<String>,
 }
 
+/// Whether a create answered with something it just made, or with what was
+/// already there.
+///
+/// **The status is the only place this is stated.** `request_json_with` drops
+/// it on every success, which is why the grant ledger had to infer it from how
+/// old `created_at` looked — a guess that is wrong in both directions: a slow
+/// round trip makes a fresh grant look like an update, and an operator's grant
+/// created seconds ago looks like ours
+/// (`isekai_p2p::grants::already_existed`).
+///
+/// **This reports the status; it does not decide what the status means.** The
+/// upsert answer is the documented `200`; that a fresh row is a `201` is this
+/// workspace's assumption and is written down nowhere outside its own notes.
+/// So a caller that acts on the difference has to weigh the two readings
+/// separately — `isekai_p2p::grants::existed_before` is where that
+/// weighing lives, and why.
+///
+/// [`Unknown`](Self::Unknown) is not a failure: which success status a route
+/// uses is the proxy's to choose, and anything else simply says nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Made {
+    /// `201` — this call created it.
+    Fresh,
+    /// `200` — it was already there, and came back unchanged.
+    Existing,
+    /// Some other success. Nothing to read; fall back to whatever the caller
+    /// did before this existed.
+    Unknown,
+}
+
+impl Made {
+    fn from_status(status: u16) -> Self {
+        match status {
+            201 => Made::Fresh,
+            200 => Made::Existing,
+            _ => Made::Unknown,
+        }
+    }
+}
+
 /// A standing authorization for one Endpoint to reach one listener (spec §8.8).
 ///
 /// Where a [`Capability`] is a one-shot token the owner has to carry to the
@@ -456,7 +652,7 @@ struct GrantList {
 }
 
 /// A pairing code to display (spec §8.9.1). Returned once and not re-fetchable.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct PairingCode {
     /// Eight characters, shown as `XXXX-XXXX`.
     pub code: String,
@@ -465,6 +661,55 @@ pub struct PairingCode {
     pub protocol: String,
     pub expires_at: String,
 }
+crate::redacted_debug!(PairingCode { owner_endpoint, protocol, expires_at } redacting { code });
+
+/// How long a Ticket lasts, and how long what it makes lasts.
+///
+/// **A struct rather than two more positional `Option<u64>`.** These sat side
+/// by side in `create_ticket`, which is how the wrong one gets passed: the
+/// proxy clamps rather than complains, so a transposition shows up as an
+/// access that lasts the wrong length rather than as an error. `create_ticket`
+/// warns in prose that "they are different quantities and the second is not
+/// capped by the first"; this is that warning where the compiler can read it.
+/// Same reasoning as `portal-client`'s `Mapped`, for the same kind of mistake.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TicketBounds {
+    /// How long the paper is good for. `None` takes the proxy's default.
+    ///
+    /// Clamps to 60..=86,400.
+    pub ticket_ttl: Option<u64>,
+
+    /// How long whoever presents it may stay — the lifetime of the Grant a
+    /// redemption makes.
+    ///
+    /// **Not capped by `ticket_ttl`**: a 15-minute Ticket making a 1-hour Grant
+    /// is the intended case. Clamps to the same range, and cannot be unlimited
+    /// — a Ticket is for one-off work, and work that ends should not leave
+    /// authorization behind.
+    pub grant_ttl: Option<u64>,
+}
+
+/// What bounds a Provisioning Key: how long, how long for what it makes, and
+/// how many at once.
+///
+/// **A struct for the reason [`TicketBounds`] is one**, and more so: these were
+/// three adjacent `Option<u64>`, and the tests show what that reads like —
+/// `create_provisioning_key("isekai-portal-v1", None, None, None, None, None)`
+/// says nothing about which five things were left to the proxy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProvisioningBounds {
+    /// How long the key may be redeemed. `None` takes the proxy's default.
+    pub key_ttl: Option<u64>,
+
+    /// How long each Grant a redemption makes may stand.
+    pub grant_ttl: Option<u64>,
+
+    /// How many Grants the key may have live at once.
+    ///
+    /// The slot count a `429 provisioning-slots-exhausted` is about: it is what
+    /// makes a standing arrangement bounded rather than open-ended.
+    pub max_live_grants: Option<u64>,
+}
 
 /// A Ticket, as returned by issuing one (spec §8.12.2).
 ///
@@ -472,7 +717,7 @@ pub struct PairingCode {
 /// screen, a Ticket is a 256-bit secret handed over out of band, and **several
 /// can be live for the same protocol at once** — which is the half of §8.12
 /// that pairing cannot do. Whoever redeems it binds themselves to it.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct Ticket {
     /// The secret itself, `tkt1_`-prefixed. **Returned by this call only and
     /// never re-fetchable** — the proxy keeps a SHA-256 of it and nothing more.
@@ -500,6 +745,17 @@ pub struct Ticket {
     #[serde(default)]
     pub expires_at: Option<String>,
 }
+crate::redacted_debug!(
+    Ticket {
+        ticket_id,
+        owner_endpoint,
+        protocol,
+        grant_ttl,
+        label,
+        created_at,
+        expires_at,
+    } redacting { ticket }
+);
 
 /// One row of `GET /v1/peer/tickets` (spec §8.12.5) — the issue response
 /// without the secret, plus who used it.
@@ -615,6 +871,60 @@ pub struct BindingView {
     pub audience: Option<String>,
 }
 
+/// What a key is tied to, if anything.
+///
+/// **The question a key listing exists to answer.** An unbound key is a bare
+/// bearer secret -- fine on a machine you own, wrong in a public repository --
+/// and an operator cannot act on that without being told which is which. Both
+/// `portal-server`'s `--provisioning-keys` and `portal-client`'s
+/// `--enrollment-keys` had the same classification written out by hand, the
+/// second commented "the same as on the server's side", over the same
+/// [`BindingView`] reached from two different records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bound<'a> {
+    /// Nothing. **Whoever holds the secret can use it.**
+    Nothing,
+    /// A workload identity token, and the subject it must carry when the answer
+    /// named one.
+    Oidc { subject: Option<&'a str> },
+    /// A kind this reading does not break out. **Not "unknown to this
+    /// build"**: `sub` and `tenant` are kinds it asks for
+    /// ([`ProvisioningBinding`]) and they land here, because nothing branches
+    /// on them -- every caller prints them as they arrived.
+    ///
+    /// Shown rather than guessed at: a binding nobody here recognises is still
+    /// a binding, and calling it unbound would be the one wrong answer.
+    Other(&'a str),
+}
+
+/// Read what a key is tied to.
+///
+/// **Absent and empty both read as [`Bound::Nothing`], and that is the point.**
+/// `binding` is `Option` because a key may have none, and `BindingView::kind`
+/// is `#[serde(default)]` so that an object arriving without a `type` cannot
+/// fail the whole response -- which means an empty string reaches here. Reading
+/// either as "bound to something" would tell an operator a bare bearer secret
+/// is safe to commit.
+///
+/// **One route reads absence differently, on purpose.** In a *listing* an
+/// absent `binding` means the key has none. In an *issue* response it means the
+/// answer did not say, which `portal-server` reports as "not reported" rather
+/// than as "nothing" -- an operator who passed `--binding-oidc` must not read
+/// silence as "it took". Those sites answer `None` themselves and call this
+/// with `Some`.
+pub fn bound_to(binding: Option<&BindingView>) -> Bound<'_> {
+    match binding {
+        None => Bound::Nothing,
+        Some(binding) => match binding.kind.as_str() {
+            "" | "none" => Bound::Nothing,
+            "oidc" => Bound::Oidc {
+                subject: binding.subject.as_deref(),
+            },
+            other => Bound::Other(other),
+        },
+    }
+}
+
 /// A Provisioning Key as issued (spec §8.13.3).
 ///
 /// **`key` is the only required field**, for the reason [`Ticket`] gives: it is
@@ -625,7 +935,7 @@ pub struct BindingView {
 /// The plaintext field is `key` here and `key_plaintext` on the Identity side.
 /// The two servers genuinely differ, and Identity's §8.8.2 says why it does not
 /// follow this one.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct ProvisioningKey {
     /// The secret, `pvk1_`-prefixed. **Store it now or lose it.**
     ///
@@ -667,6 +977,21 @@ pub struct ProvisioningKey {
     #[serde(default)]
     pub expires_at: Option<String>,
 }
+crate::redacted_debug!(
+    ProvisioningKey {
+        key_id,
+        owner_endpoint,
+        protocol,
+        grant_ttl,
+        max_live_grants,
+        live_grants,
+        redemption_count,
+        binding,
+        label,
+        created_at,
+        expires_at,
+    } redacting { key }
+);
 
 /// One row of `GET /v1/peer/provisioning-keys` (spec §8.13.7) — the issue
 /// response without the secret, plus how full the key is.
@@ -867,7 +1192,7 @@ pub fn proxy_authority(proxy_url: &str) -> &str {
 }
 
 /// A Ticket together with where to redeem it (spec §8.12.8).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct TicketTransfer {
     /// Where to redeem it: an **authority**, not a URL —
     /// `link.isekai.tools:6443`. The scheme is always `https`.
@@ -885,6 +1210,7 @@ pub struct TicketTransfer {
     /// The `tkt1_` secret.
     pub ticket: String,
 }
+crate::redacted_debug!(TicketTransfer { proxy } redacting { ticket });
 
 #[derive(Serialize, Deserialize)]
 struct TicketTransferBody {
@@ -1072,6 +1398,62 @@ pub struct RelayRttSample {
     pub rtt_ms: Option<u32>,
 }
 
+/// Which address families this Endpoint reached one relay in, over the socket
+/// mode a relay leg uses (the relay address-family plan §4-4).
+///
+/// **Only what was measured and worked.** An absent family means "nothing to
+/// say", never "that family is broken" — the initiator cannot produce negative
+/// evidence at all, because a sample that only resolves at `per_relay` is
+/// dropped by a collection deadline of half the budget, and a dropped sample is
+/// an omission. Building on positive evidence is what makes both ends' reports
+/// mean the same thing (plan Q3).
+///
+/// The control plane intersects the two ends' sets. An empty intersection means
+/// no family is named in the answer, which is today's behaviour (Q5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayReach {
+    pub dp_id: String,
+    /// `"v4"` / `"v6"`, in the wire spelling the control plane reads — the
+    /// same one `RelayInfo.family` comes back in.
+    ///
+    /// Strings rather than an enum because this module builds without the
+    /// `msquic` feature, while the `AddressFamily` the measurement produces
+    /// lives behind it. [`transport::family_name`](crate::transport::family_name)
+    /// is the one place that spelling is decided.
+    ///
+    /// Never empty on the wire. An entry with no families says nothing that
+    /// leaving the entry out does not, and invites a reader to take it as
+    /// "this relay works in neither family" — which a probe that timed out
+    /// does not establish. [`reach_field`] drops such entries, so the
+    /// invariant holds for every caller rather than only the careful ones.
+    pub families: Vec<String>,
+}
+
+/// The `relay_reach` field for a request body, or `None` to leave it out.
+///
+/// **Absent means "nothing to report this round", not "the set is empty".**
+/// Every route that carries this replaces the stored set, so a round that
+/// measured no families must not be able to erase a set measured earlier. That
+/// split is easy to reach: the round-trip probe runs on a connected socket and
+/// survives the QMUX/TCP fallback, while a family landing counts only on an
+/// unconnected binding — so a host that moves onto a network blocking UDP/443,
+/// or behind a CLAT translator, reports good round trips and no families at
+/// all. Sending `[]` there would cost the control plane a good set for the
+/// next half hour.
+///
+/// Entries with no families are dropped for the same reason one of them is not
+/// worth sending alone.
+fn reach_field(reach: &[RelayReach]) -> Option<serde_json::Value> {
+    let worth_sending: Vec<&RelayReach> = reach
+        .iter()
+        .filter(|entry| !entry.families.is_empty())
+        .collect();
+    if worth_sending.is_empty() {
+        return None;
+    }
+    Some(serde_json::json!(worth_sending))
+}
+
 /// A listener this Endpoint can reach or enrol on (spec §8.10).
 #[derive(Debug, Clone, Deserialize)]
 pub struct ReachableListener {
@@ -1174,6 +1556,18 @@ pub struct PeerConnection {
     /// its ticket may be redeemed.
     #[serde(default)]
     pub relay_base_url: Option<String>,
+    /// The address family to dial `relay_base_url` in — the **listener's** copy
+    /// of [`RelayInfo::family`].
+    ///
+    /// **Repeated rather than shared because a listener does not read
+    /// `relay`.** It takes `relay_base_url` from here (see that field), so a
+    /// family carried only inside `relay` would reach the initiator and leave
+    /// the listener dialling whatever it would have dialled anyway — and one
+    /// end choosing is worse than neither, since it is the *pair* that has to
+    /// match. The two are expected to agree; this one is what a listener acts
+    /// on (plan Q4).
+    #[serde(default)]
+    pub relay_family: Option<String>,
     /// The loopback FQDN the initiator should dial for the video QUIC over the
     /// relay, so it can validate the per-endpoint certificate the listener
     /// downloaded. `None` when the proxy has relay certificates disabled — in
@@ -1243,6 +1637,32 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
             .clone()
     }
 
+    /// The same Endpoint, over a transport to somewhere else.
+    ///
+    /// **For the routes that do not live at the control plane.** Since §8.14 a
+    /// relay leg's lease is replaced at the *data plane* — the relay's own host,
+    /// not the one that chose it — so renewing means addressing a different
+    /// origin with the same identity.
+    ///
+    /// **The token cell is shared, not copied.** Building a second client with
+    /// [`new`](Self::new) would give it a token frozen at that instant, and a
+    /// lease loop outlives an Endpoint Token by hours: it would start failing
+    /// with `token-expired` a few minutes in, on a route whose retries look
+    /// exactly like a relay being slow. Sharing means the renewal that replaces
+    /// the token on the control-plane client replaces it here too.
+    /// This client's transport, for a caller that needs to ask it something.
+    pub fn transport(&self) -> &T {
+        &self.transport
+    }
+
+    pub fn with_transport<U: ControlPlaneTransport>(&self, transport: U) -> ProxyClient<U> {
+        ProxyClient {
+            transport,
+            key: self.key.clone(),
+            endpoint_token: Arc::clone(&self.endpoint_token),
+        }
+    }
+
     /// Use `endpoint_token` from now on, on this client and every clone of it.
     ///
     /// The next request carries it; requests already in flight carry the old one
@@ -1286,6 +1706,85 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
         .await
     }
 
+    /// `POST /v1/public-listeners` (spec §7.7.1) — declare a UDP service
+    /// public.
+    ///
+    /// **Ask with the same key twice and you have one Listener, not two.**
+    /// The address is the user's, allocated once and kept — but a *Listener*
+    /// is a row, and each creation spends one of a per-Endpoint quota (default
+    /// 8) that expired rows occupy until the sweep. A daemon that re-creates on
+    /// every restart runs out after eight, and `429 listener-quota-exceeded`
+    /// becomes its permanent answer.
+    ///
+    /// So `idempotency_key` is not optional in practice. The server keeps the
+    /// first reply under it for 24 hours — longer than a Listener can live — so
+    /// a restart within a Listener's lifetime gets the Listener it already had,
+    /// and one after it has expired starts fresh, which is what starting fresh
+    /// means.
+    ///
+    /// **Give it something stable about what is being published**, never
+    /// something about this run: a fresh key per process makes every restart a
+    /// new row again, which is the failure it exists to prevent.
+    ///
+    /// `region` is a request, not a choice: the allocation is per user and
+    /// permanent, so it decides only the *first* one. Read
+    /// [`PublicListener::region`] for where the address actually is.
+    pub async fn create_public_listener(
+        &self,
+        target: &PublicTarget,
+        region: Option<&str>,
+        ttl: Option<u64>,
+        idempotency_key: Option<&str>,
+    ) -> Result<PublicListener, ProxyError> {
+        let body = serde_json::json!({ "target": target, "region": region, "ttl": ttl });
+        let extra: Vec<(String, String)> = idempotency_key
+            .map(|key| vec![("idempotency-key".to_owned(), key.to_owned())])
+            .unwrap_or_default();
+        self.request_json_with("POST", "/v1/public-listeners", to_vec(&body), &extra)
+            .await
+    }
+
+    /// `POST /v1/public-listeners/{id}/ticket` (phase-5 plan §4.3) — the paper
+    /// that lets this Endpoint bind its public address.
+    ///
+    /// **The main path, not an optimization.** Nothing is bundled with the
+    /// Listener, and a ticket runs 45 seconds against a Listener's day.
+    ///
+    /// **Ask once per bind attempt.** A ticket is single-use and the data
+    /// plane spends it only after the bind succeeds, so a retry wrapped around
+    /// the bind alone presents a spent or stale one and is refused — in a way
+    /// that reads as the data plane turning this Endpoint away.
+    ///
+    /// **It is also how a moved allocation is noticed.** The server reads the
+    /// ledger again here rather than repeating what the Listener's row
+    /// remembers, so a data plane that retired shows up as a different address
+    /// in the answer — the only place it can show up (plan §3.3).
+    pub async fn issue_public_listener_ticket(
+        &self,
+        listener_id: &str,
+    ) -> Result<PublicListener, ProxyError> {
+        self.request_json(
+            "POST",
+            &format!("/v1/public-listeners/{listener_id}/ticket"),
+            to_vec(&serde_json::json!({})),
+        )
+        .await
+    }
+
+    /// `DELETE /v1/public-listeners/{id}` (spec §7.7.2).
+    ///
+    /// **Stops the declaration, not the session.** A bound UDP session outlives
+    /// this; what ends it is the session closing. Deleting is what makes the
+    /// address stop being advertised and frees the quota slot.
+    pub async fn delete_public_listener(&self, listener_id: &str) -> Result<(), ProxyError> {
+        self.request_empty(
+            "DELETE",
+            &format!("/v1/public-listeners/{listener_id}"),
+            Vec::new(),
+        )
+        .await
+    }
+
     /// `POST /v1/peer-listeners/{id}/capability` (spec §8.4.1).
     pub async fn issue_capability(
         &self,
@@ -1313,7 +1812,7 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
         protocol: &str,
         candidates: &[Candidate],
     ) -> Result<PeerConnection, ProxyError> {
-        self.peer_connect_measured(capability, listener_id, protocol, candidates, &[])
+        self.peer_connect_measured(capability, listener_id, protocol, candidates, &[], &[])
             .await
     }
 
@@ -1331,14 +1830,18 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
         protocol: &str,
         candidates: &[Candidate],
         relay_rtt: &[RelayRttSample],
+        relay_reach: &[RelayReach],
     ) -> Result<PeerConnection, ProxyError> {
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "capability": capability,
             "listener_id": listener_id,
             "protocol": protocol,
             "candidates": candidates,
             "relay_rtt": relay_rtt,
         });
+        if let Some(reach) = reach_field(relay_reach) {
+            body["relay_reach"] = reach;
+        }
         self.request_json("POST", "/v1/peer/connect", to_vec(&body))
             .await
     }
@@ -1447,23 +1950,35 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
     /// it happens to be running. That is what lets an app be restarted without
     /// everyone it let in having to pair again.
     ///
-    /// `ttl` omitted means the grant stands until revoked, which is the usual
-    /// case — a dated grant is closer to a capability.
+    /// `expires_in` omitted means the grant stands until revoked, which is the
+    /// usual case — a dated grant is closer to a capability. Named for what it
+    /// dates rather than `ttl`, because `ttl` means the *Ticket's* lifetime one
+    /// method over and the two were confusable enough to need a guard in
+    /// `portal-server` (`check_grant_options`).
+    ///
+    /// **This is an upsert, and the [`Made`] says which happened.** A pair that
+    /// already has a grant for this protocol gets the existing id back with its
+    /// `created_at` untouched, and the `ttl` and `label` asked for here written
+    /// onto it. Whether that was a creation or an edit matters to a caller
+    /// keeping a ledger of what it made — adopting somebody else's grant means
+    /// revoking it later — and the status is the only place the answer appears.
     pub async fn create_grant(
         &self,
         allowed_endpoint: &str,
         protocol: &str,
-        ttl: Option<u64>,
+        expires_in: Option<u64>,
         label: Option<&str>,
-    ) -> Result<Grant, ProxyError> {
+    ) -> Result<(Grant, Made), ProxyError> {
         let body = serde_json::json!({
             "allowed_endpoint": allowed_endpoint,
             "protocol": protocol,
-            "ttl": ttl,
+            "ttl": expires_in,
             "label": label,
         });
-        self.request_json("POST", "/v1/peer/grants", to_vec(&body))
-            .await
+        let (grant, status) = self
+            .request_json_status_with("POST", "/v1/peer/grants", to_vec(&body), &[])
+            .await?;
+        Ok((grant, Made::from_status(status)))
     }
 
     /// `GET /v1/peer/grants` (spec §8.8.2) — everyone this Endpoint has let in.
@@ -1510,23 +2025,22 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
     /// has no listener in it (§8.8). So this works on a node that is about to
     /// be switched off, and the Ticket still does when it comes back.
     ///
-    /// `ttl` is how long the paper is good for and `grant_ttl` is how long
-    /// whoever presents it may stay. **They are different quantities and the
-    /// second is not capped by the first** — a 15-minute Ticket making a
-    /// 1-hour Grant is the intended case. Both clamp to 60..=86,400, and
-    /// `grant_ttl` cannot be unlimited: a Ticket is for one-off work, and work
-    /// that ends should not leave authorization behind.
+    /// The two lifetimes are [`TicketBounds`], which is where what each one
+    /// means is written down — they are different quantities, the second is not
+    /// capped by the first, and they used to be adjacent `Option<u64>`.
     pub async fn create_ticket(
         &self,
         protocol: &str,
-        ttl: Option<u64>,
-        grant_ttl: Option<u64>,
+        bounds: TicketBounds,
         label: Option<&str>,
     ) -> Result<Ticket, ProxyError> {
+        // **The wire is unchanged**: the struct is how a caller says it, not a
+        // change to what is said. `ttl` and `grant_ttl` are the field names
+        // §8.12.2 names, and a test pins them.
         let body = serde_json::json!({
             "protocol": protocol,
-            "ttl": ttl,
-            "grant_ttl": grant_ttl,
+            "ttl": bounds.ticket_ttl,
+            "grant_ttl": bounds.grant_ttl,
             "label": label,
         });
         self.request_json("POST", "/v1/peer/tickets", to_vec(&body))
@@ -1604,20 +2118,20 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
     pub async fn create_provisioning_key(
         &self,
         protocol: &str,
-        ttl: Option<u64>,
-        grant_ttl: Option<u64>,
-        max_live_grants: Option<u64>,
+        bounds: ProvisioningBounds,
         binding: Option<&ProvisioningBinding>,
         label: Option<&str>,
     ) -> Result<ProvisioningKey, ProxyError> {
+        // Omitted rather than null, unlike the Ticket route above, and the
+        // field names are §8.13.3's. The struct changes neither.
         let mut body = serde_json::json!({ "protocol": protocol });
-        if let Some(v) = ttl {
+        if let Some(v) = bounds.key_ttl {
             body["ttl"] = serde_json::json!(v);
         }
-        if let Some(v) = grant_ttl {
+        if let Some(v) = bounds.grant_ttl {
             body["grant_ttl"] = serde_json::json!(v);
         }
-        if let Some(v) = max_live_grants {
+        if let Some(v) = bounds.max_live_grants {
             body["max_live_grants"] = serde_json::json!(v);
         }
         if let Some(binding) = binding {
@@ -1897,17 +2411,28 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
     /// **The report replaces the set.** Anything this Endpoint reported before
     /// and leaves out now is forgotten, so a relay that dropped out of the pool
     /// cannot keep winning on a stale number.
+    /// **`reach` replaces the stored set when it is sent, and is left out
+    /// when there is nothing to report** — see [`reach_field`], which is what
+    /// keeps a round that measured no families from erasing one measured
+    /// earlier. The plan's §4-4 names only the initiator's two connect bodies,
+    /// but the control plane intersects *both* ends' family sets (§7.2-2) and
+    /// this PUT is the listener's only way to report, so it carries the field
+    /// too.
     pub async fn report_relay_rtt(
         &self,
         listener_id: &str,
         samples: &[RelayRttSample],
+        reach: &[RelayReach],
     ) -> Result<usize, ProxyError> {
         #[derive(Deserialize)]
         struct Stored {
             #[serde(default)]
             stored: usize,
         }
-        let body = serde_json::json!({ "relay_rtt": samples });
+        let mut body = serde_json::json!({ "relay_rtt": samples });
+        if let Some(reach) = reach_field(reach) {
+            body["relay_reach"] = reach;
+        }
         let stored: Stored = self
             .request_json(
                 "PUT",
@@ -1926,7 +2451,7 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
         protocol: &str,
         candidates: &[Candidate],
     ) -> Result<PeerConnection, ProxyError> {
-        self.peer_connect_with_grant_measured(listener_id, protocol, candidates, &[])
+        self.peer_connect_with_grant_measured(listener_id, protocol, candidates, &[], &[])
             .await
     }
 
@@ -1938,13 +2463,17 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
         protocol: &str,
         candidates: &[Candidate],
         relay_rtt: &[RelayRttSample],
+        relay_reach: &[RelayReach],
     ) -> Result<PeerConnection, ProxyError> {
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "listener_id": listener_id,
             "protocol": protocol,
             "candidates": candidates,
             "relay_rtt": relay_rtt,
         });
+        if let Some(reach) = reach_field(relay_reach) {
+            body["relay_reach"] = reach;
+        }
         self.request_json("POST", "/v1/peer/connect", to_vec(&body))
             .await
     }
@@ -2044,7 +2573,18 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
         path: &str,
         body: Vec<u8>,
     ) -> Result<HttpResponse, ProxyError> {
-        let headers = self.auth_headers(method, path, &body);
+        self.send_with(method, path, body, &[]).await
+    }
+
+    async fn send_with(
+        &self,
+        method: &str,
+        path: &str,
+        body: Vec<u8>,
+        extra: &[(String, String)],
+    ) -> Result<HttpResponse, ProxyError> {
+        let mut headers = self.auth_headers(method, path, &body);
+        headers.extend_from_slice(extra);
         self.transport
             .send(method, path, &headers, body)
             .await
@@ -2079,9 +2619,47 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
         path: &str,
         body: Vec<u8>,
     ) -> Result<R, ProxyError> {
-        let resp = self.send(method, path, body).await?;
+        self.request_json_with(method, path, body, &[]).await
+    }
+
+    /// As [`request_json`](Self::request_json), with headers of the caller's
+    /// own.
+    ///
+    /// **Not covered by the PoP signature**, which is over the method, the path
+    /// and the body (§8.0). That is the right shape for what goes here — an
+    /// `Idempotency-Key` is the server's bookkeeping and changes nothing about
+    /// what is being asked for — but it does mean these headers prove nothing,
+    /// so nothing that has to be proven belongs in one.
+    async fn request_json_with<R: for<'de> Deserialize<'de>>(
+        &self,
+        method: &str,
+        path: &str,
+        body: Vec<u8>,
+        extra: &[(String, String)],
+    ) -> Result<R, ProxyError> {
+        self.request_json_status_with(method, path, body, extra)
+            .await
+            .map(|(value, _status)| value)
+    }
+
+    /// As [`request_json_with`](Self::request_json_with), keeping the status.
+    ///
+    /// **Only the routes that upsert have any use for it.** Everywhere else a
+    /// success status says nothing a caller can act on, which is why
+    /// [`request_json_with`] drops it — but on `POST /v1/peer/grants` it is the
+    /// difference between having created a grant and having edited somebody
+    /// else's, and nothing else in the answer states that (see [`Made`]).
+    async fn request_json_status_with<R: for<'de> Deserialize<'de>>(
+        &self,
+        method: &str,
+        path: &str,
+        body: Vec<u8>,
+        extra: &[(String, String)],
+    ) -> Result<(R, u16), ProxyError> {
+        let resp = self.send_with(method, path, body, extra).await?;
         if (200..300).contains(&resp.status) {
-            serde_json::from_slice(&resp.body).map_err(ProxyError::Decode)
+            let value = serde_json::from_slice(&resp.body).map_err(ProxyError::Decode)?;
+            Ok((value, resp.status))
         } else {
             Err(problem_error(&resp))
         }
@@ -2186,7 +2764,7 @@ mod tests {
     #[tokio::test]
     async fn peer_connect_reads_the_relay_ticket() {
         let resp = r#"{"connection_id":"conn_1","state":"relay","listener_id":"pl_1",
-            "protocol":"isekai-validator-v1","peer_endpoint":"ep:B",
+            "protocol":"isekai-camera-v1","peer_endpoint":"ep:B",
             "relay":{"masque_uri":"https://p/x/","session_id":"sess_1"},
             "ticket":{"ticket":"eyJ.JWT.sig","role":"initiator",
                       "expires_at":"2026-07-13T08:40:45Z",
@@ -2194,7 +2772,7 @@ mod tests {
             "peer_candidates":[],"created_at":"t","expires_at":"t"}"#;
         let (client, _key) = client(MockTransport::with_response(201, resp));
         let conn = client
-            .peer_connect("cap_x", "pl_1", "isekai-validator-v1", &[])
+            .peer_connect("cap_x", "pl_1", "isekai-camera-v1", &[])
             .await
             .unwrap();
         let ticket = conn.ticket.expect("a proxy with §8.14 sends one");
@@ -2209,15 +2787,144 @@ mod tests {
     #[tokio::test]
     async fn a_connect_response_without_a_ticket_still_parses() {
         let resp = r#"{"connection_id":"conn_1","state":"relay","listener_id":"pl_1",
-            "protocol":"isekai-validator-v1","peer_endpoint":"ep:B",
+            "protocol":"isekai-camera-v1","peer_endpoint":"ep:B",
             "relay":{"masque_uri":"https://p/x/","session_id":"sess_1"},
             "peer_candidates":[],"created_at":"t","expires_at":"t"}"#;
         let (client, _key) = client(MockTransport::with_response(201, resp));
         let conn = client
-            .peer_connect("cap_x", "pl_1", "isekai-validator-v1", &[])
+            .peer_connect("cap_x", "pl_1", "isekai-camera-v1", &[])
             .await
             .unwrap();
         assert!(conn.ticket.is_none());
+    }
+
+    /// **A public `relay` carries no `session_id`, and that has to parse.**
+    /// The field was a required `String`, so the answer this whole route
+    /// exists to give could not be read at all — the server omits it, because
+    /// a public address has no second half to meet.
+    #[tokio::test]
+    async fn a_public_ticket_names_a_data_plane_and_no_session() {
+        let resp = r#"{"listener_id":"ul_1","owner_endpoint":"ep:C","visibility":"public",
+            "public_address":{"hostname":"udp-ap1.isekai.tools","ip":"203.0.113.9","port":10042},
+            "region":"ap-northeast-1",
+            "relay":{"masque_uri":"https://dp1.example:8443/.well-known/masque/udp/%2A/%2A/",
+                     "dp_id":"dp1abc","spki_sha256":["aGFzaA"]},
+            "ticket":{"ticket":"eyJ.JWT.sig","role":"public",
+                      "expires_at":"t","lease_expires_at":"t2"},
+            "status":"active","created_at":"c","expires_at":"e"}"#;
+        let (client, key) = client(MockTransport::with_response(200, resp));
+        let listener = client.issue_public_listener_ticket("ul_1").await.unwrap();
+
+        let relay = listener.relay.expect("a data plane was named");
+        assert_eq!(relay.dp_id.as_deref(), Some("dp1abc"));
+        assert_eq!(relay.session_id, None, "there is no session to meet on");
+        let ticket = listener.ticket.expect("a ticket");
+        assert_eq!(ticket.role, RelayRole::Public);
+        assert_eq!(listener.public_address.port, 10042);
+        assert_eq!(
+            listener.public_address.hostname.as_deref(),
+            Some("udp-ap1.isekai.tools"),
+            "the name has nowhere else to come from: the data plane reports a SocketAddr",
+        );
+        assert_eq!(listener.region.as_deref(), Some("ap-northeast-1"));
+
+        let calls = client.transport.calls.lock().unwrap();
+        let (method, path, headers, _) = calls.last().unwrap();
+        assert_eq!(
+            (method.as_str(), path.as_str()),
+            ("POST", "/v1/public-listeners/ul_1/ticket")
+        );
+        assert_eq!(
+            header(headers, pop::HEADER_ENDPOINT_ID),
+            Some(key.endpoint_id().as_str()),
+        );
+    }
+
+    /// **No `relay` means the control plane's own data path**, which needs no
+    /// ticket — and creation never carries one anyway.
+    #[tokio::test]
+    async fn a_listener_on_the_control_plane_names_neither() {
+        let resp = r#"{"listener_id":"ul_2","owner_endpoint":"ep:C","visibility":"public",
+            "public_address":{"ip":"203.0.113.1","port":10007},
+            "status":"active","created_at":"c","expires_at":"e"}"#;
+        let (client, _key) = client(MockTransport::with_response(201, resp));
+        let listener = client
+            .create_public_listener(
+                &PublicTarget {
+                    host: "127.0.0.1".into(),
+                    port: 51820,
+                },
+                Some("ap-northeast-1"),
+                Some(3600),
+                Some("publish:127.0.0.1:51820"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            listener.relay.is_none(),
+            "this control plane holds the port"
+        );
+        assert!(
+            listener.ticket.is_none(),
+            "creation is idempotent; it bundles none"
+        );
+        assert!(listener.public_address.hostname.is_none());
+        assert!(listener.region.is_none(), "not an echo of the request");
+
+        let calls = client.transport.calls.lock().unwrap();
+        let (method, path, headers, body) = calls.last().unwrap();
+        assert_eq!(
+            (method.as_str(), path.as_str()),
+            ("POST", "/v1/public-listeners")
+        );
+        let sent: serde_json::Value = serde_json::from_slice(body).unwrap();
+        assert_eq!(sent["target"]["host"], "127.0.0.1");
+        assert_eq!(sent["target"]["port"], 51820);
+        assert_eq!(sent["region"], "ap-northeast-1");
+        // **Without this, a restart is a second Listener.** Eight of those and
+        // the Endpoint cannot publish again.
+        assert_eq!(
+            header(headers, "idempotency-key"),
+            Some("publish:127.0.0.1:51820"),
+        );
+    }
+
+    /// **It is not sent when there is none**, rather than sent empty — an empty
+    /// key is a key, and the server would cache one reply under it for every
+    /// caller that omitted one.
+    #[tokio::test]
+    async fn no_idempotency_key_means_no_header() {
+        let resp = r#"{"listener_id":"ul_3","owner_endpoint":"ep:C","visibility":"public",
+            "public_address":{"ip":"203.0.113.1","port":10007},
+            "status":"active","created_at":"c","expires_at":"e"}"#;
+        let (client, _key) = client(MockTransport::with_response(201, resp));
+        client
+            .create_public_listener(
+                &PublicTarget {
+                    host: "127.0.0.1".into(),
+                    port: 51820,
+                },
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let calls = client.transport.calls.lock().unwrap();
+        let (_, _, headers, _) = calls.last().unwrap();
+        assert!(header(headers, "idempotency-key").is_none());
+    }
+
+    #[tokio::test]
+    async fn deleting_a_public_listener_hits_its_path() {
+        let (client, _key) = client(MockTransport::with_response(204, ""));
+        client.delete_public_listener("ul_1").await.unwrap();
+        let calls = client.transport.calls.lock().unwrap();
+        let (method, path, _, _) = calls.last().unwrap();
+        assert_eq!(
+            (method.as_str(), path.as_str()),
+            ("DELETE", "/v1/public-listeners/ul_1")
+        );
     }
 
     /// Both relay-ticket calls go where §8.14 says, and carry a PoP over the
@@ -2273,7 +2980,7 @@ mod tests {
     #[tokio::test]
     async fn peer_connect_signs_and_parses() {
         let resp = r#"{"connection_id":"conn_1","state":"relay","listener_id":"pl_1",
-            "protocol":"isekai-validator-v1","peer_endpoint":"ep:B",
+            "protocol":"isekai-camera-v1","peer_endpoint":"ep:B",
             "relay":{"masque_uri":"https://p/.well-known/masque/udp/relay/sess_1/","session_id":"sess_1"},
             "peer_candidates":[],"created_at":"t","expires_at":"t"}"#;
         let (client, key) = client(MockTransport::with_response(201, resp));
@@ -2284,12 +2991,12 @@ mod tests {
             port: 41000,
         }];
         let conn = client
-            .peer_connect("cap_x", "pl_1", "isekai-validator-v1", &candidates)
+            .peer_connect("cap_x", "pl_1", "isekai-camera-v1", &candidates)
             .await
             .unwrap();
         assert_eq!(conn.connection_id, "conn_1");
         assert_eq!(conn.state, "relay");
-        assert_eq!(conn.relay.unwrap().session_id, "sess_1");
+        assert_eq!(conn.relay.unwrap().session_id.as_deref(), Some("sess_1"));
 
         // The request carried the Endpoint Token and a PoP over POST /v1/peer/connect.
         let calls = client.transport.calls.lock().unwrap();
@@ -2305,6 +3012,288 @@ mod tests {
         let sent: serde_json::Value = serde_json::from_slice(body).unwrap();
         assert_eq!(sent["capability"], "cap_x");
         assert_eq!(sent["candidates"][0]["type"], "srflx");
+    }
+
+    fn reach(dp_id: &str, families: &[&str]) -> RelayReach {
+        RelayReach {
+            dp_id: dp_id.to_owned(),
+            families: families.iter().map(|f| (*f).to_owned()).collect(),
+        }
+    }
+
+    /// All three report paths carry it, which the plan's §4-4 does not say:
+    /// it names the initiator's two connect bodies, but the control plane
+    /// intersects *both* ends' sets (§7.2-2) and the listener's only way to
+    /// report is the PUT. Miss one and the intersection is empty forever on
+    /// that side, which looks exactly like "no common family" and is not.
+    #[tokio::test]
+    async fn every_report_path_carries_the_family_sets() {
+        let connect = r#"{"connection_id":"pc_1","state":"relay","listener_id":"ln_1",
+            "protocol":"mjpeg","peer_endpoint":"ep:B","peer_candidates":[],
+            "created_at":"t","expires_at":"t"}"#;
+
+        let (by_capability, _key) = client(MockTransport::with_response(201, connect));
+        by_capability
+            .peer_connect_measured(
+                "cap",
+                "ln_1",
+                "mjpeg",
+                &[],
+                &[],
+                &[reach("dp_1", &["v6", "v4"])],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            last_body(&by_capability)["relay_reach"],
+            serde_json::json!([{ "dp_id": "dp_1", "families": ["v6", "v4"] }]),
+            "the capability connect body"
+        );
+
+        let (by_grant, _key) = client(MockTransport::with_response(201, connect));
+        by_grant
+            .peer_connect_with_grant_measured("ln_1", "mjpeg", &[], &[], &[reach("dp_2", &["v4"])])
+            .await
+            .unwrap();
+        assert_eq!(
+            last_body(&by_grant)["relay_reach"],
+            serde_json::json!([{ "dp_id": "dp_2", "families": ["v4"] }]),
+            "the grant connect body"
+        );
+
+        let (listener, _key) = client(MockTransport::with_response(200, r#"{"stored":1}"#));
+        listener
+            .report_relay_rtt("ln_1", &[], &[reach("dp_3", &["v6"])])
+            .await
+            .unwrap();
+        assert_eq!(
+            last_body(&listener)["relay_reach"],
+            serde_json::json!([{ "dp_id": "dp_3", "families": ["v6"] }]),
+            "the listener's PUT"
+        );
+    }
+
+    /// Nothing measured leaves the field **out**, because every route that
+    /// carries it replaces the stored set: `[]` would erase a set measured on
+    /// an earlier round. The split is routine rather than exotic — the
+    /// round-trip probe runs on a connected socket and survives the QMUX/TCP
+    /// fallback, while a family landing counts only on an unconnected binding,
+    /// so a host behind a CLAT translator reports good round trips and no
+    /// families at all.
+    #[tokio::test]
+    async fn nothing_measured_leaves_the_field_out() {
+        let (listener, _key) = client(MockTransport::with_response(200, r#"{"stored":0}"#));
+        listener.report_relay_rtt("ln_1", &[], &[]).await.unwrap();
+        let sent = last_body(&listener);
+        assert!(
+            sent.get("relay_reach").is_none(),
+            "absent is 'nothing to report'; [] would be 'the set is empty'"
+        );
+        assert!(
+            sent.get("relay_rtt").is_some(),
+            "the round trips still go, and still mean what they did"
+        );
+    }
+
+    /// And an entry naming no families is dropped rather than sent, for every
+    /// caller — the invariant is documented on `RelayReach::families`, so it
+    /// is enforced here rather than only in the one caller that remembers.
+    #[tokio::test]
+    async fn an_entry_with_no_families_is_dropped_at_the_boundary() {
+        let (listener, _key) = client(MockTransport::with_response(200, r#"{"stored":1}"#));
+        listener
+            .report_relay_rtt(
+                "ln_1",
+                &[],
+                &[reach("dp_dark", &[]), reach("dp_fine", &["v4"])],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            last_body(&listener)["relay_reach"],
+            serde_json::json!([{ "dp_id": "dp_fine", "families": ["v4"] }])
+        );
+
+        let (only_dark, _key) = client(MockTransport::with_response(200, r#"{"stored":0}"#));
+        only_dark
+            .report_relay_rtt("ln_1", &[], &[reach("dp_dark", &[])])
+            .await
+            .unwrap();
+        assert!(
+            last_body(&only_dark).get("relay_reach").is_none(),
+            "nothing left worth sending is the same as nothing measured"
+        );
+    }
+
+    fn last_body(client: &ProxyClient<MockTransport>) -> serde_json::Value {
+        let calls = client.transport.calls.lock().unwrap();
+        let (_, _, _, body) = calls.last().unwrap();
+        serde_json::from_slice(body).unwrap()
+    }
+
+    /// Both halves of the answer are read, from the two places they live.
+    ///
+    /// A listener never looks at `relay`, so a family carried only there would
+    /// reach the initiator and leave the listener dialling whatever it would
+    /// have anyway — and one end choosing is worse than neither, because it is
+    /// the pair that has to match (plan Q4).
+    #[tokio::test]
+    async fn the_chosen_family_is_read_from_both_fields() {
+        let resp = r#"{"connection_id":"pc_1","state":"relay","listener_id":"ln_1",
+            "protocol":"mjpeg","peer_endpoint":"ep:B","peer_candidates":[],
+            "created_at":"t","expires_at":"t",
+            "relay":{"masque_uri":"https://p/","session_id":"s1","family":"v6"},
+            "relay_base_url":"https://dp1.example:8443","relay_family":"v6"}"#;
+        let (client, _key) = client(MockTransport::with_response(201, resp));
+        let connection = client
+            .peer_connect_measured("cap", "ln_1", "mjpeg", &[], &[], &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            connection.relay.as_ref().unwrap().family.as_deref(),
+            Some("v6"),
+            "the initiator's copy"
+        );
+        assert_eq!(
+            connection.relay_family.as_deref(),
+            Some("v6"),
+            "the listener's copy, which is the one it can reach"
+        );
+    }
+
+    /// And absent is the ordinary case: no common family, or a control plane
+    /// that does not choose at all. Both must parse, because a response this
+    /// cannot read costs the connection rather than the direct path.
+    #[tokio::test]
+    async fn a_response_that_names_no_family_still_parses() {
+        let resp = r#"{"connection_id":"pc_1","state":"relay","listener_id":"ln_1",
+            "protocol":"mjpeg","peer_endpoint":"ep:B","peer_candidates":[],
+            "created_at":"t","expires_at":"t",
+            "relay":{"masque_uri":"https://p/","session_id":"s1"},
+            "relay_base_url":"https://dp1.example:8443"}"#;
+        let (client, _key) = client(MockTransport::with_response(201, resp));
+        let connection = client
+            .peer_connect_measured("cap", "ln_1", "mjpeg", &[], &[], &[])
+            .await
+            .unwrap();
+        assert_eq!(connection.relay.as_ref().unwrap().family, None);
+        assert_eq!(connection.relay_family, None);
+    }
+
+    /// A dated grant sends the seconds asked for, and the caller reads the
+    /// expiry back from the response rather than assuming its own number —
+    /// the proxy clamps, so the two need not agree.
+    #[tokio::test]
+    async fn a_dated_grant_sends_its_ttl_and_reads_back_the_expiry() {
+        let body = r#"{"grant_id":"gr_2","owner_endpoint":"ep:B",
+            "allowed_endpoint":"ep:A","protocol":"mjpeg","origin":"manual",
+            "created_at":"2026-11-05T09:00:00Z","expires_at":"2026-11-05T10:00:00Z"}"#;
+        let (client, _key) = client(MockTransport::with_response(201, body));
+        let (grant, made) = client
+            .create_grant("ep:A", "mjpeg", Some(7200), None)
+            .await
+            .unwrap();
+        assert_eq!(made, Made::Fresh, "a 201 says this call made it");
+        assert_eq!(
+            grant.expires_at.as_deref(),
+            Some("2026-11-05T10:00:00Z"),
+            "the server's expiry, which is an hour where two were asked for"
+        );
+        let sent = last_body(&client);
+        assert_eq!(sent["ttl"], 7200, "the seconds asked for go on the wire");
+        assert!(sent["label"].is_null(), "no label means none is sent");
+    }
+    fn binding(kind: &str, subject: Option<&str>) -> BindingView {
+        BindingView {
+            kind: kind.to_owned(),
+            issuer: None,
+            subject: subject.map(str::to_owned),
+            audience: None,
+        }
+    }
+
+    /// **Absent, empty and `"none"` all mean a bare bearer secret.**
+    ///
+    /// The three are not interchangeable on the wire -- a key may have no
+    /// `binding` at all, and `kind` is `#[serde(default)]` so an object without
+    /// a `type` yields an empty string -- but they are the same answer to the
+    /// question a listing asks. Reading any of them as "bound to something"
+    /// would tell an operator a secret is safe to commit.
+    #[test]
+    fn nothing_absent_and_empty_all_read_as_unbound() {
+        assert_eq!(bound_to(None), Bound::Nothing);
+        assert_eq!(bound_to(Some(&binding("", None))), Bound::Nothing);
+        assert_eq!(bound_to(Some(&binding("none", None))), Bound::Nothing);
+    }
+
+    #[test]
+    fn an_oidc_binding_carries_its_subject_when_there_is_one() {
+        assert_eq!(
+            bound_to(Some(&binding(
+                "oidc",
+                Some("repo:acme/app:ref:refs/heads/main")
+            ))),
+            Bound::Oidc {
+                subject: Some("repo:acme/app:ref:refs/heads/main")
+            },
+        );
+        assert_eq!(
+            bound_to(Some(&binding("oidc", None))),
+            Bound::Oidc { subject: None },
+            "a binding whose subject the answer did not name is still bound",
+        );
+    }
+
+    /// **An unrecognised kind is not unbound.** A binding nobody here knows
+    /// about is still a binding, and calling it unbound is the one wrong answer
+    /// -- it would tell an operator to treat a tied key as a bare secret.
+    #[test]
+    fn an_unknown_kind_is_reported_rather_than_guessed_at() {
+        assert_eq!(
+            bound_to(Some(&binding("spiffe", Some("spiffe://acme/sa/app")))),
+            Bound::Other("spiffe"),
+        );
+    }
+
+    /// A create that upserts says so in its status, which is the whole reason
+    /// the status is kept here and nowhere else.
+    ///
+    /// **`created_at` cannot answer this.** The grant below reports being made
+    /// a minute ago, which the ledger's 30-second window would read as "already
+    /// there" — correct here by luck, and wrong for a fresh grant whose round
+    /// trip was slow. The `200` says it outright.
+    #[tokio::test]
+    async fn a_create_that_upserts_says_so_in_its_status() {
+        let body = r#"{"grant_id":"gr_3","owner_endpoint":"ep:B",
+            "allowed_endpoint":"ep:A","protocol":"mjpeg","origin":"manual",
+            "created_at":"2026-11-05T09:00:00Z"}"#;
+        let (client, _key) = client(MockTransport::with_response(200, body));
+        let (grant, made) = client
+            .create_grant("ep:A", "mjpeg", None, None)
+            .await
+            .unwrap();
+        assert_eq!(made, Made::Existing, "a 200 is the upsert answer");
+        assert_eq!(
+            grant.grant_id, "gr_3",
+            "and the existing id comes back, not a new one"
+        );
+    }
+
+    /// Any other success leaves the caller where it was.
+    ///
+    /// **Not a failure.** Which success status a route uses is the proxy's to
+    /// choose, and a reading the wire did not support is worse than no reading:
+    /// the ledger falls back to the age heuristic it used before this existed.
+    #[tokio::test]
+    async fn an_unexpected_success_status_reads_as_unknown() {
+        let body = r#"{"grant_id":"gr_4","owner_endpoint":"ep:B",
+            "allowed_endpoint":"ep:A","protocol":"mjpeg","origin":"manual"}"#;
+        let (client, _key) = client(MockTransport::with_response(202, body));
+        let (_grant, made) = client
+            .create_grant("ep:A", "mjpeg", None, None)
+            .await
+            .unwrap();
+        assert_eq!(made, Made::Unknown);
     }
 
     /// The shape of what goes out matters more than the plumbing: the server
@@ -2349,7 +3338,14 @@ mod tests {
             "created_at":"2026-08-28T08:30:00Z","expires_at":"2026-08-28T08:45:00Z"}"#;
         let (client, _key) = client(MockTransport::with_response(201, body));
         let ticket = client
-            .create_ticket("mjpeg", Some(900), Some(3600), Some("ci"))
+            .create_ticket(
+                "mjpeg",
+                TicketBounds {
+                    ticket_ttl: Some(900),
+                    grant_ttl: Some(3600),
+                },
+                Some("ci"),
+            )
             .await
             .unwrap();
         assert_eq!(ticket.ticket, "tkt1_secret");
@@ -2515,7 +3511,7 @@ mod tests {
             "allowed_endpoint":"ep:A","protocol":"mjpeg","origin":"manual",
             "created_at":"2026-08-02T09:00:00Z"}"#;
         let (client, _key) = client(MockTransport::with_response(201, body));
-        let grant = client
+        let (grant, _made) = client
             .create_grant("ep:A", "mjpeg", None, Some("phone"))
             .await
             .unwrap();
@@ -2531,6 +3527,15 @@ mod tests {
         assert_eq!(sent["allowed_endpoint"], "ep:A");
         assert_eq!(sent["protocol"], "mjpeg");
         assert!(sent["ttl"].is_null(), "no ttl means until revoked");
+        // **The label was passed and never checked.** A grant is the pair and
+        // the protocol; the label is the only part that is purely for whoever
+        // reads `--grants` later, which is exactly the part a silent drop
+        // would never be noticed in.
+        assert_eq!(sent["label"], "phone");
+        assert!(
+            sent.get("listener_id").is_none(),
+            "a grant authorizes reaching this Endpoint, not one of its listeners"
+        );
     }
 
     /// A line is not a chunk. The network splits the body wherever it likes, so
@@ -2755,7 +3760,7 @@ mod tests {
             "title":"Capability is invalid","status":403}"#;
         let (client, _key) = client(MockTransport::with_response(403, resp));
         let err = client
-            .peer_connect("bad", "pl_1", "isekai-validator-v1", &[])
+            .peer_connect("bad", "pl_1", "isekai-camera-v1", &[])
             .await
             .unwrap_err();
         match err {

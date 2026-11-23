@@ -27,11 +27,16 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use bytes::Bytes;
-use channel_masque::{CONNECT_UDP_BIND_PATH, H3Channel, MasqueClient, MasqueClientMode};
+use channel_masque::{
+    CONNECT_UDP_BIND_PATH, ForwardLimits, H3Channel, MasqueClient, MasqueClientMode,
+};
 /// Re-exported so a caller of [`BindSession::inbound_activity`] can name what it
 /// gets back, and one draining [`BindSession::events`] can match on them,
 /// without depending on the MASQUE crate directly.
 pub use channel_masque::{InboundActivity, MasqueClientEvent};
+// The hook lives in [`crate::datapath`], beside the other carrier. Named here
+// because `RelayOptions` below holds one.
+use crate::datapath::DatapathHook;
 use h3_util::msquic_async::H3MsQuicAsyncConnector;
 use h3_util::msquic_async::h3_msquic_async::msquic_async;
 use http::Uri;
@@ -44,12 +49,11 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tower::ServiceBuilder;
 use tower_http::auth::AddAuthorizationLayer;
-use tower_http::set_header::SetRequestHeaderLayer;
 
 use crate::endpoint::EndpointKey;
 use crate::observed::{ObservedAddressWatch, spawn_observed_address_watch};
 use crate::pop;
-use crate::transport::make_client_config;
+use crate::transport::{AddressFamily, Liveness, make_client_config};
 
 /// How a relay leg's underlying QUIC connection is set up.
 ///
@@ -73,6 +77,20 @@ pub struct RelayOptions {
     /// when the video connection has to share a binding with the leg — binding
     /// lookup is per-registration, so they must match.
     pub registration: Option<Arc<msquic_async::Registration>>,
+    /// Interpose on the inner-QUIC packets crossing this leg.
+    ///
+    /// **A test instrument, and nothing reads it from configuration** — there
+    /// is no flag, no TOML key and no environment variable that puts one here.
+    /// `docs/isekai_p2p_datapath_hook_plan.md` says why: a production binary
+    /// that can be told to drop packets is not a thing to have.
+    ///
+    /// It is on [`RelayOptions`] rather than passed separately because it is a
+    /// property of how this leg is set up, which is what this struct is for.
+    ///
+    /// **Only the dialled leg has somewhere to put one.** A leg opened for
+    /// listening runs `MasqueClientMode::Forward`, which does not go through
+    /// the bridge this hooks — see the plan's §1.1.
+    pub datapath_hook: Option<Arc<dyn DatapathHook>>,
 }
 
 /// Where a relay leg is actually dialled.
@@ -103,6 +121,17 @@ fn relay_target(masque: &Uri, proxy_url: &str, dp_id: Option<&str>) -> anyhow::R
     Ok(uri)
 }
 
+/// `scheme://authority` — a leg's destination with the path dropped, which is
+/// the base URL every route on that host hangs off.
+fn origin_of(uri: &Uri) -> String {
+    match (uri.scheme_str(), uri.authority()) {
+        (Some(scheme), Some(authority)) => format!("{scheme}://{authority}"),
+        // `relay_target` has already refused anything without both, so this is
+        // unreachable in practice; returning the whole URI beats panicking.
+        _ => uri.to_string(),
+    }
+}
+
 /// A URL we are about to open a QUIC connection to.
 ///
 /// **Checked here rather than left to the transport.** `h3-util` unwraps the
@@ -131,10 +160,23 @@ fn check_relay_uri(uri: &Uri) -> anyhow::Result<()> {
 fn relay_connector(
     uri: Uri,
     opts: &RelayOptions,
+    family: Option<AddressFamily>,
     shutdown: CancellationToken,
+    liveness: Liveness,
 ) -> anyhow::Result<(H3MsQuicAsyncConnector, ObservedAddressWatch)> {
-    let (registration, config) = make_client_config(opts.registration.clone(), false)?;
-    let (registration, config_qmux) = make_client_config(Some(registration), true)?;
+    let (registration, config) = make_client_config(opts.registration.clone(), false, liveness)?;
+    // **The second configuration is how a leg reaches a relay where UDP does
+    // not pass, and it is the only thing that makes that work.** `connect()`
+    // tries QUIC first and, if `start` fails and a QMUX configuration was
+    // given, dials the *same host and port* over TCP with ALPN `h3qx-01`
+    // instead. A relay serving QMUX on its own port is therefore reached with
+    // nothing to configure here and nothing to advertise: the fallback is the
+    // address it already has.
+    //
+    // So passing `None` -- which reads like tidying away a transport nothing
+    // mentions -- silently takes UDP-less deployments with it, and the symptom
+    // is a leg that will not bind on exactly the networks that needed it.
+    let (registration, config_qmux) = make_client_config(Some(registration), true, liveness)?;
     // The leg goes to the same proxy the control plane does, and gets the same
     // check: the certificate has to name the host dialled (#134).
     let host = uri.host().context("relay URI has no host")?.to_owned();
@@ -145,9 +187,61 @@ fn relay_connector(
         opts.unconnected,
         registration,
     )
-    .with_peer_certificate_callback(crate::hostname::refuse_other_hosts(host));
+    .with_peer_certificate_callback(crate::hostname::refuse_other_hosts(host))
+    // The same list the control-plane connection gets: an address the proxy
+    // cannot answer on is no more usable for a leg than for the control plane.
+    .with_local_address_policies(crate::local_address::current().as_policies());
     let (conn_tx, conn_rx) = mpsc::channel(4);
     let observed = spawn_observed_address_watch(conn_rx, shutdown);
+    // **The family the control plane chose for *both* ends** (plan Q6). It is
+    // applied here because this is where the connector is built, and inside
+    // `connect` is where an address is actually picked -- `bind.rs` never
+    // resolves anything itself.
+    //
+    // A preference, not a requirement: with nothing routable in the named
+    // family the connector still reaches the others. Right, and deliberately
+    // so -- the family was reported as usable at measurement time, so arriving
+    // here with it unusable means the route changed since, and reaching the
+    // relay matters more than reaching it in the agreed family. The cost is
+    // the direct path, which would not have formed either way.
+    //
+    // **And it is honoured only on an unconnected leg.** The connector picks
+    // the address only inside `if self.is_unconnected`; with a connected
+    // socket msquic resolves the host in `start` and the preference is never
+    // consulted. So a leg built with `RelayOptions { unconnected: false }` --
+    // `isekai-client-ffi` with migration off -- drops the agreed family while
+    // its peer honours it. Harmless, because such a leg has no direct path to
+    // line up anyway, but worth saying out loud rather than leaving a reader
+    // to find it upstream, and worth a line rather than nothing: "the family
+    // was agreed" and "the family was applied" are different facts and only
+    // one of them is visible from the response.
+    let connector = match family {
+        Some(family) if opts.unconnected => {
+            // The other half of the question `relay_family::chosen` logs: it
+            // says what was named, this says it reached the connector. A
+            // chosen family that is never applied looks exactly like one that
+            // was never named.
+            // `info!`, matching `relay_family::chosen`: its comment promises
+            // an operator need not raise the level on one end, and "a family
+            // was chosen" without "and applied" leaves exactly the gap this
+            // pair exists to close.
+            tracing::info!(?family, "dialling the relay in the agreed address family");
+            connector.with_preferred_address_family(family)
+        }
+        Some(family) => {
+            // `info!` too, and for the stronger reason: this is the arm
+            // where an agreed family is silently dropped while the peer
+            // honours it. At `debug!` an operator could see a family chosen
+            // and never learn it was not applied.
+            tracing::info!(
+                ?family,
+                "the control plane chose an address family, but this leg is on a connected \
+                 socket, which cannot honour it; it has no direct path either way"
+            );
+            connector
+        }
+        None => connector,
+    };
     Ok((connector.with_channel(conn_tx), observed))
 }
 
@@ -175,16 +269,82 @@ const RELAY_TICKET_HEADER: &str = "seera-relay-ticket";
 /// still binds the leg, on a single lease it will not renew. Only a proxy with
 /// the flag on refuses, and it says so with `relay-ticket-required` — which is
 /// the signal that this side is the one that needs upgrading, not the proxy.
-fn ticket_layer(
-    ticket: Option<&str>,
-) -> anyhow::Result<Option<SetRequestHeaderLayer<HeaderValue>>> {
+fn ticket_header(ticket: Option<&str>) -> anyhow::Result<Option<(HeaderName, HeaderValue)>> {
     let Some(ticket) = ticket else {
         return Ok(None);
     };
-    Ok(Some(SetRequestHeaderLayer::appending(
+    Ok(Some((
         HeaderName::from_static(RELAY_TICKET_HEADER),
         HeaderValue::from_str(ticket).context("relay ticket is not a valid header value")?,
     )))
+}
+
+/// Every header a bound-UDP request carries besides its bearer token.
+///
+/// **A value rather than a stack of layers**, because *which headers go out* is
+/// the contract with the data plane — it reads them to decide whether this is a
+/// relay leg or a public address — and a contract that can only be read by
+/// tracing a `ServiceBuilder` chain is one a test cannot hold. This is what the
+/// request gets, and what the tests below assert on.
+fn bound_udp_headers(
+    pop: &pop::PopHeaders,
+    kind: BoundUdp<'_>,
+    ticket: Option<&str>,
+) -> anyhow::Result<Vec<(HeaderName, HeaderValue)>> {
+    let mut headers = vec![
+        (
+            HeaderName::from_static(pop::HEADER_ENDPOINT_ID),
+            header_value(&pop.endpoint_id)?,
+        ),
+        (
+            HeaderName::from_static(pop::HEADER_POP_NONCE),
+            header_value(&pop.nonce)?,
+        ),
+        (
+            HeaderName::from_static(pop::HEADER_POP_TIMESTAMP),
+            header_value(&pop.timestamp)?,
+        ),
+        (
+            HeaderName::from_static(pop::HEADER_POP_SIGNATURE),
+            header_value(&pop.signature)?,
+        ),
+    ];
+    headers.extend(temporary_address_header(kind));
+    headers.extend(session_header(kind)?);
+    headers.extend(ticket_header(ticket)?);
+    Ok(headers)
+}
+
+/// `Seera-Signaling-Session-Id`, for the session a leg meets its peer on.
+///
+/// **Absent for a public address**, and that absence is what the data plane
+/// reads to know which of the two it is looking at.
+fn session_header(kind: BoundUdp<'_>) -> anyhow::Result<Option<(HeaderName, HeaderValue)>> {
+    let (BoundUdp::BindLeg { connection_id } | BoundUdp::ConnectLeg { connection_id }) = kind
+    else {
+        return Ok(None);
+    };
+    Ok(Some((
+        HeaderName::from_static("seera-signaling-session-id"),
+        HeaderValue::from_str(connection_id).context("invalid connection id header value")?,
+    )))
+}
+
+/// `Seera-Prefer-Temporary-Public-Address`, which asks a proxy not to spend
+/// this user's allocated address on a leg.
+///
+/// **Absent for a public address, where the allocated one is the whole point.**
+/// A co-located control plane reads this header and binds an ephemeral port
+/// instead — the session comes up, and the `ip:port` handed to the world
+/// receives nothing.
+fn temporary_address_header(kind: BoundUdp<'_>) -> Option<(HeaderName, HeaderValue)> {
+    match kind {
+        BoundUdp::BindLeg { .. } => Some((
+            HeaderName::from_static("seera-prefer-temporary-public-address"),
+            HeaderValue::from_static("?1"),
+        )),
+        BoundUdp::ConnectLeg { .. } | BoundUdp::PublicAddress => None,
+    }
 }
 
 /// A running MASQUE bind session. Keep it alive for the duration of the P2P
@@ -193,6 +353,7 @@ pub struct BindSession {
     /// MASQUE client events (e.g. [`MasqueClientEvent::PublicAddresses`] carries
     /// this Endpoint's edge/relay addresses).
     pub events: mpsc::Receiver<MasqueClientEvent>,
+    relay_origin: String,
     observed: ObservedAddressWatch,
     inbound: InboundActivity,
     shutdown: CancellationToken,
@@ -200,6 +361,20 @@ pub struct BindSession {
 }
 
 impl BindSession {
+    /// The origin this leg was actually dialled at.
+    ///
+    /// **The leg reports it rather than the caller recomputing it**, because
+    /// the routes that act on a leg have to reach the same host it went to.
+    /// Since §8.14 `POST /v1/relay/sessions/{id}/renew` is served by the *data
+    /// plane* — the relay's own host — while the ticket it spends comes from
+    /// the control plane. Working the destination out a second time somewhere
+    /// else is how those two drift apart, and they fail quietly when they do:
+    /// the control plane answers `connection-not-found` for a leg it does not
+    /// hold, which reads as "the relay forgot us" rather than "you asked the
+    /// wrong host".
+    pub fn relay_origin(&self) -> &str {
+        &self.relay_origin
+    }
     /// How the proxy sees this leg — `None` until the first report arrives.
     ///
     /// The server advertises this pair to the video connection via
@@ -295,42 +470,202 @@ pub async fn open_bind_session(
     forward_to: SocketAddr,
     ticket: Option<&str>,
     opts: RelayOptions,
+    // The family the control plane chose for both ends, from
+    // `PeerConnection::relay_family` (a listener) or `RelayInfo::family` (an
+    // initiator). An **argument rather than a `RelayOptions` field** because
+    // it arrives in the connect *response*, while the options are built by the
+    // application before that (plan Q7). `None` is today's behaviour.
+    family: Option<AddressFamily>,
+) -> anyhow::Result<BindSession> {
+    open_bound_udp(
+        target,
+        endpoint_token,
+        key,
+        BoundUdp::BindLeg { connection_id },
+        forward_to,
+        ticket,
+        opts,
+        family,
+    )
+    .await
+}
+
+/// Open the bound-UDP session that **is** this Endpoint's public address
+/// (`docs/public_listener_client_plan.md` P1).
+///
+/// The socket the proxy binds for this session is the `ip:port` the control
+/// plane allocated, so traffic anyone sends there arrives here and is forwarded
+/// to `forward_to`. `target` is the `masque_uri` from the Listener's `relay`,
+/// and `ticket` the paper from `POST /v1/public-listeners/{id}/ticket`.
+///
+/// **`ticket` is `None` only when the address is on the control plane's own
+/// data path** — the case where the Listener's answer carried no `relay`.
+/// There the session's Endpoint Token is the authorization. A registered data
+/// plane with no ticket has nothing to check and refuses.
+///
+/// # Why this is not [`open_bind_session`] with an argument
+///
+/// A relay leg and a public address differ by two headers, and **the data
+/// plane decides which request it is looking at from them** rather than from
+/// the ticket inside — deliberately, so that a ticket cannot choose the check
+/// applied to it. Reusing the leg's call would send both:
+///
+/// | header | on a leg | here |
+/// | --- | --- | --- |
+/// | `Seera-Signaling-Session-Id` | names the session the two halves meet on | **absent.** Sending it puts a `role: public` ticket on the leg path, which refuses it |
+/// | `Seera-Prefer-Temporary-Public-Address` | asks for a throwaway address | **absent.** Sending it makes a co-located control plane skip the allocated port and bind an ephemeral one — **the bind succeeds and the published address is dead** |
+///
+/// The second is the reason this is a separate function rather than an
+/// `Option` parameter: it fails silently, on the deployment that looks
+/// simplest.
+///
+/// # One socket per stranger
+///
+/// **This session forwards in [`MasqueClientMode::Forward`], which binds a
+/// fresh local UDP socket for every remote source address it sees.** On a relay
+/// leg that is one peer. Here the senders are whoever finds the address: a
+/// single datagram from an unseen source port costs a socket and a context id,
+/// nothing authenticates the sender — the ticket checked at bind time says
+/// nothing about who sends afterwards — and there is no cap and no eviction.
+///
+/// **A caller that publishes an address before that is bounded is publishing a
+/// way to exhaust its own file descriptors.** The cap is P1b of
+/// `docs/public_listener_client_plan.md`, and it is deliberately ordered before
+/// anything that uses this: binding an address and exposing it are the same
+/// act.
+#[allow(clippy::too_many_arguments)]
+pub async fn open_public_bind_session(
+    target: &str,
+    endpoint_token: &str,
+    key: &EndpointKey,
+    forward_to: SocketAddr,
+    ticket: Option<&str>,
+    opts: RelayOptions,
+    // The family the control plane chose for both ends, from
+    // `PeerConnection::relay_family` (a listener) or `RelayInfo::family` (an
+    // initiator). An **argument rather than a `RelayOptions` field** because
+    // it arrives in the connect *response*, while the options are built by the
+    // application before that (plan Q7). `None` is today's behaviour.
+    family: Option<AddressFamily>,
+) -> anyhow::Result<BindSession> {
+    open_bound_udp(
+        target,
+        endpoint_token,
+        key,
+        BoundUdp::PublicAddress,
+        forward_to,
+        ticket,
+        opts,
+        family,
+    )
+    .await
+}
+
+/// How many senders a public address keeps sockets for, and how long one may
+/// stay quiet.
+///
+/// **Numbers chosen to be wrong in the cheaper direction.** Too low evicts
+/// somebody real; too high leaves more sockets held than anyone needed. So the
+/// count sits far above any audience this is likely to have — a service behind
+/// one published address — and the idle window far above the gap between two
+/// datagrams of a conversation that is still going, while staying short enough
+/// that a flood is reclaimed in minutes rather than for the life of the
+/// session.
+const PUBLIC_FORWARD_LIMITS: ForwardLimits = ForwardLimits {
+    max_sources: 1024,
+    idle_after: std::time::Duration::from_secs(120),
+};
+
+/// Which of the two bound-UDP sessions is being opened.
+///
+/// **The difference is a pair of headers, and it is not a flag.** What the data
+/// plane does with the request turns entirely on them, so naming the two cases
+/// is what keeps a caller from asking for one and sending the other's headers.
+#[derive(Debug, Clone, Copy)]
+enum BoundUdp<'a> {
+    /// The listener's side of a relay, which binds the edge itself.
+    ///
+    /// **Asks not to be given the user's allocated public address**: this leg
+    /// wants any address that carries packets, and spending the one somebody
+    /// published would take it away from what published it.
+    BindLeg { connection_id: &'a str },
+    /// The initiator's side, which binds an ephemeral loopback source.
+    ///
+    /// **Asks for nothing about public addresses**, because it is not being
+    /// given one — the question does not arise on this side, and asking anyway
+    /// would be a header sent on the strength of a shared code path rather
+    /// than of what the request is.
+    ConnectLeg { connection_id: &'a str },
+    /// A public address, which meets nobody and is exactly the allocated one.
+    PublicAddress,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn open_bound_udp(
+    target: &str,
+    endpoint_token: &str,
+    key: &EndpointKey,
+    kind: BoundUdp<'_>,
+    forward_to: SocketAddr,
+    ticket: Option<&str>,
+    opts: RelayOptions,
+    // The family the control plane chose for both ends, from
+    // `PeerConnection::relay_family` (a listener) or `RelayInfo::family` (an
+    // initiator). An **argument rather than a `RelayOptions` field** because
+    // it arrives in the connect *response*, while the options are built by the
+    // application before that (plan Q7). `None` is today's behaviour.
+    family: Option<AddressFamily>,
 ) -> anyhow::Result<BindSession> {
     let uri: Uri = target.parse().context("invalid proxy target URI")?;
+    // **Checked on this path too.** The connect leg validates inside
+    // `relay_target`; a bind leg took its target on trust, so a
+    // `relay_base_url` with no scheme — which `http::Uri` parses happily from
+    // `host:port` — got as far as the transport and failed per request. The
+    // lease loop would then retry that to the lapse, arriving at the same
+    // ten-minute death this route was fixed to avoid.
+    check_relay_uri(&uri)?;
+    // Taken before the URI is moved into the connector.
+    let dialled = origin_of(&uri);
     let pop = sign_connect_udp(key, CONNECT_UDP_BIND_PATH);
     let shutdown = CancellationToken::new();
-    let (connector, observed) = relay_connector(uri.clone(), &opts, shutdown.clone())?;
+    // **A leg notices its own death in time; a published address is left
+    // patient.** `transport::RELAY_LEG_KEEPALIVE` has both halves of why: a
+    // peer connection riding on a leg closes itself sixteen seconds after its
+    // relay path stops being acknowledged, so the leg has to be inside that —
+    // while a public address has nothing that would replace it and nothing
+    // watching, so the same impatience would only end it sooner.
+    let liveness = match kind {
+        BoundUdp::PublicAddress => Liveness::PublicAddress,
+        BoundUdp::BindLeg { .. } | BoundUdp::ConnectLeg { .. } => Liveness::RelayLeg,
+    };
+    let (connector, observed) =
+        relay_connector(uri.clone(), &opts, family, shutdown.clone(), liveness)?;
+    // **Armed against this function being dropped before it returns.**
+    // Everything below runs on a task of its own holding a clone of
+    // `shutdown`, and a `CancellationToken` does not cancel when a clone is
+    // dropped — so a caller whose future is cancelled while this waits on
+    // `ready_rx` would leave an established leg, its socket and its H3
+    // connection running with nothing left in the process that could stop
+    // them. Disarmed on the way out, where the token moves into the handle
+    // that owns it from then on.
+    let armed = shutdown.clone().drop_guard();
     let channel = H3Channel::<_, StreamBody<ReceiverStream<Result<Frame<Bytes>, Infallible>>>>::new(
         connector, uri, None,
     );
 
+    // **One list, and the request carries exactly it.** Spelled as a stack of
+    // layers, what a request sends could only be checked by reading the stack —
+    // so a test could confirm every helper and still miss a layer deleted from
+    // the assembly, which is the one edit that turns a public bind into a leg.
+    let headers = bound_udp_headers(&pop, kind, ticket)?;
     let channel = ServiceBuilder::new()
         .layer(AddAuthorizationLayer::bearer(endpoint_token))
-        .layer(SetRequestHeaderLayer::appending(
-            HeaderName::from_static(pop::HEADER_ENDPOINT_ID),
-            header_value(&pop.endpoint_id)?,
-        ))
-        .layer(SetRequestHeaderLayer::appending(
-            HeaderName::from_static(pop::HEADER_POP_NONCE),
-            header_value(&pop.nonce)?,
-        ))
-        .layer(SetRequestHeaderLayer::appending(
-            HeaderName::from_static(pop::HEADER_POP_TIMESTAMP),
-            header_value(&pop.timestamp)?,
-        ))
-        .layer(SetRequestHeaderLayer::appending(
-            HeaderName::from_static(pop::HEADER_POP_SIGNATURE),
-            header_value(&pop.signature)?,
-        ))
-        .layer(SetRequestHeaderLayer::appending(
-            HeaderName::from_static("seera-prefer-temporary-public-address"),
-            HeaderValue::from_static("?1"),
-        ))
-        .layer(SetRequestHeaderLayer::appending(
-            HeaderName::from_static("seera-signaling-session-id"),
-            HeaderValue::from_str(connection_id).context("invalid connection id header value")?,
-        ))
-        .option_layer(ticket_layer(ticket)?)
+        .map_request(move |mut req: http::Request<_>| {
+            for (name, value) in headers.clone() {
+                req.headers_mut().append(name, value);
+            }
+            req
+        })
         .service(channel);
 
     let (out_tx, out_rx) = mpsc::channel(32);
@@ -341,6 +676,25 @@ pub async fn open_bind_session(
     // Built here rather than in the task so its activity handle can be taken
     // before it moves; afterwards there is nothing left to ask.
     let mut client = MasqueClient::new(channel, None);
+    // **A public address's senders are not a known set** (§3.5), so the sockets
+    // they cost have to have an end. A relay leg gets no limit, because a limit
+    // on its one peer is a limit on nothing.
+    if let BoundUdp::PublicAddress = kind {
+        client = client.with_forward_limits(PUBLIC_FORWARD_LIMITS);
+    }
+    // **Said rather than dropped silently.** A bound session forwards in
+    // `MasqueClientMode::Forward`, which never goes through the bridge a
+    // `DatapathHook` interposes on, so one set here does nothing at all. The
+    // field's own doc says so, but somebody setting it is not reading the
+    // field -- they are watching for packets to go missing, and would see
+    // traffic flow normally with nothing to explain why.
+    if opts.datapath_hook.is_some() {
+        tracing::warn!(
+            "a datapath hook was set on a leg opened for listening, where it \
+             has no effect: only a dialled leg goes through the bridge it \
+             interposes on"
+        );
+    }
     let inbound = client.inbound_activity();
     let task = tokio::spawn(async move {
         match client
@@ -367,9 +721,13 @@ pub async fn open_bind_session(
     match ready_rx.await {
         Ok(Ok(())) => Ok(BindSession {
             events: out_rx,
+            // Normalized the same way the connect leg does, so the two report
+            // the same shape and `/renew` is appended to a base URL either way.
+            relay_origin: dialled,
             observed,
             inbound,
-            shutdown,
+            // Established, so the handle is what stops it from here on.
+            shutdown: armed.disarm(),
             task: Some(task),
         }),
         Ok(Err(e)) => {
@@ -391,12 +749,29 @@ pub async fn open_bind_session(
 pub struct ConnectRelay {
     /// The local UDP address the application should send its traffic to.
     pub local_addr: SocketAddr,
+    /// Cancelled when the leg stops carrying traffic, for any reason.
+    ended: CancellationToken,
+    relay_origin: String,
     observed: ObservedAddressWatch,
     shutdown: CancellationToken,
     task: Option<JoinHandle<()>>,
 }
 
 impl ConnectRelay {
+    /// The origin this leg was actually dialled at.
+    ///
+    /// **The leg reports it rather than the caller recomputing it**, because
+    /// the routes that act on a leg have to reach the same host it went to.
+    /// Since §8.14 `POST /v1/relay/sessions/{id}/renew` is served by the *data
+    /// plane* — the relay's own host — while the ticket it spends comes from
+    /// the control plane. Working the destination out a second time somewhere
+    /// else is how those two drift apart, and they fail quietly when they do:
+    /// the control plane answers `connection-not-found` for a leg it does not
+    /// hold, which reads as "the relay forgot us" rather than "you asked the
+    /// wrong host".
+    pub fn relay_origin(&self) -> &str {
+        &self.relay_origin
+    }
     /// How the proxy sees this leg — `None` until the first report arrives.
     ///
     /// Note this is *not* [`local_addr`](ConnectRelay::local_addr), which is the
@@ -405,6 +780,28 @@ impl ConnectRelay {
     /// `add_candidate_addr` to offer a direct path.
     pub fn observed(&self) -> ObservedAddressWatch {
         self.observed.clone()
+    }
+
+    /// Cancelled when the leg has stopped carrying traffic.
+    ///
+    /// **Not the same token as [`shutdown_token`](Self::shutdown_token), and
+    /// the difference is the whole point.** That one is how a holder *asks* the
+    /// leg to stop; this one is how the holder is *told* it has — including
+    /// when nobody asked, which is what a relay restarting looks like from
+    /// here.
+    ///
+    /// Until this existed there was no way to know. The bridge runs on the H3
+    /// executor and is not handed back, so a leg whose tunnel ended simply
+    /// stopped forwarding: the connection riding it went quiet, and a session
+    /// already on a direct path lost its fallback without a word
+    /// (`docs/relay_repath_plan.md` §1.3).
+    ///
+    /// **It reports the connection going, not one stream ending** — see
+    /// `MasqueClient::start_connect_udp`. A relay restarting is the first, so
+    /// the case this was built for is covered; a relay that closes just this
+    /// session and stays up is not.
+    pub fn ended(&self) -> CancellationToken {
+        self.ended.clone()
     }
 
     /// The token that winds this leg down, for a holder that has to end the
@@ -462,6 +859,12 @@ pub async fn open_connect_relay(
     // registered relay — dials `proxy_url`.
     dp_id: Option<&str>,
     opts: RelayOptions,
+    // The family the control plane chose for both ends, from
+    // `PeerConnection::relay_family` (a listener) or `RelayInfo::family` (an
+    // initiator). An **argument rather than a `RelayOptions` field** because
+    // it arrives in the connect *response*, while the options are built by the
+    // application before that (plan Q7). `None` is today's behaviour.
+    family: Option<AddressFamily>,
 ) -> anyhow::Result<ConnectRelay> {
     let masque: Uri = masque_uri.parse().context("invalid masque_uri")?;
     let target_path = masque
@@ -483,34 +886,43 @@ pub async fn open_connect_relay(
     // `proxy_url` remains the fallback for a `masque_uri` with no authority,
     // which is what a control plane that has no registered relay still returns.
     let uri = relay_target(&masque, proxy_url, dp_id)?;
+    // Kept as the leg's own answer to "where did this go", so nothing has to
+    // work it out again — see [`ConnectRelay::relay_origin`].
+    let dialled = origin_of(&uri);
     let shutdown = CancellationToken::new();
-    let (connector, observed) = relay_connector(uri.clone(), &opts, shutdown.clone())?;
+    // The initiator's connect leg — the one thing here that replaces itself,
+    // and the reason these timings exist (`transport::RELAY_LEG_KEEPALIVE`).
+    let (connector, observed) = relay_connector(
+        uri.clone(),
+        &opts,
+        family,
+        shutdown.clone(),
+        Liveness::RelayLeg,
+    )?;
+    // **Armed against this function being dropped before it returns.**
+    // Everything below runs on a task of its own holding a clone of
+    // `shutdown`, and a `CancellationToken` does not cancel when a clone is
+    // dropped — so a caller whose future is cancelled while this waits on
+    // `ready_rx` would leave an established leg, its socket and its H3
+    // connection running with nothing left in the process that could stop
+    // them. Disarmed on the way out, where the token moves into the handle
+    // that owns it from then on.
+    let armed = shutdown.clone().drop_guard();
     let channel = H3Channel::<_, StreamBody<ReceiverStream<Result<Frame<Bytes>, Infallible>>>>::new(
         connector, uri, None,
     );
+    // **An initiator's leg, which is not a bind leg.** It meets its peer on
+    // the same session, and asks nothing about public addresses: it binds
+    // an ephemeral loopback source rather than being handed an address.
+    let headers = bound_udp_headers(&pop, BoundUdp::ConnectLeg { connection_id }, ticket)?;
     let channel = ServiceBuilder::new()
         .layer(AddAuthorizationLayer::bearer(endpoint_token))
-        .layer(SetRequestHeaderLayer::appending(
-            HeaderName::from_static(pop::HEADER_ENDPOINT_ID),
-            header_value(&pop.endpoint_id)?,
-        ))
-        .layer(SetRequestHeaderLayer::appending(
-            HeaderName::from_static(pop::HEADER_POP_NONCE),
-            header_value(&pop.nonce)?,
-        ))
-        .layer(SetRequestHeaderLayer::appending(
-            HeaderName::from_static(pop::HEADER_POP_TIMESTAMP),
-            header_value(&pop.timestamp)?,
-        ))
-        .layer(SetRequestHeaderLayer::appending(
-            HeaderName::from_static(pop::HEADER_POP_SIGNATURE),
-            header_value(&pop.signature)?,
-        ))
-        .layer(SetRequestHeaderLayer::appending(
-            HeaderName::from_static("seera-signaling-session-id"),
-            HeaderValue::from_str(connection_id).context("invalid connection id header value")?,
-        ))
-        .option_layer(ticket_layer(ticket)?)
+        .map_request(move |mut req: http::Request<_>| {
+            for (name, value) in headers.clone() {
+                req.headers_mut().append(name, value);
+            }
+            req
+        })
         .service(channel);
 
     let socket = Arc::new(
@@ -523,16 +935,23 @@ pub async fn open_connect_relay(
         .context("failed to read local relay socket address")?;
 
     let session_shutdown = shutdown.clone();
-    // Signals that `start_connect_udp` has established the leg (or failed to).
-    let (ready_tx, ready_rx) = oneshot::channel();
+    // Moved out before the spawn, since `opts` is not `'static`-friendly as a
+    // whole and only this field is wanted inside.
+    let datapath_hook = opts.datapath_hook.clone();
+    // Signals that `start_connect_udp` has established the leg (or failed to),
+    // and hands back the token that says when it stopped.
+    let (ready_tx, ready_rx) = oneshot::channel::<anyhow::Result<CancellationToken>>();
     let task = tokio::spawn(async move {
         let mut client = MasqueClient::new(channel, None);
+        if let Some(hook) = datapath_hook {
+            client = client.with_datapath_hook(hook);
+        }
         match client
             .start_connect_udp(&target_path, Vec::new(), socket, session_shutdown.clone())
             .await
         {
-            Ok(()) => {
-                let _ = ready_tx.send(Ok(()));
+            Ok(ended) => {
+                let _ = ready_tx.send(Ok(ended));
             }
             Err(e) => {
                 let _ = ready_tx.send(Err(anyhow::anyhow!(
@@ -546,10 +965,13 @@ pub async fn open_connect_relay(
     });
 
     match ready_rx.await {
-        Ok(Ok(())) => Ok(ConnectRelay {
+        Ok(Ok(ended)) => Ok(ConnectRelay {
             local_addr,
+            ended,
+            relay_origin: dialled,
             observed,
-            shutdown,
+            // Established, so the handle is what stops it from here on.
+            shutdown: armed.disarm(),
             task: Some(task),
         }),
         Ok(Err(e)) => {
@@ -567,6 +989,112 @@ pub async fn open_connect_relay(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// The names a request would carry, in order.
+    fn names(headers: &[(HeaderName, HeaderValue)]) -> Vec<&str> {
+        headers.iter().map(|(name, _)| name.as_str()).collect()
+    }
+
+    fn value_of<'a>(headers: &'a [(HeaderName, HeaderValue)], name: &str) -> Option<&'a str> {
+        headers
+            .iter()
+            .find(|(n, _)| n.as_str() == name)
+            .map(|(_, v)| v.to_str().unwrap())
+    }
+
+    fn a_pop() -> pop::PopHeaders {
+        sign_connect_udp(&EndpointKey::generate(), CONNECT_UDP_BIND_PATH)
+    }
+
+    /// **The whole request, not the helpers.** Asserting each helper leaves the
+    /// assembly free to drop one: a public bind that sent the session header
+    /// would be taken for a relay leg, and one that sent the temporary-address
+    /// preference would come up bound to an ephemeral port while the published
+    /// address received nothing. So what is read here is the list the request
+    /// actually carries.
+    #[test]
+    fn a_public_address_carries_neither_of_the_legs_headers() {
+        let headers =
+            bound_udp_headers(&a_pop(), BoundUdp::PublicAddress, Some("eyJ.JWT")).unwrap();
+        assert_eq!(
+            names(&headers),
+            vec![
+                pop::HEADER_ENDPOINT_ID,
+                pop::HEADER_POP_NONCE,
+                pop::HEADER_POP_TIMESTAMP,
+                pop::HEADER_POP_SIGNATURE,
+                RELAY_TICKET_HEADER,
+            ],
+            "a public bind sends its PoP and its ticket, and nothing that says `leg`",
+        );
+    }
+
+    /// The listener's leg meets its peer, and asks not to be handed the
+    /// address somebody published.
+    #[test]
+    fn a_bind_leg_meets_its_peer_and_declines_the_allocated_address() {
+        let kind = BoundUdp::BindLeg {
+            connection_id: "conn_1",
+        };
+        let headers = bound_udp_headers(&a_pop(), kind, None).unwrap();
+        assert_eq!(
+            value_of(&headers, "seera-signaling-session-id"),
+            Some("conn_1"),
+        );
+        assert_eq!(
+            value_of(&headers, "seera-prefer-temporary-public-address"),
+            Some("?1"),
+        );
+        assert!(
+            value_of(&headers, RELAY_TICKET_HEADER).is_none(),
+            "none given"
+        );
+    }
+
+    /// **The initiator's leg asks nothing about public addresses.** It binds an
+    /// ephemeral loopback source, so the question does not arise — and sending
+    /// the header anyway would be a header sent on the strength of a shared
+    /// code path rather than of what the request is.
+    #[test]
+    fn a_connect_leg_says_nothing_about_public_addresses() {
+        let kind = BoundUdp::ConnectLeg {
+            connection_id: "conn_1",
+        };
+        let headers = bound_udp_headers(&a_pop(), kind, Some("eyJ.JWT")).unwrap();
+        assert_eq!(
+            value_of(&headers, "seera-signaling-session-id"),
+            Some("conn_1"),
+        );
+        assert!(value_of(&headers, "seera-prefer-temporary-public-address").is_none());
+        assert_eq!(value_of(&headers, RELAY_TICKET_HEADER), Some("eyJ.JWT"));
+    }
+
+    /// **What the leg reports is a base URL, not the CONNECT-UDP path.**
+    ///
+    /// `relay_origin` is what the lease loop appends
+    /// `/v1/relay/sessions/{id}/renew` to, so carrying the leg's own long
+    /// `.well-known/masque/...` path through would address a route that does
+    /// not exist.
+    #[test]
+    fn the_origin_a_leg_reports_is_the_hosts_base_url() {
+        let masque: Uri = "https://dp1abc.relay.example:8443/.well-known/masque/udp/10.0.0.1/443/"
+            .parse()
+            .unwrap();
+        let dialled = relay_target(&masque, "https://cp.example:6443", Some("dp1abc")).unwrap();
+        assert_eq!(origin_of(&dialled), "https://dp1abc.relay.example:8443");
+    }
+
+    /// With no relay chosen the origin is the control plane's own, so the
+    /// renewal path needs no special case for the co-located data plane.
+    #[test]
+    fn with_no_relay_the_origin_is_the_control_plane() {
+        let masque: Uri = "https://ignored.example:8443/.well-known/masque/udp/10.0.0.1/443/"
+            .parse()
+            .unwrap();
+        let dialled = relay_target(&masque, "https://cp.example:6443", None).unwrap();
+        assert_eq!(origin_of(&dialled), "https://cp.example:6443");
+    }
 
     /// **Where a leg is dialled is what the control plane chose**, and the
     /// choice arrives as `dp_id`, not as the shape of the URI.
@@ -597,10 +1125,9 @@ mod tests {
     /// Token and PoP to an origin nobody configured.
     #[test]
     fn no_chosen_relay_dials_the_configured_proxy_however_the_uri_looks() {
-        let masque: Uri =
-            "https://link.isekai.tools:6443/.well-known/masque/udp/127.0.0.1/30001/"
-                .parse()
-                .unwrap();
+        let masque: Uri = "https://link.isekai.tools:6443/.well-known/masque/udp/127.0.0.1/30001/"
+            .parse()
+            .unwrap();
         let dialled = relay_target(&masque, "https://localhost:8443", None).unwrap();
         assert_eq!(
             dialled.host(),
@@ -622,7 +1149,6 @@ mod tests {
             "a relay leg must not be opened over plaintext",
         );
     }
-    use super::*;
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use p256::ecdsa::Signature;
@@ -673,12 +1199,12 @@ mod tests {
     /// error about a missing ticket would not.
     #[test]
     fn the_ticket_header_is_added_only_when_there_is_a_ticket() {
-        assert!(ticket_layer(None).unwrap().is_none());
-        assert!(ticket_layer(Some("eyJ.JWT.sig")).unwrap().is_some());
+        assert!(ticket_header(None).unwrap().is_none());
+        assert!(ticket_header(Some("eyJ.JWT.sig")).unwrap().is_some());
         // A ticket is a JWT, so this cannot normally happen — but a value that
         // would not survive as a header must fail here rather than silently
         // opening an unticketed leg.
-        assert!(ticket_layer(Some("bad\nvalue")).is_err());
+        assert!(ticket_header(Some("bad\nvalue")).is_err());
     }
 
     /// Every PoP value must survive as an HTTP header value.

@@ -271,7 +271,11 @@ struct ContentView: View {
 
     private var developmentSection: some View {
         Section {
-            Toggle("Skip TLS verification", isOn: $model.settings.insecureSkipVerify)
+            // Debug builds only: it turns off certificate checks for Identity,
+            // the control plane and the peer (ViewerModel.allowsInsecureTLS).
+            if ViewerModel.allowsInsecureTLS {
+                Toggle("Skip TLS verification", isOn: $model.settings.insecureSkipVerify)
+            }
             Toggle("Direct path", isOn: $model.settings.enableMigration)
                 .disabled(model.isConnected)
             TextField("Log filter", text: $model.settings.logFilter)

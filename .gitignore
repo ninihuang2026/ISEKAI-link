@@ -1,5 +1,9 @@
 /rust/target
 /target
+# portal-client-ffi is a standalone workspace (like isekai-client-ffi and
+# portal-server/portal-client before it), not a member of rust/'s workspace,
+# so /rust/target above doesn't cover its build output.
+/rust/portal-client-ffi/target
 
 # Private keys any of these tools writes with `load_or_generate_key` or
 # `endpoint_cert::load_or_generate_cert_key`. Long-lived secrets — never commit.
@@ -11,13 +15,52 @@
 # of them and reached a pull request.
 *.pem
 # The one PEM that is meant to be here: a public CA bundle, no key in it.
+# **One line per app.** The rule above is by shape, so each app that ships the
+# bundle needs its own exception; android-portal's was missing, and the app
+# reached main unable to complete a single TLS handshake -- quictls had no
+# roots, so every connection died as "connection lost" before pairing could
+# even be attempted.
 !android/app/src/main/assets/cacert.pem
+!android-portal/app/src/main/assets/cacert.pem
+#
+# **Nobody has written down where the bundle came from or as of when.** Both
+# copies are byte-identical (sha256 6d84ab71cb72...); the first arrived with
+# the Android camera client in #133 on 2026-08-18, with no source recorded.
+# As of 2026-10-14 it holds 146 roots, two of them already past notAfter
+# (SECOM Security Communication RootCA1, 2023-09-30; Baltimore CyberTrust
+# Root, 2025-05-12) -- harmless, since an expired root is simply not trusted,
+# but there is no signal for when the store itself needs refreshing. A stale
+# trust store fails exactly as opaquely as the missing file did: "connection
+# lost", with nothing naming the certificate.
 
 # Auth0 tokens the camera apps store after a device sign-in. The refresh token
 # in here mints access tokens for the signed-in account until it is revoked, so
 # it is the same kind of secret as the key above and is written the same way
 # (0600, beside the key). Never commit.
 *-auth0.json
+
+# The service catalogue an operator writes for their own machine. `--config`
+# names it and `portal-server --example-config` prints a starter; what ends up
+# in it is local addresses and which of them this host offers. It was committed
+# once by accident and removed again (#200), and has been swept into a `git add`
+# several times since — ignoring it is cheaper than noticing each time.
+/rust/portal-server.toml
+
+# The gateway policy, for the same reason and by the same route:
+# `--gateway-config` names it and `portal-server --example-gateway-config`
+# prints a starter, which `docs/portal.md` says to redirect into this very
+# path. It carries a deployment's operations and attribute ranges. This one
+# was swept in by a `git add -A` and removed again.
+/rust/gateway.toml
+
+# cargo-mutants writes its report here, and keeps the previous run beside it.
+/rust/mutants.out/
+/rust/mutants.out.old/
+
+# And a mutant that makes `config_dir` answer with a relative path writes the
+# consent record into the crate directory instead of the user's. The test that
+# catches that mutant runs after it, so the file is left behind either way.
+/rust/*/*-privacy-consent.json
 
 # iOS build outputs. `ios/build-rust.sh` writes the bindings and the
 # xcframework; `xcodegen generate` writes the project and its Info.plist. Only
@@ -37,3 +80,8 @@ quic.txt
 # camera-apps workflow, which runs it). Hundreds of megabytes of copied
 # libraries; regenerated from a build.
 /dist
+
+# Python bytecode. `.github/scripts/` is the first Python in this tree, and
+# importing one of those scripts -- which is how you test it rather than just
+# run it -- leaves a `__pycache__` beside it.
+__pycache__/

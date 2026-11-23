@@ -62,7 +62,7 @@ pub enum ConnectionState {
 }
 
 /// Connection settings (mirrors the desktop GUI's P2P fields).
-#[derive(Debug, Clone, uniffi::Record)]
+#[derive(Clone, uniffi::Record)]
 pub struct ClientConfig {
     pub identity_url: String,
     pub proxy_url: String,
@@ -103,6 +103,19 @@ pub struct ClientConfig {
     /// `RUST_LOG` on, so this is the only way to see what the core is doing.
     pub log_filter: String,
 }
+isekai_p2p_core::redacted_debug!(
+    ClientConfig {
+        identity_url,
+        proxy_url,
+        protocol,
+        listener_id,
+        expected_endpoint,
+        register,
+        insecure_skip_verify,
+        enable_migration,
+        log_filter,
+    } redacting { capability }
+);
 
 /// One end-to-end route the video can take.
 #[derive(Debug, Clone, uniffi::Record)]
@@ -581,6 +594,7 @@ fn directory_config(
         token_ttl: None,
         key: EndpointKey::from_pkcs8_pem(endpoint_key_pem)
             .map_err(|e| ClientError::InvalidKey(e.to_string()))?,
+        narrowing: Default::default(),
     })
 }
 
@@ -780,6 +794,7 @@ pub fn connect(
     sink.on_state(ConnectionState::Connecting, String::new());
 
     let cfg = P2pConfig {
+        narrowing: Default::default(),
         identity_url: config.identity_url,
         identity_http3: false,
         proxy_url: config.proxy_url,
@@ -810,6 +825,7 @@ pub fn connect(
     // leg's binding, so without the shared, unconnected socket there is nothing
     // for a direct path to be opened from. They are switched together.
     let relay_options = RelayOptions {
+        datapath_hook: None,
         unconnected: config.enable_migration,
         registration: Some(Arc::clone(&registration)),
     };
@@ -847,7 +863,7 @@ pub fn connect(
     // camera the user paired with, and the proxy names both.
     match camera_core::paired::check(
         &config.expected_endpoint,
-        session.connection.peer_endpoint.as_deref(),
+        session.connection().peer_endpoint.as_deref(),
     ) {
         // Said either way. A connection that was held against a pairing and one
         // that had nothing to be held against both go on to stream, and only
@@ -868,12 +884,12 @@ pub fn connect(
     }
 
     let connection_id = session.connection_id().to_owned();
-    let video_port = session.local_addr.port();
+    let video_port = session.local_addr().port();
     // Dial the per-endpoint relay FQDN with validation when the proxy issued a
     // relay certificate; otherwise fall back to 127.0.0.1 unvalidated (dev).
     // Said either way. "Pinned" and "nothing to pin" look identical from
     // outside, and only one of them is protected.
-    let pin = match camera_core::AttestedPeer::from_connection(&session.connection) {
+    let pin = match camera_core::AttestedPeer::from_connection(&session.connection()) {
         Ok(pin) => {
             tracing::info!(
                 peer = %pin.peer_endpoint,

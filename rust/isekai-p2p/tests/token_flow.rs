@@ -31,7 +31,7 @@ async fn challenge(State(s): State<Hits>, _h: HeaderMap, _b: Bytes) -> Json<Valu
     }))
 }
 
-async fn register(State(s): State<Hits>, _h: HeaderMap, _b: Bytes) -> Json<Value> {
+async fn register_endpoint(State(s): State<Hits>, _h: HeaderMap, _b: Bytes) -> Json<Value> {
     s.0.lock().unwrap().push("register".into());
     Json(json!({
         "endpoint_id": "ep:abc",
@@ -50,7 +50,7 @@ async fn issue_token(State(s): State<Hits>, _h: HeaderMap, _b: Bytes) -> Json<Va
         "expires_in": 900,
         "endpoint_id": "ep:abc",
         "permissions": ["peer-connect:initiate"],
-        "protocols": ["isekai-validator-v1"],
+        "protocols": ["isekai-camera-v1"],
     }))
 }
 
@@ -60,17 +60,18 @@ fn config(identity_url: String, register: bool) -> P2pConfig {
         identity_http3: false,
         proxy_url: String::new(),
         credential: Credential::auth0("AUTH0_AT", None, register),
-        protocol: "isekai-validator-v1".into(),
+        protocol: "isekai-camera-v1".into(),
         device_name: Some("test-device".into()),
         token_ttl: Some(900),
         key: EndpointKey::generate(),
+        narrowing: Default::default(),
     }
 }
 
 async fn serve(hits: Hits) -> String {
     let app = Router::new()
         .route("/v1/endpoints/register/challenge", post(challenge))
-        .route("/v1/endpoints/register", post(register))
+        .route("/v1/endpoints/register", post(register_endpoint))
         .route("/v1/tokens/endpoint", post(issue_token))
         .with_state(hits);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -112,4 +113,268 @@ async fn without_register_only_issues() {
         vec!["token"],
         "register=false skips registration",
     );
+}
+
+/// **The second issue must not register again.**
+///
+/// `register` is a static argument and `issue()` re-reads it on every renewal,
+/// so a config that registered once would present the same keypair again and
+/// take `409 endpoint-already-registered`. Nothing in the Auth0 arm caught
+/// that, so every renewal from the second onwards failed — and a task outliving
+/// one token lost its Endpoint Token partway through. Agent mode meets this on
+/// every run, because a task-scoped key is freshly generated and so must
+/// register.
+#[tokio::test]
+async fn renewing_issues_rather_than_registering_again() {
+    let hits = Hits::default();
+    let url = serve(hits.clone()).await;
+    let cfg = config(url, true);
+
+    issue_endpoint_token(&cfg).await.expect("the first token");
+    issue_endpoint_token(&cfg).await.expect("the renewal");
+
+    assert_eq!(
+        *hits.0.lock().unwrap(),
+        vec!["challenge", "register", "token", "token"],
+        "the renewal issues against the Endpoint the first call registered",
+    );
+}
+
+/// The cell is shared across clones, because the renewal task holds one.
+#[tokio::test]
+async fn a_cloned_config_registers_no_second_time() {
+    let hits = Hits::default();
+    let url = serve(hits.clone()).await;
+    let cfg = config(url, true);
+    let renewal = cfg.clone();
+
+    issue_endpoint_token(&cfg).await.expect("the first token");
+    issue_endpoint_token(&renewal).await.expect("the renewal");
+
+    assert_eq!(
+        *hits.0.lock().unwrap(),
+        vec!["challenge", "register", "token", "token"],
+    );
+}
+
+/// **A `409` on the way in is not a failure.** The registration can reach the
+/// server and the answer not come back; `get_or_try_init` does not remember
+/// failures, so without an arm for it every renewal would register again, take
+/// `409` again, and keep doing that while a plain issue would have worked.
+#[tokio::test]
+async fn an_endpoint_already_registered_is_issued_against() {
+    let hits = Hits::default();
+    let app = Router::new()
+        .route(
+            "/v1/endpoints/register/challenge",
+            post(|State(s): State<Hits>| async move {
+                s.0.lock().unwrap().push("challenge".into());
+                (
+                    axum::http::StatusCode::CONFLICT,
+                    Json(json!({
+                        "type": "https://identity.isekai.tools/problems/endpoint-already-registered",
+                        "title": "Endpoint already registered",
+                        "status": 409,
+                    })),
+                )
+            }),
+        )
+        .route("/v1/tokens/endpoint", post(issue_token))
+        .with_state(hits.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let cfg = config(format!("http://{addr}"), true);
+
+    issue_endpoint_token(&cfg).await.expect("the first token");
+    issue_endpoint_token(&cfg).await.expect("the renewal");
+
+    assert_eq!(
+        *hits.0.lock().unwrap(),
+        vec!["challenge", "token", "token"],
+        "the 409 settles the cell, so the renewal does not try to register again",
+    );
+}
+
+/// **The registration counts even when the issue does not.**
+///
+/// `register_and_issue` did both behind one `Result`, so an issue that failed
+/// after a registration that succeeded reported a failure and left the cell
+/// empty. The Endpoint existed; nothing in the config knew it. For agent mode
+/// that is an Endpoint the revocation on the way out skips and no sweep
+/// reaches — and the way in is entirely ordinary: a narrowing the server
+/// refuses is refused at the *issue*, one call after the registration it has
+/// already accepted.
+#[tokio::test]
+async fn a_registration_counts_even_when_the_issue_is_refused() {
+    let hits = Hits::default();
+    let app = Router::new()
+        .route("/v1/endpoints/register/challenge", post(challenge))
+        .route("/v1/endpoints/register", post(register_endpoint))
+        .route(
+            "/v1/tokens/endpoint",
+            post(|State(s): State<Hits>| async move {
+                s.0.lock().unwrap().push("token".into());
+                (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "type": "https://identity.isekai.tools/problems/invalid-request",
+                        "title": "Invalid request",
+                        "status": 400,
+                        "detail": "requested_gateways must be canonical endpoint ids",
+                    })),
+                )
+            }),
+        )
+        .with_state(hits.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let cfg = config(format!("http://{addr}"), true);
+
+    issue_endpoint_token(&cfg)
+        .await
+        .expect_err("the issue is refused");
+
+    assert!(
+        cfg.credential.may_have_registered(),
+        "the Endpoint exists, so whatever cleans up has to be able to find it",
+    );
+    assert_eq!(
+        *hits.0.lock().unwrap(),
+        vec!["challenge", "register", "token"],
+    );
+}
+
+/// And the retry after that failure does not register a second time: the
+/// refusal was the issue's, and the registration still stands.
+#[tokio::test]
+async fn retrying_after_a_refused_issue_does_not_register_again() {
+    let hits = Hits::default();
+    let app = Router::new()
+        .route("/v1/endpoints/register/challenge", post(challenge))
+        .route("/v1/endpoints/register", post(register_endpoint))
+        .route(
+            "/v1/tokens/endpoint",
+            post(|State(s): State<Hits>| async move {
+                s.0.lock().unwrap().push("token".into());
+                (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({ "status": 503 })),
+                )
+            }),
+        )
+        .with_state(hits.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let cfg = config(format!("http://{addr}"), true);
+
+    issue_endpoint_token(&cfg).await.expect_err("unavailable");
+    issue_endpoint_token(&cfg).await.expect_err("still");
+
+    assert_eq!(
+        *hits.0.lock().unwrap(),
+        vec!["challenge", "register", "token", "token"],
+    );
+}
+
+/// **A registration whose answer is lost still made an Endpoint.**
+///
+/// `registered` only settles when the response comes back, so a dropped
+/// connection or a body that will not parse leaves it empty — and the Endpoint
+/// exists all the same. That is the leak this file's other test closes,
+/// arrived at by a different road: nothing revokes it and no sweep reaches it.
+/// The attempt is taken *before* the request for exactly this reason.
+#[tokio::test]
+async fn a_registration_whose_answer_is_lost_still_counts() {
+    let hits = Hits::default();
+    let app = Router::new()
+        .route("/v1/endpoints/register/challenge", post(challenge))
+        .route(
+            "/v1/endpoints/register",
+            // Accepted by the server, and the caller never finds out: a `200`
+            // whose body is not what `Registered` parses.
+            post(|State(s): State<Hits>| async move {
+                s.0.lock().unwrap().push("register".into());
+                Json(json!({ "unexpected": "shape" }))
+            }),
+        )
+        .with_state(hits.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let cfg = config(format!("http://{addr}"), true);
+
+    issue_endpoint_token(&cfg)
+        .await
+        .expect_err("the registration's answer did not arrive");
+
+    assert!(
+        cfg.credential.may_have_registered(),
+        "an Endpoint may exist, and only whoever cleans up can find out",
+    );
+}
+
+/// **The other side of that pessimism, and the reason it is narrow.**
+///
+/// A run that could not reach Identity at all never asked for a registration —
+/// the challenge is its own call, and registering only follows one that
+/// succeeded. Claiming an Endpoint here would make every unreachable-Identity
+/// run end by telling its operator to go and revoke something that was never
+/// made.
+#[tokio::test]
+async fn a_run_that_never_asked_claims_nothing() {
+    let cfg = config("http://127.0.0.1:1".to_owned(), true);
+    issue_endpoint_token(&cfg).await.expect_err("nothing there");
+    assert!(
+        !cfg.credential.may_have_registered(),
+        "the challenge never came back, so no registration was ever attempted",
+    );
+}
+
+/// **Where a contract actually ends underneath somebody.** `--register` is for
+/// a key's first use, so a settled installation issues without it on every
+/// renewal for the life of the session — and that was the one path with no
+/// explanation on it, which is to say the only path that matters here.
+///
+/// Both arms are driven, because the explanation lived on the other one.
+#[tokio::test]
+async fn a_membership_that_ended_is_explained_on_both_issue_paths() {
+    for register in [false, true] {
+        let refuse = || async {
+            (
+                axum::http::StatusCode::FORBIDDEN,
+                Json(json!({
+                    "type": "https://identity.isekai.tools/problems/membership-expired",
+                    "status": 403,
+                    "detail": "membership expired at 2027-01-31T23:59:59Z",
+                })),
+            )
+        };
+        let app = Router::new()
+            .route("/v1/endpoints/register/challenge", post(challenge))
+            .route("/v1/endpoints/register", post(register_endpoint))
+            .route("/v1/tokens/endpoint", post(refuse))
+            .with_state(Hits::default());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let error = issue_endpoint_token(&config(format!("http://{addr}"), register))
+            .await
+            .expect_err("an ended membership issues nothing");
+        let text = format!("{error:#}");
+        assert!(text.contains("has ended"), "register={register}: {text}");
+        // The server's own moment, which is the whole of what the holder can
+        // act on -- and the person asking is the one it is about.
+        assert!(
+            text.contains("2027-01-31T23:59:59Z"),
+            "register={register}: {text}"
+        );
+        // **Not the other explanation.** A run that has not registered here is
+        // exactly what the cross-tenant guess is written for, and it would talk
+        // over an answer the server actually gave.
+        assert!(!text.contains("tenant"), "register={register}: {text}");
+    }
 }

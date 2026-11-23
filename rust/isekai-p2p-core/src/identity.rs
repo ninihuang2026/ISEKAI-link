@@ -23,8 +23,11 @@
 //! authentication state plus possession of the Endpoint private key" and
 //! nothing else — every route that wanted a PoP still wants one.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use time::OffsetDateTime;
@@ -78,6 +81,23 @@ impl IdentityError {
             IdentityError::Api { status, .. } => Some(*status),
             _ => None,
         }
+    }
+
+    /// The problem's slug — the last segment of the `type` URI.
+    ///
+    /// **For saying more about a refusal, not for telling refusals apart.**
+    /// The uniformity above is deliberate and this does not undo it: a caller
+    /// that branches on these has rebuilt the oracle. What it is for is
+    /// recognising a message whose cause is on *this* side, and explaining it
+    /// — `pop-signature-invalid` is the case, since the server answers it both
+    /// for a bad signature and for an Endpoint it cannot find.
+    pub fn kind(&self) -> Option<String> {
+        let IdentityError::Api { body, .. } = self else {
+            return None;
+        };
+        let problem: Value = serde_json::from_str(body).ok()?;
+        let uri = problem.get("type")?.as_str()?;
+        Some(uri.rsplit('/').next().unwrap_or(uri).to_owned())
     }
 }
 
@@ -185,6 +205,19 @@ pub enum RevokeReason {
     EndpointDeleted,
     AdminRevoke,
     SecurityIncident,
+    /// **The Endpoint's task is over. Nothing went wrong.**
+    ///
+    /// The other four are all exceptions — something was lost, deleted,
+    /// compromised, or overruled. A task-scoped Endpoint's revocation is none
+    /// of those: it is the ordinary way every successful run ends, hundreds of
+    /// times a day, and reusing `endpoint_deleted` for it would bury the
+    /// operator's own deletions under them in the audit log.
+    ///
+    /// This is the Auth0 route's counterpart to the key route's
+    /// `enrollment_released`, with one difference: **a request names this
+    /// one.** Identity can see a slot being given back; it cannot see that a
+    /// task finished.
+    TaskFinished,
 }
 
 impl RevokeReason {
@@ -194,6 +227,7 @@ impl RevokeReason {
             RevokeReason::EndpointDeleted => "endpoint_deleted",
             RevokeReason::AdminRevoke => "admin_revoke",
             RevokeReason::SecurityIncident => "security_incident",
+            RevokeReason::TaskFinished => "task_finished",
         }
     }
 }
@@ -252,8 +286,72 @@ pub struct Registration {
     pub registered_at: String,
 }
 
+/// What a token is asked to be narrowed to.
+///
+/// # The two halves obey different rules
+///
+/// **`permissions` and `protocols` are remembered; `gateways` is not.**
+///
+/// A renewal returns `the current ceiling ∩ the token being refreshed`, so a
+/// narrowing on those two axes survives *by not being re-sent* — which is why
+/// [`refresh_token`](IdentityClient::refresh_token) takes none of them.
+///
+/// `gateways` is not a claim on the token at all. It selects which
+/// entitlements' leases to start, and **the server states outright that it must
+/// be given on every renewal**: omitting it renews the lease at every Gateway
+/// offering the class. Treating the two halves alike is how a caller that named
+/// one Gateway ends up with grants at all of them from the first renewal
+/// onwards.
+///
+/// # Absent is not the same as empty
+///
+/// `None` asks for nothing in particular and gets the ceiling.
+/// `Some(vec![])` asks for *none* of that axis — and **the server takes it
+/// literally**: a token with no protocols is issued, starts no lease, and can
+/// never connect. It is not refused, so a caller building this list from a
+/// filter that matched nothing gets a `200` and a failure that surfaces much
+/// later as "the grant never arrived".
+///
+/// Narrowing never widens: what is asked for is intersected with the ceiling
+/// the user's entitlements set, so this cannot reach past them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Narrowing {
+    /// The permissions this token should carry.
+    pub permissions: Option<Vec<String>>,
+    /// The protocol classes this token should carry.
+    pub protocols: Option<Vec<String>>,
+    /// **Not a claim, and not remembered.** Which entitlements' leases to start
+    /// — the selector the distribution uses to decide which Gateways hear about
+    /// this Endpoint.
+    ///
+    /// Omitting it starts a lease at *every* Gateway offering the class, which
+    /// is how grants spread further than a task needs. Naming them is the
+    /// intended operation — **on every renewal as well as at issue**, because
+    /// unlike the other two axes the server does not carry this one forward.
+    pub gateways: Option<Vec<String>>,
+}
+
+impl Narrowing {
+    /// Whether this asks for anything at all.
+    pub fn is_empty(&self) -> bool {
+        self.permissions.is_none() && self.protocols.is_none() && self.gateways.is_none()
+    }
+
+    fn apply_to(&self, body: &mut Value) {
+        if let Some(p) = &self.permissions {
+            body["requested_permissions"] = json!(p);
+        }
+        if let Some(p) = &self.protocols {
+            body["requested_protocols"] = json!(p);
+        }
+        if let Some(g) = &self.gateways {
+            body["requested_gateways"] = json!(g);
+        }
+    }
+}
+
 /// Response of `POST /v1/tokens/endpoint` (§8.2.1).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct EndpointToken {
     pub endpoint_token: String,
     pub token_type: String,
@@ -264,6 +362,15 @@ pub struct EndpointToken {
     #[serde(default)]
     pub protocols: Vec<String>,
 }
+crate::redacted_debug!(
+    EndpointToken {
+        token_type,
+        expires_in,
+        endpoint_id,
+        permissions,
+        protocols,
+    } redacting { endpoint_token }
+);
 
 /// Response of `POST /v1/endpoints/enroll` (§8.8.5) — registration and the
 /// first Endpoint Token in one round trip.
@@ -274,7 +381,7 @@ pub struct EndpointToken {
 /// *succeeded*: a slot is spent, the Challenge is consumed, and — because one
 /// key registers exactly one Endpoint — **that keypair can never be registered
 /// again**. Every retry is `409`. A missing `device_id` is not worth that.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct Enrolled {
     pub endpoint_id: String,
     pub endpoint_token: String,
@@ -305,6 +412,22 @@ pub struct Enrolled {
     #[serde(default)]
     pub protocols: Vec<String>,
 }
+crate::redacted_debug!(
+    Enrolled {
+        endpoint_id,
+        expires_in,
+        device_id,
+        tenant_id,
+        user_id,
+        status,
+        registered_at,
+        enrollment_key_id,
+        ephemeral,
+        expires_at,
+        permissions,
+        protocols,
+    } redacting { endpoint_token }
+);
 
 impl Enrolled {
     /// The Endpoint Token, in the shape the rest of this crate passes around.
@@ -404,7 +527,7 @@ impl NewEnrollmentKey {
 /// Lax for the same reason [`Enrolled`] is: `key` is **returned by this call
 /// only and never re-fetchable**, so a response this cannot parse is a key the
 /// server has minted, counted against the quota, and will never show again.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct IssuedEnrollmentKey {
     /// The secret, `enr1_`-prefixed. Store it now or lose it.
     ///
@@ -449,6 +572,23 @@ pub struct IssuedEnrollmentKey {
     #[serde(default)]
     pub warnings: Vec<String>,
 }
+crate::redacted_debug!(
+    IssuedEnrollmentKey {
+        key_id,
+        owner_sub,
+        tenant_id,
+        permissions,
+        protocols,
+        ephemeral,
+        endpoint_idle_ttl,
+        max_live_endpoints,
+        binding,
+        label,
+        created_at,
+        expires_at,
+        warnings,
+    } redacting { key }
+);
 
 /// One row of `GET /v1/enrollment-keys` (§8.8.9) — the issue response without
 /// the secret, plus how full it is.
@@ -562,6 +702,122 @@ pub struct EndpointSummary {
     /// Last time a token was issued or renewed. **Not "connected now".**
     #[serde(default)]
     pub last_token_issued_at: Option<String>,
+}
+
+/// What `GET /v1/me` says the signed-in person is (`multitenancy.md` §5.4,
+/// `guest_membership.md` §3 D5).
+#[derive(Debug, Clone, Deserialize)]
+pub struct Membership {
+    /// The Auth0 `sub` this answer is about.
+    pub sub: String,
+    /// The tenant that was resolved — **not necessarily the `org_id`**. Reserved
+    /// names are refused, and a token with no organization falls to the
+    /// personal tenant.
+    pub tenant_id: String,
+    /// `organization` or `individual`.
+    pub tenant_kind: String,
+    /// `super_admin`, `tenant_admin`, `member` or `guest`.
+    ///
+    /// **`guest` only when a live guest membership actually won.** A row that
+    /// has ended is not a guest, and a super administrator does not step down
+    /// for one.
+    pub role: String,
+    /// A guest's contract end (RFC 3339).
+    ///
+    /// **Present whenever there is a membership row at all**, even one that has
+    /// ended and even when `role` is no longer `guest` — that date is the
+    /// reason this person's tokens are refused, so hiding it takes the
+    /// explanation away with it.
+    #[serde(default)]
+    pub not_after: Option<String>,
+    /// `expired`, `revoked` or `promoted` — why a membership no longer holds.
+    ///
+    /// **`revoked` arrives before `not_after` does**, which is the case worth
+    /// carrying: without it a revoked guest is shown "good for another month"
+    /// while every issue is refused.
+    ///
+    /// **`promoted` is not a refusal.** That person is an ordinary member
+    /// again, and the row is only the record of what they were.
+    #[serde(default)]
+    pub membership_ended: Option<String>,
+    /// **An administrator whom a guest membership outranks.**
+    ///
+    /// Administration is decided by a claim, so it can arrive *after* the
+    /// membership; guest is the narrowing record and wins. Said out loud,
+    /// because otherwise the person wonders where their administration went.
+    #[serde(default)]
+    pub demoted_to_guest: bool,
+    /// `claim` or `config` — what made this caller an administrator. Absent for
+    /// an ordinary member.
+    #[serde(default)]
+    pub admin_source: Option<String>,
+}
+
+impl EndpointToken {
+    /// What the token says about the person it was issued to (spec §15.1.1).
+    ///
+    /// **Read from the token rather than asked for.** `principal_kind` is a
+    /// claim, so it travels with the token down every route that issued it —
+    /// including the Enrollment Key route, which has no Auth0 caller to ask
+    /// about. `None` is a token from before the claim existed, and the
+    /// deployment's own migration treats that as an ordinary member.
+    ///
+    /// **The signature is not checked here.** Everything this token does is
+    /// checked by the servers that hold the signing key; reading the claim is
+    /// for explaining a refusal to the person holding it, and a forged claim
+    /// changes what they are told rather than what they may do.
+    pub fn principal(&self) -> Option<Principal> {
+        let claims: Value = self
+            .endpoint_token
+            .split('.')
+            .nth(1)
+            .and_then(|payload| URL_SAFE_NO_PAD.decode(payload).ok())
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())?;
+        Some(Principal {
+            kind: claims.get("principal_kind")?.as_str()?.to_owned(),
+            // **Only a guest carries one**, so its absence is not a fault.
+            not_after: claims.get("principal_not_after").and_then(|v| v.as_i64()),
+        })
+    }
+}
+
+/// The subject a token was issued to (spec §15.1.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Principal {
+    /// `guest` or `member`.
+    ///
+    /// **`admin` is deliberately not among them.** Administration is decided by
+    /// a claim on the caller's own token, so the routes with no caller — a
+    /// renewal on an Enrollment Key — could not say it, and the same Endpoint
+    /// would change rank depending on how it renewed.
+    pub kind: String,
+    /// When a guest's contract ends (Unix seconds).
+    ///
+    /// **Separate from `exp`, on purpose.** `exp` is clamped to it, but
+    /// verifying a JWT allows for clock skew, so `exp` alone cannot say where
+    /// the contract's edge is. Anything derived from the contract — a grant, a
+    /// relay lease — is cut against this.
+    ///
+    /// **It is a copy taken when the token was issued.** A contract shortened
+    /// afterwards is not reflected until the next issue.
+    pub not_after: Option<i64>,
+}
+
+impl Principal {
+    /// Whether this token was issued to a guest.
+    pub fn is_guest(&self) -> bool {
+        self.kind == "guest"
+    }
+}
+
+impl Membership {
+    /// Whether this person is a guest right now.
+    ///
+    /// **The role rather than the row**, because the row outlives the
+    /// membership: it is kept so that an ended contract can still be explained.
+    pub fn is_guest(&self) -> bool {
+        self.role == "guest"
+    }
 }
 
 /// `GET /v1/endpoints` (§8.1.3).
@@ -703,6 +959,84 @@ pub struct IdentityClient<T> {
     transport: T,
 }
 
+/// What a Gateway is told about one access lease
+/// (`docs/portal_gateway_plan.md` §1.2).
+///
+/// **`scope` is not here, and that is the design.** The centre holds a class
+/// name and attribute values; the rules that turn them into permission live at
+/// the enforcement point. A centre that never carries scope cannot invent a new
+/// rule shape, whatever else it is talked into.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct PolicyEvent {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub access_lease_id: String,
+    pub decision_id: String,
+    pub version: i64,
+    pub allowed_endpoint: String,
+    pub protocol: String,
+    /// Seconds left on the lease. `policy.granted` only.
+    #[serde(default)]
+    pub ttl: Option<i64>,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    /// **Strings, because that is what the wire carries.** Identity types this
+    /// as a map of strings, so a number or an object is refused before this
+    /// code sees it rather than by a check of ours that could be forgotten.
+    #[serde(default)]
+    pub attributes: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    pub constraints: Option<PolicyConstraints>,
+    /// `policy.revoked` only, and always present on one: `lease-expired`,
+    /// `entitlement-removed` or `endpoint-revoked`.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+impl PolicyEvent {
+    /// Whether this row grants rather than withdraws.
+    pub fn is_granted(&self) -> bool {
+        self.kind == "policy.granted"
+    }
+}
+
+/// What the centre asks the enforcement point to hold to.
+///
+/// **`window` is a label, not an expression.** What hours it means, in which
+/// zone, around which holidays, is the Gateway's configuration — putting the
+/// calendar in the centre is exactly the split this design avoids.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct PolicyConstraints {
+    #[serde(default)]
+    pub grant_ttl: Option<u32>,
+    #[serde(default)]
+    pub max_concurrent: Option<u32>,
+    #[serde(default)]
+    pub window: Option<String>,
+}
+
+/// Everything in force for this Gateway right now, and where the stream should
+/// pick up.
+///
+/// **This is the correctness guarantee, not the stream.** The table is rebuilt
+/// from here on the rule "anything not in this list is dropped", which is why
+/// the distinction between an empty list and a failed read matters so much: the
+/// first is an instruction and the second is not an answer at all.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PolicySnapshot {
+    /// The Gateway this is for. There is no way to ask for someone else's, so
+    /// this comes back as confirmation rather than as a choice that was made.
+    pub gateway: String,
+    /// Hand to `GET /v1/policies/stream?after=<cursor>`.
+    pub cursor: i64,
+    /// **Required, deliberately.** An empty list is an instruction to drop
+    /// every row, so a `#[serde(default)]` here would turn a `200` whose body
+    /// has been renamed or reshaped into exactly that — the failure the rest of
+    /// this design goes out of its way to make impossible to write by accident.
+    /// Absent, the response fails to deserialize and the caller gets an error.
+    pub items: Vec<PolicyEvent>,
+}
+
 impl<T: ControlPlaneTransport> IdentityClient<T> {
     /// Create a client that speaks to the Identity API over `transport`.
     pub fn new(transport: T) -> Self {
@@ -758,21 +1092,19 @@ impl<T: ControlPlaneTransport> IdentityClient<T> {
     }
 
     /// §8.2.1 — obtain an Endpoint Token (Auth0 AT + PoP over this request).
+    ///
+    /// **Issuing is where a narrowing is asked for.** Renewal cannot widen and
+    /// therefore carries none ([`refresh_token`](Self::refresh_token)); asking
+    /// for the ceiling back is what calling this again is for.
     pub async fn issue_token(
         &self,
         auth0_token: &str,
         key: &EndpointKey,
-        requested_permissions: Option<&[String]>,
-        requested_protocols: Option<&[String]>,
+        narrowing: &Narrowing,
         ttl: Option<i64>,
     ) -> Result<EndpointToken, IdentityError> {
         let mut body = json!({ "endpoint_id": key.endpoint_id() });
-        if let Some(p) = requested_permissions {
-            body["requested_permissions"] = json!(p);
-        }
-        if let Some(p) = requested_protocols {
-            body["requested_protocols"] = json!(p);
-        }
+        narrowing.apply_to(&mut body);
         if let Some(t) = ttl {
             body["ttl"] = json!(t);
         }
@@ -784,19 +1116,19 @@ impl<T: ControlPlaneTransport> IdentityClient<T> {
             .await
     }
 
-    /// Convenience: challenge → register → issue a token in one call.
-    pub async fn register_and_issue(
-        &self,
-        auth0_token: &str,
-        key: &EndpointKey,
-        device_name: Option<&str>,
-        ttl: Option<i64>,
-    ) -> Result<EndpointToken, IdentityError> {
-        let challenge = self.register_challenge(auth0_token, key).await?;
-        self.register(auth0_token, key, &challenge, device_name)
-            .await?;
-        self.issue_token(auth0_token, key, None, None, ttl).await
-    }
+    // **There was a `register_and_issue` here, and it is gone on purpose.**
+    //
+    // Folding challenge → register → issue into one call put two server-side
+    // writes behind one `Result`, so an issue refused after a registration the
+    // server had accepted came back as a single failure. A caller could not
+    // tell that an Endpoint now existed — and for a task-scoped one, nothing
+    // revokes it and no sweep reaches it, so it stayed registered for good. A
+    // narrowing the server refuses is refused at the issue, one call after the
+    // registration, which made that the ordinary path rather than the rare one.
+    //
+    // Call the three in order and keep the registration's outcome. The count of
+    // round trips is the same; what differs is that the middle one's success is
+    // something the caller is told.
 
     // ---- §8.2.2 / §8.2.3: renewal ----
 
@@ -826,8 +1158,15 @@ impl<T: ControlPlaneTransport> IdentityClient<T> {
     ///
     /// **Renewal never widens.** The result is
     /// `current ceiling ∩ the token being refreshed`, monotonically, so
-    /// `requested_*` is not sent: it exists only to narrow further, and asking
-    /// for the ceiling back is what re-issuing (§8.2.1) is for.
+    /// `requested_permissions` and `requested_protocols` are not sent: they
+    /// exist only to narrow further, and asking for the ceiling back is what
+    /// re-issuing (§8.2.1) is for.
+    ///
+    /// **`gateways` is the exception, and not optional in practice.** It is a
+    /// lease selector rather than a claim, and the server does not carry it
+    /// forward — omitting it renews the lease at *every* Gateway offering the
+    /// class. A caller that narrowed at issue and then stopped saying so
+    /// spreads its grants across all of them from the first renewal onwards.
     ///
     /// PoP is required here whichever credential is used — §8.8.7 substitutes
     /// for the Auth0 half of §17's pair and leaves the key-possession half
@@ -837,6 +1176,7 @@ impl<T: ControlPlaneTransport> IdentityClient<T> {
         auth: IdentityAuth<'_>,
         key: &EndpointKey,
         challenge: &Challenge,
+        gateways: Option<&[String]>,
         ttl: Option<i64>,
     ) -> Result<EndpointToken, IdentityError> {
         let endpoint_id = key.endpoint_id();
@@ -848,6 +1188,12 @@ impl<T: ControlPlaneTransport> IdentityClient<T> {
             "timestamp": timestamp,
             "signature": signature,
         });
+        // **Re-sent every time, unlike the other two axes.** The server does
+        // not remember this one: leaving it out renews the lease at every
+        // Gateway offering the class.
+        if let Some(g) = gateways {
+            body["requested_gateways"] = json!(g);
+        }
         if let Some(t) = ttl {
             body["ttl"] = json!(t);
         }
@@ -927,6 +1273,136 @@ impl<T: ControlPlaneTransport> IdentityClient<T> {
         self.post("/v1/endpoints/enroll", auth, None, body).await
     }
 
+    /// `GET /v1/policies/stream` — the changes, as they happen
+    /// (identity spec §8.10.3).
+    ///
+    /// `after` is the `cursor` from a snapshot. **Omit it and the whole of what
+    /// is in force streams first**, which is a second way to get the same
+    /// answer `list_policies` gives — so pass the cursor unless that is what
+    /// you want.
+    ///
+    /// # It ends, and that is not a fault
+    ///
+    /// **The server closes this at the expiry of the token that opened it.**
+    /// A PoP covers one request, so an indefinite stream would be authenticated
+    /// once and then trusted forever; ending it forces the check to be made
+    /// again, and bounds how much can be missed to one token lifetime. A caller
+    /// that treats the end as an error logs a fault every fifteen minutes; the
+    /// right response is to reconcile and open a new one.
+    ///
+    /// # It is the fast path, not the record
+    ///
+    /// Nothing is replayed and a slow reader is cut off. Correctness comes from
+    /// [`list_policies`](Self::list_policies), which is what a reconnect reads.
+    /// **And expiry never appears here at all** — a lapsed lease is silent, so
+    /// a subscriber that waits to be told will wait forever.
+    pub async fn policy_stream(
+        &self,
+        endpoint_token: &str,
+        key: &EndpointKey,
+        after: Option<i64>,
+    ) -> Result<tokio::sync::mpsc::Receiver<PolicyEvent>, IdentityError>
+    where
+        T: crate::proxy::EventStreamTransport,
+    {
+        let path = match after {
+            Some(cursor) => format!("/v1/policies/stream?after={cursor}"),
+            None => "/v1/policies/stream".to_owned(),
+        };
+        // **Signed over the path the request is actually made on**, query string
+        // and all. Signing the bare path would leave the cursor unprotected,
+        // and it is what decides how much history arrives.
+        let pop = pop::sign_request(key, "GET", &path, &[]);
+        let mut headers = vec![(
+            "authorization".to_owned(),
+            format!("Bearer {endpoint_token}"),
+        )];
+        headers.extend(
+            pop.as_pairs()
+                .map(|(name, value)| (name.to_owned(), value.to_owned())),
+        );
+        let (status, mut chunks) = self
+            .transport
+            .open_stream("GET", &path, &headers)
+            .await
+            .map_err(IdentityError::Transport)?;
+        if status != 200 {
+            let mut body = Vec::new();
+            while body.len() < MAX_POLICY_LINE {
+                match chunks.recv().await {
+                    Some(Ok(chunk)) => body.extend_from_slice(&chunk),
+                    _ => break,
+                }
+            }
+            return Err(IdentityError::Api {
+                status,
+                body: String::from_utf8_lossy(&body).into_owned(),
+                // **None because this path cannot see headers**, not because
+                // there are none to read. `open_stream` returns a status and a
+                // body, so a `Retry-After` on `503 policy-stream-capacity` is
+                // not available here; the caller's own backoff is what paces a
+                // retry. Widening the trait to carry them is the fix if that
+                // stops being enough.
+                retry_after: None,
+            });
+        }
+
+        let (events, receiver) = tokio::sync::mpsc::channel(32);
+        tokio::spawn(async move {
+            let mut buffer = Vec::new();
+            while let Some(chunk) = chunks.recv().await {
+                match chunk {
+                    Ok(bytes) => buffer.extend_from_slice(&bytes),
+                    Err(e) => {
+                        tracing::debug!("the policy stream ended: {e}");
+                        break;
+                    }
+                }
+                // **Drained first, then measured.** The cap is on one
+                // unterminated line, not on how much arrives at once: a full
+                // replay (`after = None`) can deliver far more than this in a
+                // single chunk, all of it complete lines, and checking first
+                // ended the stream on a buffer that was about to be emptied.
+                let mut ready = Vec::new();
+                drain_policy_lines(&mut buffer, &mut ready);
+                if buffer.len() > MAX_POLICY_LINE {
+                    tracing::warn!(
+                        "a policy line exceeded {MAX_POLICY_LINE} bytes; ending the stream"
+                    );
+                    break;
+                }
+                for event in ready {
+                    if events.send(event).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+        Ok(receiver)
+    }
+
+    /// `GET /v1/me` — who the signed-in person is here, and under what terms.
+    ///
+    /// **Identity answers rather than the caller reading its own token.** How a
+    /// tenant is resolved and how an administrator is recognised are deployment
+    /// settings, so a client that decoded the access token itself would hold a
+    /// second copy of those rules and drift from the one that is enforced
+    /// (`multitenancy.md` §5.4).
+    ///
+    /// **It answers `200` for everyone who can authenticate**, including
+    /// somebody with no privileges at all — folding that into `403` would make
+    /// "not an administrator", "invalid token" and "no tenant" one answer.
+    pub async fn me(&self, auth0_token: &str) -> Result<Membership, IdentityError> {
+        self.request(
+            "GET",
+            "/v1/me",
+            IdentityAuth::Auth0(auth0_token),
+            None,
+            Vec::new(),
+        )
+        .await
+    }
+
     /// §8.1.3 — the Endpoints this caller owns.
     ///
     /// **Revoked rows are hidden unless asked for**, which is why
@@ -981,6 +1457,33 @@ impl<T: ControlPlaneTransport> IdentityClient<T> {
     }
 
     // ---- §8.7: revocation ----
+
+    /// §8.7 — revoke an Endpoint, as its owner or as itself.
+    ///
+    /// [`RevokeAuth`] carries the asymmetry: the Auth0 route states a reason,
+    /// the key route states none and gets `enrollment_released`. The key route
+    /// signs a PoP, which is what confines it to **this** Endpoint — a leaked
+    /// key alone stops nothing, including the other Endpoints it grew.
+    ///
+    /// **Best-effort at the end of a job.** The idle sweep is behind this, so a
+    /// failure here costs a slot until then and nothing else; it is not a
+    /// reason to fail work that otherwise succeeded.
+    /// `GET /v1/policies` — everything in force for this Gateway
+    /// (identity spec §8.10.2).
+    ///
+    /// Series B: an Endpoint Token and a PoP, and **no permission** — the
+    /// distribution is scoped to whoever is named by the token, so there is
+    /// nothing else to authorize and no way to ask for another Gateway's rows.
+    pub async fn list_policies(
+        &self,
+        endpoint_token: &str,
+        key: &EndpointKey,
+    ) -> Result<PolicySnapshot, IdentityError> {
+        let path = "/v1/policies";
+        let pop = pop::sign_request(key, "GET", path, &[]);
+        self.request_raw("GET", path, Some(endpoint_token), Some(&pop), Vec::new())
+            .await
+    }
 
     /// §8.7 — revoke an Endpoint, as its owner or as itself.
     ///
@@ -1284,11 +1787,38 @@ fn now_rfc3339() -> Result<String, IdentityError> {
         .map_err(|_| IdentityError::Time)
 }
 
+/// The largest policy line worth buffering.
+///
+/// A line that never ends would grow the buffer without limit. Ending the
+/// stream is what every other failure here does, so the caller already knows
+/// how to recover — by reconciling and opening a new one.
+const MAX_POLICY_LINE: usize = 64 * 1024;
+
+/// Split what has arrived into whole lines, dropping `keepalive` and anything
+/// unreadable.
+///
+/// **One bad line does not end the stream.** The next may be fine, and the
+/// reconciliation is what this is checked against in any case.
+fn drain_policy_lines(buffer: &mut Vec<u8>, out: &mut Vec<PolicyEvent>) {
+    while let Some(end) = buffer.iter().position(|b| *b == b'\n') {
+        let line: Vec<u8> = buffer.drain(..=end).collect();
+        let line = &line[..line.len() - 1];
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_slice::<PolicyEvent>(line) {
+            Ok(event) => out.push(event),
+            // `keepalive` has no lease and lands here. It carries nothing, and
+            // its only meaning is that the stream is still open — which is
+            // already said by the fact that a chunk arrived.
+            Err(e) => tracing::trace!("ignoring a policy line: {e}"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::Engine as _;
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use p256::ecdsa::Signature;
     use p256::ecdsa::signature::Verifier;
 
@@ -1320,10 +1850,52 @@ mod tests {
     fn deserializes_token_response() {
         let json = r#"{"endpoint_token":"eyJ...","token_type":"Bearer","expires_in":900,
             "endpoint_id":"ep:abc","permissions":["peer-connect:initiate"],
-            "protocols":["isekai-validator-v1"]}"#;
+            "protocols":["isekai-camera-v1"]}"#;
         let tok: EndpointToken = serde_json::from_str(json).unwrap();
         assert_eq!(tok.endpoint_token, "eyJ...");
         assert_eq!(tok.expires_in, 900);
         assert_eq!(tok.permissions, vec!["peer-connect:initiate"]);
+    }
+    /// **The claim is what says a token belongs to a guest**, and it is the
+    /// only signal that travels every route — a renewal on an Enrollment Key
+    /// has no caller to ask about. Reading it is how a refusal further on gets
+    /// explained instead of arriving as a bare `insufficient-permission`.
+    #[test]
+    fn a_token_says_which_kind_of_principal_it_was_issued_to() {
+        let token = |claims: &str| EndpointToken {
+            endpoint_token: format!(
+                "header.{}.signature",
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims)
+            ),
+            token_type: "Bearer".into(),
+            expires_in: 900,
+            endpoint_id: "ep:1".into(),
+            permissions: Vec::new(),
+            protocols: Vec::new(),
+        };
+
+        let guest = token(r#"{"principal_kind":"guest","principal_not_after":1767139199}"#)
+            .principal()
+            .expect("the claim is there");
+        assert!(guest.is_guest());
+        assert_eq!(guest.not_after, Some(1767139199));
+
+        // **A member carries the claim too**, so that its absence means "older
+        // than the claim" rather than "not a guest" — the deployment's own
+        // migration turns on that distinction.
+        let member = token(r#"{"principal_kind":"member"}"#)
+            .principal()
+            .expect("the claim is there");
+        assert!(!member.is_guest());
+        assert_eq!(member.not_after, None);
+
+        // A token from before the claim existed, and one that is not a JWT at
+        // all: neither is a guest, and neither is an error to the holder.
+        assert!(token(r#"{"sub":"ep:1"}"#).principal().is_none());
+        let opaque = EndpointToken {
+            endpoint_token: "not-a-jwt".into(),
+            ..token("{}")
+        };
+        assert!(opaque.principal().is_none());
     }
 }

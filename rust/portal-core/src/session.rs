@@ -30,6 +30,7 @@
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use isekai_p2p::agent::ReachableListener;
@@ -73,6 +74,17 @@ pub struct ServerHandle {
     commands: mpsc::Sender<ListenerCommand>,
     /// Bindings and departures, for anything that wants to report them.
     pub signaling: broadcast::Sender<SignalingEvent>,
+    /// Cancelled when the task below has ended, however it ended.
+    ///
+    /// **`signaling` cannot carry this.** This struct holds the sender, so a
+    /// caller's `recv()` never reports the channel closed while the server is
+    /// alive: a session that stopped without getting a last event out — a
+    /// panic, a closed command channel, a `Lagged` gap swallowing the one
+    /// `Unreachable` the loop sends — left that caller waiting on a channel
+    /// nobody would ever send on, with the process up and still listed as a
+    /// listener it was no longer running. A token cannot be missed or
+    /// overtaken, and it is cancelled by a drop guard, so unwinding counts too.
+    pub stopped: CancellationToken,
     running: tokio::task::JoinHandle<()>,
     shutdown: CancellationToken,
     reg: Arc<Registration>,
@@ -182,6 +194,7 @@ pub async fn serve(
     cert_key_path: &Path,
     catalogue: Catalogue,
     policy: AcceptPolicy,
+    routing: Routing,
     shutdown: CancellationToken,
 ) -> anyhow::Result<ServerHandle> {
     // Issued once and reused for both the certificate and the session, so
@@ -212,6 +225,7 @@ pub async fn serve(
         portal_addr,
         None,
         RelayOptions {
+            datapath_hook: None,
             unconnected: true,
             registration: Some(reg.clone()),
         },
@@ -243,11 +257,34 @@ pub async fn serve(
                 accepted = listener.accept() => match accepted {
                     Ok(conn) => {
                         let catalogue = catalogue.clone();
-                        let serving = accepting.clone();
-                        direct_path::advertise(conn.clone(), legs.clone(), serving.clone());
+                        // **A child token, not a clone of the accept loop's.**
+                        // `advertise` watches this connection's leg for as
+                        // long as its token is live, and holds a `Connection`
+                        // clone while it does. Given the loop's own token it
+                        // would outlive the peer it was advertising to, so a
+                        // server that had served a long succession of clients
+                        // would hold a task and a live msquic handle for every
+                        // one of them until the process stopped. The guard
+                        // below ends it with the connection.
+                        let serving = accepting.child_token();
+                        // **Both ends have to stay quiet for a session to
+                        // really be relay-only.** A client that offers no
+                        // candidate still gets a direct path if this side
+                        // advertises one, because the advertisement is what
+                        // makes the *peer* probe — measured: withholding the
+                        // client's candidate alone left a path validated
+                        // anyway, by the pre-multipath switch.
+                        if let Routing::PreferDirect = routing {
+                            direct_path::advertise(
+                                conn.clone(),
+                                legs.clone(),
+                                serving.clone(),
+                            );
+                        }
                         // One task per peer: a forward that stalls must not
                         // stop the next peer being accepted.
                         tokio::spawn(async move {
+                            let _ended = serving.clone().drop_guard();
                             if let Err(e) = crate::server::serve(conn, catalogue, serving).await {
                                 tracing::warn!("portal connection ended: {e:#}");
                             }
@@ -264,18 +301,25 @@ pub async fn serve(
 
     let (commands, cmd_rx) = mpsc::channel(8);
     let (signaling, _) = broadcast::channel(32);
-    let running = tokio::spawn(run(
-        session,
-        cmd_rx,
-        policy,
-        signaling.clone(),
-        shutdown.clone(),
-    ));
+    let stopped = CancellationToken::new();
+    let running = tokio::spawn({
+        // A guard rather than a `cancel()` after the await: that line would be
+        // skipped by a panic in `run`, which is one of the endings this exists
+        // to report. Dropping is the one thing that happens either way.
+        let ended = stopped.clone().drop_guard();
+        let signaling = signaling.clone();
+        let shutdown = shutdown.clone();
+        async move {
+            run(session, cmd_rx, policy, signaling, shutdown).await;
+            drop(ended);
+        }
+    });
 
     Ok(ServerHandle {
         info,
         commands,
         signaling,
+        stopped,
         running,
         shutdown,
         reg,
@@ -334,6 +378,38 @@ impl Connected {
         // cost a bug report rather than a bisect.
         tracing::debug!("closing: cancelling the forwards");
         shutdown.cancel();
+        // **Before anything releases the peer connection.** Doing that kills
+        // the relay leg underneath it, and a supervisor that has not been told
+        // why reads a dead leg as the relay failing: it asks the control plane
+        // for a new connection to stand a replacement on, backs off, and asks
+        // again. The far listener binds a leg for each of those rows and
+        // unbinds it moments later, so a plain disconnect arrives at the other
+        // end as a burst of connections -- measured at two per disconnect,
+        // five and eight seconds after the tap, with the session already gone.
+        //
+        // Not `session.close()`, which is still last: that cancels the
+        // supervisor's `shutdown`, which retires the attachment at once. This
+        // says only "stop replacing it" and leaves the leg where it is.
+        //
+        // **The reason it is last is not the reason this comment first gave.**
+        // It said the peer connection was still draining *through* the leg.
+        // The drain is what kills the leg: `peer.drain` is
+        // `reg.shutdown(); reg.wait_idle()`, and the leg's own QUIC connection
+        // is on that same registration (this file hands it over in
+        // `RelayOptions`). Worse, `wait_idle` then waits for a handle the leg
+        // will not release until `retire`, which `session.close()` below only
+        // reaches afterwards -- so the drain cannot succeed. Measured: seven
+        // consecutive disconnects, every one of them 5.00s from "waiting for
+        // msquic" to `msquic still had live handles after 5s`, which is
+        // `PeerSession::drain`'s failure branch and its
+        // `mem::forget(registration)`. **One leaked registration per
+        // connect/disconnect cycle**, which is the leak
+        // `portal-client-ffi`'s own doc says it is trying to avoid.
+        //
+        // Not fixed here. Reporting the leg closed has to happen before or
+        // alongside the drain, which is a different change from this one and
+        // wants its own measurement.
+        session.stop_replacing_the_leg();
         // **Dropped before the wait, not after it.** `Sessions` holds a
         // `Connection` clone of its own, and the drain below is a wait for
         // msquic to have no live handles left — one held by a value still in
@@ -371,7 +447,16 @@ pub enum Reach<'a> {
     /// `peer` narrows the search to one server's Endpoint ID, which is what a
     /// client paired with more than one needs. `None` is right when there is
     /// only one, and says so if there is not.
-    Grant { peer: Option<&'a str> },
+    Grant {
+        peer: Option<&'a str>,
+        /// How long to wait for a Grant to appear before giving up.
+        ///
+        /// **`None` asks once**, which is right when the Grant has stood since
+        /// pairing. A task-scoped Endpoint's Grant is made moments after its
+        /// token is issued and over an event stream, so for that one an empty
+        /// answer means *not yet* rather than *no*.
+        wait: Option<Duration>,
+    },
     /// A capability the operator issued and handed over. **One-shot, and 30
     /// seconds by default** — right for letting a guest in once, wrong for
     /// anything that reconnects. It names its listener, so nothing is
@@ -382,12 +467,37 @@ pub enum Reach<'a> {
     },
 }
 
+/// Whether this session may leave the relay.
+///
+/// **A diagnostic as much as a setting.** A session on a direct path and one
+/// still on the relay fail in different ways, and when only one of them
+/// misbehaves there is no way to tell them apart from the outside — a direct
+/// path happens or does not according to what two NATs do. This makes the
+/// relay-only case reproducible on a machine where punching always succeeds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Routing {
+    /// Offer a direct-path candidate and move onto one if it validates. What
+    /// every session does unless told otherwise.
+    PreferDirect,
+    /// Stay on the relay.
+    ///
+    /// **Offers no candidate at all**, rather than offering one and declining
+    /// to prefer it. A candidate is what makes the peer probe this end, so
+    /// withholding it means no direct path is ever validated — which is the
+    /// state a session behind two unpunchable NATs is in, and the one being
+    /// reproduced. Declining to *prefer* a path that exists would be a
+    /// different thing, and would leave a validated path the connection could
+    /// still be moved onto.
+    RelayOnly,
+}
+
 /// Connect to a portal server and open the peer QUIC to it.
 ///
 /// See [`Reach`] for the two ways of being allowed to.
 pub async fn connect(
     cfg: &P2pConfig,
     reach: Reach<'_>,
+    routing: Routing,
     shutdown: &CancellationToken,
 ) -> anyhow::Result<Connected> {
     // **One registration for both, and it has to be made here.** msquic looks
@@ -398,13 +508,13 @@ pub async fn connect(
     // `serve` does the same thing from the other end.
     let reg = Arc::new(Registration::new(&msquic::RegistrationConfig::default())?);
     let session = match reach {
-        Reach::Grant { peer } => connect_on_a_grant(cfg, peer, reg.clone()).await?,
+        Reach::Grant { peer, wait } => connect_on_a_grant(cfg, peer, wait, reg.clone()).await?,
         Reach::Capability {
             capability,
             listener_id,
         } => connect_on_a_capability(cfg, capability, listener_id, reg.clone()).await?,
     };
-    open_the_peer_connection(session, reg, shutdown).await
+    open_the_peer_connection(session, reg, routing, shutdown).await
 }
 
 /// Find the listener this client is paired with, and connect to it.
@@ -418,12 +528,13 @@ pub async fn connect(
 async fn connect_on_a_grant(
     cfg: &P2pConfig,
     peer: Option<&str>,
+    wait: Option<Duration>,
     reg: Arc<Registration>,
 ) -> anyhow::Result<InitiatorSession> {
     let directory = PeerDirectory::open(cfg)
         .await
         .context("open the proxy control plane")?;
-    let reachable = directory.reachable().await?;
+    let reachable = wait_for_a_grant(&directory, cfg, peer, wait).await?;
     let listener = choose_listener(&reachable, &cfg.protocol, peer)?;
     tracing::info!(
         listener = %listener.listener_id,
@@ -437,12 +548,122 @@ async fn connect_on_a_grant(
             &[],
             "127.0.0.1:0".parse().expect("valid loopback addr"),
             RelayOptions {
+                datapath_hook: None,
                 unconnected: true,
                 registration: Some(reg),
             },
         )
         .await
         .context("peer connect")
+}
+
+/// List the listeners this Endpoint can reach, waiting for one to appear.
+///
+/// **A token and a Grant do not arrive together.** Issuing the token is what
+/// starts a lease at the Gateway (draft §6.2.1), and from there the path is
+/// asynchronous — Identity streams `policy.granted`, the Gateway validates the
+/// attributes, writes its table and creates the Grant — so a `connect` made
+/// immediately after the issue finds nothing reachable. That is not a refusal;
+/// it is **early**, and a run that treats it as a refusal fails at the one
+/// moment it was always going to.
+///
+/// `wait` of `None` is what every caller before agent mode did: ask once, and
+/// let an empty answer be an answer. A task-scoped Endpoint registered seconds
+/// ago is the case that needs the other behaviour.
+async fn wait_for_a_grant(
+    directory: &PeerDirectory,
+    cfg: &P2pConfig,
+    peer: Option<&str>,
+    wait: Option<Duration>,
+) -> anyhow::Result<Vec<ReachableListener>> {
+    let reachable = directory.reachable().await?;
+    let Some(wait) = wait else {
+        return Ok(reachable);
+    };
+    if matches(&reachable, &cfg.protocol, peer) {
+        return Ok(reachable);
+    }
+    let started = Instant::now();
+    // **The last polling failure, held rather than raised.** A wait of thirty
+    // seconds makes about eighteen calls, and one `429`, one `503` or one
+    // control-plane hiccup among them is not an answer about the Grant. Raising
+    // it would end the wait the moment it was granted — the failure this
+    // function exists to prevent, arriving by a different door.
+    let mut last_error: Option<anyhow::Error> = None;
+    // Short at first, because the usual answer arrives in seconds and a run
+    // that sat out a fixed interval would spend most of its wait after the
+    // Grant already existed. Then longer, because if it did not arrive quickly
+    // it is not arriving quickly.
+    let mut interval = Duration::from_millis(250);
+    tracing::info!(
+        protocol = %cfg.protocol,
+        peer = peer.unwrap_or("-"),
+        ?wait,
+        "no Grant yet; waiting for the Gateway to make one",
+    );
+    loop {
+        if started.elapsed() >= wait {
+            // **A failed poll is reported as itself.** If the list never came
+            // back, saying "no Grant appeared" would blame the Gateway for the
+            // proxy being unreachable.
+            if let Some(e) = last_error {
+                return Err(e.context(format!(
+                    "could not tell whether a Grant exists: the reachable-listener list \
+                     kept failing for {wait:?}",
+                )));
+            }
+            // **What to look at, because several causes are one answer from
+            // here.** An empty list is what the Gateway not having made a Grant
+            // looks like — it never received the event, it refused the
+            // attributes, nothing entitles this Endpoint — and equally what a
+            // server that is not running looks like. Only the Gateway's log
+            // separates the first three, and only the peer separates them from
+            // the fourth.
+            anyhow::bail!(
+                "nothing reachable after {wait:?}. Issuing the token starts a lease at the \
+                 Gateway and the Grant follows over its event stream, so either the \
+                 Gateway has not made one -- it never received the event, it refused the \
+                 attributes, or nothing entitles this Endpoint, which its log will say and \
+                 this cannot -- or there is nothing to reach: check that the peer is \
+                 running, that it serves `{}`, and that {} is the Endpoint you meant",
+                cfg.protocol,
+                peer.unwrap_or("the peer"),
+            );
+        }
+        tokio::time::sleep(interval).await;
+        interval = (interval * 2).min(Duration::from_secs(2));
+        let reachable = match directory.reachable().await {
+            Ok(reachable) => {
+                last_error = None;
+                reachable
+            }
+            Err(e) => {
+                tracing::debug!("could not list reachable listeners while waiting: {e:#}");
+                last_error = Some(e);
+                continue;
+            }
+        };
+        if matches(&reachable, &cfg.protocol, peer) {
+            // **The number §6.3 asked for.** How long a Grant takes to arrive
+            // was a guess from the design and had never been measured.
+            tracing::info!(
+                waited = ?started.elapsed(),
+                "the Grant arrived",
+            );
+            return Ok(reachable);
+        }
+    }
+}
+
+/// Whether anything in `reachable` is what this run is looking for.
+///
+/// **Only emptiness is worth waiting on.** `choose_listener`'s other refusals —
+/// two servers and no `--peer`, a peer with several live listeners — are
+/// decisions the operator has to make, and no amount of waiting makes them.
+fn matches(reachable: &[ReachableListener], protocol: &str, peer: Option<&str>) -> bool {
+    reachable
+        .iter()
+        .any(|l| l.protocol == protocol && peer.is_none_or(|want| l.owner_endpoint == want))
 }
 
 /// The one listener `peer` names, or the only one there is.
@@ -526,6 +747,7 @@ async fn connect_on_a_capability(
         &[],
         "127.0.0.1:0".parse().expect("valid loopback addr"),
         RelayOptions {
+            datapath_hook: None,
             unconnected: true,
             registration: Some(reg),
         },
@@ -540,6 +762,7 @@ async fn connect_on_a_capability(
 async fn open_the_peer_connection(
     session: InitiatorSession,
     reg: Arc<Registration>,
+    routing: Routing,
     shutdown: &CancellationToken,
 ) -> anyhow::Result<Connected> {
     // A *name*, never an address: it is the per-endpoint FQDN the peer's relay
@@ -554,7 +777,7 @@ async fn open_the_peer_connection(
     // What the peer signed about its own key, if it has said anything. Absent
     // is ordinary and changes nothing; present means the handshake has to
     // produce that key (spec §8.6.5).
-    let pin = match AttestedPeer::from_connection(&session.connection) {
+    let pin = match AttestedPeer::from_connection(&session.connection()) {
         Ok(pin) => {
             tracing::info!(
                 peer = %pin.peer_endpoint,
@@ -568,29 +791,61 @@ async fn open_the_peer_connection(
         }
     };
 
-    // Resolved before the dial: a candidate has to be offered before `start`,
-    // and the handshake can take a long time by design, so there is no useful
-    // "add it later".
+    // Resolved before the dial: the connection has to be *configured* for a
+    // direct path before `start`, and the handshake can take a long time by
+    // design. A later candidate is another matter — see the `reoffer` below,
+    // which is what carries a direct path across a change of address.
     //
     // **And it is probed, as of phase 4.** `serve` above advertises the other
     // end's leg binding, which is the half this offer was waiting for — until
     // it landed, this candidate said where we could be reached to a peer with
     // no address to send to. `crate::path` is what happens once a path
     // validates.
-    let candidate = wait_for_observed(&session, shutdown).await;
+    let candidates = match routing {
+        Routing::PreferDirect => wait_for_observed(&session, shutdown).await,
+        // **Not even waited for.** The wait is what the leg's observed-address
+        // report is for, and asking for it here would cost up to
+        // `OBSERVED_ADDRESS_WAIT` to arrive at the `None` this already knows.
+        Routing::RelayOnly => {
+            tracing::warn!(
+                "staying on the relay: no direct-path candidate is offered, so no direct \
+                 path will be probed. Every byte crosses the relay for the life of this \
+                 session",
+            );
+            isekai_p2p::agent::ObservedAddresses::default()
+        }
+    };
 
     let peer = transport::connect(
         Some(reg),
         &host,
-        session.local_addr.port(),
+        session.local_addr().port(),
         transport::ConnectOptions {
             verify,
             pin,
-            candidate,
+            candidates: candidates.clone(),
         },
         shutdown,
     )
     .await?;
+
+    // The address offered above is the one the leg had a moment ago, and this
+    // end's address moves: a renewed DHCP lease, SLAAC, a different network.
+    // Without this the session drops to the relay at the first such change and
+    // stays there (#358).
+    //
+    // On this session's own token, which is what `Connected::close` cancels
+    // before it drains — the same arrangement `Sessions::start` below has, and
+    // for the same reason: the task holds a `Connection` clone, and the drain
+    // is a wait for msquic to have no live handles left.
+    if !candidates.is_empty() {
+        direct_path::reoffer(
+            peer.connection().clone(),
+            session.observed_address(),
+            &candidates,
+            shutdown.clone(),
+        );
+    }
 
     let sessions = crate::udp::Sessions::start(peer.connection().clone(), shutdown.clone());
     Ok(Connected {
@@ -608,19 +863,25 @@ async fn open_the_peer_connection(
 async fn wait_for_observed(
     session: &InitiatorSession,
     shutdown: &CancellationToken,
-) -> Option<isekai_p2p::agent::ObservedAddress> {
+) -> isekai_p2p::agent::ObservedAddresses {
+    use isekai_p2p::agent::ObservedAddresses;
+
     let mut watch = session.observed_address();
-    if let Some(address) = *watch.borrow_and_update() {
-        return Some(address);
+    let held = watch.borrow_and_update().clone();
+    if !held.is_empty() {
+        return held;
     }
     let waited = tokio::time::timeout(OBSERVED_ADDRESS_WAIT, async {
         loop {
             tokio::select! {
-                _ = shutdown.cancelled() => return None,
+                _ = shutdown.cancelled() => return ObservedAddresses::default(),
                 changed = watch.changed() => {
-                    changed.ok()?;
-                    if let Some(address) = *watch.borrow_and_update() {
-                        return Some(address);
+                    if changed.is_err() {
+                        return ObservedAddresses::default();
+                    }
+                    let held = watch.borrow_and_update().clone();
+                    if !held.is_empty() {
+                        return held;
                     }
                 }
             }
@@ -628,13 +889,13 @@ async fn wait_for_observed(
     })
     .await;
     match waited {
-        Ok(address) => address,
+        Ok(addresses) => addresses,
         Err(_) => {
             tracing::warn!(
                 "no observed address from the relay leg within {OBSERVED_ADDRESS_WAIT:?}; \
                  forwarding over the relay without a direct-path candidate",
             );
-            None
+            ObservedAddresses::default()
         }
     }
 }
@@ -676,7 +937,7 @@ mod tests {
     #[test]
     fn a_listener_of_another_protocol_is_not_a_candidate() {
         let reachable = [
-            listener("ep:aaa", "sample", "pl_camera"),
+            listener("ep:aaa", "isekai-camera-v1", "pl_camera"),
             listener("ep:aaa", "isekai-portal-v1", "pl_portal"),
         ];
         let found = choose_listener(&reachable, "isekai-portal-v1", None).expect("the portal");
@@ -700,6 +961,34 @@ mod tests {
             found.listener_id, "pl_running",
             "the newest lease is the one still being renewed",
         );
+    }
+
+    /// **Only an empty answer is worth waiting on.** The Grant travels over
+    /// the Gateway's event stream and arrives after the token that started its
+    /// lease, so "nothing here yet" is a moment in a sequence.
+    #[test]
+    fn nothing_reachable_is_what_waiting_is_for() {
+        let none: [ReachableListener; 0] = [];
+        assert!(!matches(&none, "isekai-portal-v1", None));
+        assert!(!matches(&none, "isekai-portal-v1", Some("ep:R1")));
+    }
+
+    /// The other refusals are decisions, and waiting makes none of them: a
+    /// listener on another protocol will not become this one, and a peer this
+    /// run did not name will not stop being there.
+    #[test]
+    fn a_listener_that_does_not_answer_the_question_is_not_one() {
+        let reachable = [listener("ep:aaa", "isekai-camera-v1", "pl_camera")];
+        assert!(
+            !matches(&reachable, "isekai-portal-v1", None),
+            "a camera is not a portal, however long we wait",
+        );
+        assert!(
+            !matches(&reachable, "isekai-camera-v1", Some("ep:bbb")),
+            "the protocol is right and the peer is not",
+        );
+        assert!(matches(&reachable, "isekai-camera-v1", Some("ep:aaa")));
+        assert!(matches(&reachable, "isekai-camera-v1", None));
     }
 
     /// **The awkward cases are the whole reason this is a function.** Each one
@@ -742,5 +1031,30 @@ mod tests {
             err.contains("--peer") && err.contains("ep:aaa") && err.contains("ep:bbb"),
             "lists what to choose between: {err}",
         );
+    }
+
+    /// **Why `stopped` is a drop guard and not a `cancel()` after the await.**
+    ///
+    /// A panic in the session loop is one of the endings the token exists to
+    /// report -- `portal-server` waits on it to decide whether to keep running
+    /// -- and a line placed after the await is exactly the line a panic skips.
+    /// Unwinding drops, so a guard covers it; this is the assertion that says
+    /// the distinction is real and not a guess about tokio.
+    #[tokio::test]
+    async fn a_session_that_panics_still_reports_that_it_stopped() {
+        let stopped = tokio_util::sync::CancellationToken::new();
+        let ended = stopped.clone().drop_guard();
+        let panicked = tokio::spawn(async move {
+            let _ended = ended;
+            panic!("the session loop came apart");
+        });
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), stopped.cancelled())
+                .await
+                .is_ok(),
+            "a caller waiting on `stopped` would have waited forever"
+        );
+        assert!(panicked.await.is_err(), "and it really did panic");
     }
 }

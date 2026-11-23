@@ -363,6 +363,7 @@ async fn token(a: Token) -> anyhow::Result<()> {
         device_name: a.device_name,
         token_ttl: a.ttl,
         key: load_key(&a.key)?,
+        narrowing: Default::default(),
     };
     let token = issue_endpoint_token(&cfg).await?;
     print_json(&serde_json::json!({
@@ -403,6 +404,7 @@ async fn connect(a: Connect) -> anyhow::Result<()> {
         device_name: None,
         token_ttl: None,
         key: load_key(&a.key)?,
+        narrowing: Default::default(),
     };
     let candidates = parse_candidates(&a.candidate)?;
     let session = InitiatorSession::connect_with_token(
@@ -414,13 +416,13 @@ async fn connect(a: Connect) -> anyhow::Result<()> {
         local_bind,
     )
     .await?;
-    print_json(&session.connection)?;
+    print_json(&session.connection())?;
     print_json(&serde_json::json!({
-        "relay_local_addr": session.local_addr.to_string(),
+        "relay_local_addr": session.local_addr().to_string(),
     }))?;
     tracing::info!(
         "relay leg running; send UDP to {} (Ctrl-C to stop)",
-        session.local_addr
+        session.local_addr()
     );
     tokio::signal::ctrl_c()
         .await
@@ -441,6 +443,9 @@ async fn run_bind(a: Bind) -> anyhow::Result<()> {
         // The CLI does not migrate paths, so the leg keeps its plain connected
         // socket and its own registration.
         isekai_p2p_core::bind::RelayOptions::default(),
+        // No family either: with no unconnected binding there is no direct
+        // path for a family to be agreed for.
+        None,
     )
     .await?;
     eprintln!(

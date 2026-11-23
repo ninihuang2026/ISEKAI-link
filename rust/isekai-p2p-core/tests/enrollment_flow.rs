@@ -295,7 +295,7 @@ async fn renewing_mints_one_assertion_and_signs_a_pop() {
         .await
         .expect("refresh challenge");
     let token = client
-        .refresh_token(auth, &key, &challenge, None)
+        .refresh_token(auth, &key, &challenge, None, None)
         .await
         .expect("refresh");
     assert_eq!(token.endpoint_token, "TOKEN.2");
@@ -331,6 +331,71 @@ async fn renewing_mints_one_assertion_and_signs_a_pop() {
     // re-issuing is for, so nothing here requests permissions or protocols.
     assert!(body["requested_permissions"].is_null());
     assert!(body["requested_protocols"].is_null());
+    // And with no selector given, none is sent.
+    assert!(body["requested_gateways"].is_null());
+}
+
+/// **The lease selector is the one axis a renewal must repeat.**
+///
+/// The server remembers a narrowing of permissions and protocols and says
+/// outright that it does not remember this one: leaving it out renews the lease
+/// at every Gateway offering the class. A caller that narrowed at issue and then
+/// went quiet would spread its grants across all of them from the first renewal
+/// onwards — which is the opposite of what asking for one Gateway meant.
+#[tokio::test]
+async fn a_renewal_repeats_the_lease_selector() {
+    let captured = Captured::default();
+    let app = Router::new()
+        .route(
+            "/v1/tokens/endpoint/refresh/challenge",
+            post(
+                |State(s): State<Captured>, h: HeaderMap, b: Bytes| async move {
+                    record(&s, "/v1/tokens/endpoint/refresh/challenge", h, b).await;
+                    Json(challenge_body())
+                },
+            ),
+        )
+        .route(
+            "/v1/tokens/endpoint/refresh",
+            post(
+                |State(s): State<Captured>, h: HeaderMap, b: Bytes| async move {
+                    record(&s, "/v1/tokens/endpoint/refresh", h, b).await;
+                    Json(json!({
+                        "endpoint_token": "TOKEN.2",
+                        "token_type": "Bearer",
+                        "expires_in": 900,
+                        "endpoint_id": "ep:abc",
+                        "permissions": ["peer-connect:initiate"],
+                        "protocols": ["isekai-portal-v1"],
+                    }))
+                },
+            ),
+        )
+        .with_state(captured.clone());
+
+    let client = serve(app).await;
+    let key = EndpointKey::generate();
+    let auth = enrolment("enr1_SECRET").with_assertion("OIDC.JWT");
+    let challenge = client
+        .refresh_challenge(auth, &key.endpoint_id())
+        .await
+        .expect("refresh challenge");
+    let gateways = vec!["ep:r1".to_owned()];
+    client
+        .refresh_token(auth, &key, &challenge, Some(&gateways), None)
+        .await
+        .expect("refresh");
+
+    let reqs = captured.0.lock().unwrap();
+    let (_, _, body) = reqs
+        .iter()
+        .find(|(path, _, _)| path == "/v1/tokens/endpoint/refresh")
+        .expect("the refresh was made");
+    assert_eq!(body["requested_gateways"], json!(["ep:r1"]));
+    // Still not these two: they are remembered, and re-sending them is how a
+    // caller would widen back towards the ceiling by accident.
+    assert!(body["requested_permissions"].is_null());
+    assert!(body["requested_protocols"].is_null());
 }
 
 /// The Auth0 route is unchanged by all of this: header, not body.
@@ -363,6 +428,58 @@ async fn renewing_on_auth0_still_uses_the_header() {
 }
 
 // ---- §8.7 ----
+
+/// **The Auth0 route names its own reason, and for a task it is not an
+/// exception.**
+///
+/// The four words the vocabulary used to hold — lost, deleted, revoked by an
+/// admin, compromised — are all exceptions. A task-scoped Endpoint revokes
+/// itself on every successful run, hundreds of times a day, and putting those
+/// under `endpoint_deleted` would bury an operator's own deletions among them
+/// (ISEKAI-identity#44, answered in #45).
+#[tokio::test]
+async fn a_finished_task_says_so() {
+    let captured = Captured::default();
+    let app = Router::new()
+        .route(
+            "/v1/endpoints/{endpoint_id}/revoke",
+            post(
+                |State(s): State<Captured>, h: HeaderMap, b: Bytes| async move {
+                    record(&s, "/revoke", h, b).await;
+                    Json(json!({
+                        "endpoint_id": "ep:A7-task1",
+                        "status": "revoked",
+                        "reason": "task_finished",
+                        "revoked_at": "2026-09-18T01:00:00Z",
+                        "proxy_notification": "delivered",
+                    }))
+                },
+            ),
+        )
+        .with_state(captured.clone());
+
+    let client = serve(app).await;
+    let revoked = client
+        .revoke_endpoint(
+            RevokeAuth::Auth0 {
+                token: "AUTH0_AT",
+                endpoint_id: "ep:A7-task1",
+                reason: RevokeReason::TaskFinished,
+            },
+            None,
+        )
+        .await
+        .expect("revoke");
+    assert_eq!(revoked.reason.as_deref(), Some("task_finished"));
+
+    let reqs = captured.take();
+    let (_p, headers, body) = &reqs[0];
+    assert_eq!(headers.get("authorization").unwrap(), "Bearer AUTH0_AT");
+    assert_eq!(body["reason"], "task_finished");
+    // The key route's field, which this route does not use: it authenticates
+    // as the person, and there is no Enrollment Key in an agent run.
+    assert!(body["enrollment_key"].is_null());
+}
 
 #[tokio::test]
 async fn self_revocation_sends_no_assertion_and_no_reason() {

@@ -22,6 +22,8 @@
 //! | 4 | **Does a multipath client still connect to a peer without it?** | yes |
 //! | 5 | Do both paths survive the window a validated path used to decay in, with the application silent? | yes |
 //! | 6 | **And the other way round — a plain client against a peer with it?** | yes |
+//! | 7 | **Does a path that never validates leave the connection alone?** | yes |
+//! | 8 | **And does it give its slot back, out of the four there are?** | only if the connection breaks — it reports |
 //!
 //! The two sides are set up the way the shipping code sets them up, because the
 //! answers are only worth having if they are about that arrangement: the viewer
@@ -83,6 +85,33 @@ const ALPN: &str = "multipath-spike";
 /// activated thirty-nine seconds later carried nothing, while fourteen seconds
 /// later worked.
 const OBSERVE: Duration = Duration::from_secs(60);
+
+/// How long question 7 watches after an unreachable candidate is advertised.
+///
+/// Has to outlast the failure it is looking for, and the field says that is not
+/// the 16s `DisconnectTimeoutMs` on its own: an idle forwarded SSH session died
+/// 53 seconds in, with the dead path's 1220-byte challenge outstanding from the
+/// third second and the path gone from `get_path_statistics` by the fourth. A
+/// 30-second window saw none of it and reported a pass.
+const FUSE: Duration = Duration::from_secs(90);
+
+/// How long question 8 waits for a failed path to give its slot back.
+///
+/// What it is timing is a path validation timeout plus however long
+/// `PATH_ABANDON` takes to settle, and the question is whether the slot comes
+/// back at all rather than how fast — so this only has to be comfortably longer
+/// than the two or three seconds a validation takes to give up. Twenty seconds
+/// was tried first and answered "never" at every step; ten says the same and
+/// keeps the spike inside its runtime.
+///
+/// **The polling is deliberately slow (250ms).** `get_path_statistics` queues an
+/// operation to msquic's connection worker and blocks the caller until it runs,
+/// which is what `portal_core::path` samples sparingly for the same reason.
+const SLOT_PATIENCE: Duration = Duration::from_secs(10);
+
+/// `QUIC_MAX_PATH_COUNT` (`quicdef.h`), as a bound on the open-until-refused
+/// loop so a core that stops refusing cannot spin forever.
+const MAX_PATHS: usize = 4;
 
 /// How long a path may go without sending before it gets a PING.
 ///
@@ -407,8 +436,268 @@ async fn multipath_round_trip(reg: &Arc<Registration>) -> anyhow::Result<()> {
         OBSERVE.as_secs()
     );
 
+    // Question 7: a path that never validates — the common case in the field
+    // rather than a corner, and the one that cost a production outage.
+    //
+    // A hole punch behind a symmetric NAT fails, and NAT traversal leaves the
+    // attempt behind: the peer advertised an address, msquic opened a path
+    // towards it, padded a `PATH_CHALLENGE` to the path MTU, and nothing ever
+    // came back. `QuicConnPathValidationTimeout` then took the *path* a few
+    // seconds later and left the *path id*, with that challenge still
+    // outstanding and nothing that could ever retire it — no path to retransmit
+    // on, no acknowledgement possible. Loss detection is counted per path id
+    // and its remedy was not: it closed the whole connection. Two idle
+    // forwarded SSH sessions died that way, at 27 and at 53 seconds, while
+    // their relay path carried in both directions the entire time.
+    //
+    // **Question 5's keepalive was the first suspect and it was wrong**, which
+    // is worth recording here because this file is where a reader will reach
+    // for it. The PING is ack-eliciting and `QuicSendPathKeepAlives` asks
+    // nothing about whether a path is carrying before sending one, so it looked
+    // like the thing lighting the fuse; gating it on `GotValidPacket` and
+    // running this question against the result changed nothing, because the
+    // validation timeout disposes of such a path before the first keepalive is
+    // ever due. The challenge, not the keepalive, is what stays behind.
+    //
+    // Opened with `add_path`, not advertised. A second `add_observed_addr` is
+    // the shape a camera behind a NAT actually produces, and it is also one this
+    // connection has already used once, with a different observed address — so
+    // it ends the connection in under a millisecond, long before anything here
+    // is measured, and asks nothing about the path id. `add_path` reaches the
+    // same state the failed punch leaves behind, directly and with one path id,
+    // which is the unit loss detection works in: `portal_core::path` opens the
+    // relay path the same way.
+    //
+    // A socket that is bound and never read is what makes this a *silent*
+    // failure, which is the one that matters: the datagrams arrive, so no ICMP
+    // comes back to tear the path down early, and no answer ever does either.
+    // Off-host blackholes are both worse — TEST-NET-1 is refused outright here,
+    // since this client is pinned to loopback and `add_path` takes its local
+    // address from the remote's (`portal_core::path::add_path_local`), and an
+    // unused loopback port answers with ICMP instead of silence.
+    //
+    // **Surviving the window is the weaker half of this question, and on its
+    // own it is not evidence.** It passed on loopback before seera-msquic #111
+    // too: whether an orphaned path id's deadline is ever evaluated depends on
+    // when the one connection-level loss detection timer next happens to be
+    // dispatched to it, and on loopback it is not — which is exactly why 30-
+    // and 90-second windows both reported a pass while the field was dying at
+    // 53. What makes this a check rather than a hope is the second half: msquic
+    // must *say* it gave up on the path. #111 abandons the path id and tells
+    // the peer, per draft-ietf-quic-multipath-21 §3.1 — "the endpoint MUST
+    // explicitly close the path" — where before there was no `PathRemoved` at
+    // all. More than one is expected and not an error: the abandon indicates it
+    // and the acknowledgement indicates it again, which #111 records as
+    // pre-existing in the peer-initiated flow.
+    let paths_before_q7 = client
+        .get_path_statistics()
+        .context("the path count before question 7")?
+        .len();
+    let blackhole = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+        .context("binding a socket that will never answer")?;
+    let unreachable = blackhole.local_addr().context("the blackhole's address")?;
+    client
+        .add_path(SocketAddr::new(unreachable.ip(), 0), unreachable)
+        .context("opening a path the peer can never answer on")?;
+
+    let lit = Instant::now();
+    let mut gave_up_on = Vec::new();
+    loop {
+        let left = FUSE.saturating_sub(lit.elapsed());
+        if left.is_zero() {
+            break;
+        }
+        let event = tokio::time::timeout(left, async {
+            tokio::select! {
+                event = poll_fn(|cx| client.poll_event(cx)) => (Side::Client, event),
+                event = poll_fn(|cx| server.poll_event(cx)) => (Side::Server, event),
+            }
+        })
+        .await;
+        match event {
+            Err(_) => break,
+            Ok((_, Ok(ConnectionEvent::PathRemoved { path_id, .. }))) => gave_up_on.push(path_id),
+            Ok((_, Ok(_))) => {}
+            Ok((side, Err(e))) => anyhow::bail!(
+                "the {} connection ended {:?} after a path to an unreachable address was \
+                 opened, with the relay and direct paths both still carrying: {e}",
+                match side {
+                    Side::Client => "client",
+                    Side::Server => "server",
+                },
+                lit.elapsed()
+            ),
+        }
+    }
+    if gave_up_on.is_empty() {
+        anyhow::bail!(
+            "the connection survived {}s with a path open to {unreachable}, but msquic \
+             never said it gave up on that path -- so the path id is still carrying an \
+             unanswerable challenge and this passed for the same reason it passed before \
+             the fix",
+            FUSE.as_secs()
+        );
+    }
+    println!(
+        "PASS  7. {}s with a path open to {unreachable}: the connection survived, and \
+         msquic abandoned path(s) {gave_up_on:?} rather than it",
+        FUSE.as_secs()
+    );
+
+    // Question 8: does a path that never came up give its slot back?
+    //
+    // `QUIC_MAX_PATH_COUNT` is 4 and a relay path plus a direct one already
+    // spend two, so `relay_repath_plan.md` §0.3 warns that a relay flapping
+    // every few seconds would run `add_path` out of slots. The record it rests
+    // on is a `QUIC_STATUS_NOT_FOUND` from `portal_core::path`'s give-up, read
+    // at the time as a path that could not be dropped and therefore sat on a
+    // slot for good. That reading has a rival: `RELAY_PATH_PATIENCE` is ten
+    // seconds and a path validation times out in two or three, so the thing
+    // being dropped may simply have been cleaned up already — in which case
+    // NOT_FOUND is the *proof* of that rather than evidence of a leak.
+    //
+    // The two differ in what they predict about the count, so this counts. It
+    // reports rather than asserts, because a refusal is the measurement and not
+    // a failure: the first version of this question used `?` on `add_path` and
+    // so stopped at the first `QUIC_STATUS_OUT_OF_MEMORY` with nothing to say
+    // about why. The only thing it fails on is the connection itself breaking.
+    //
+    // `0.0.0.0:0` as the local address is not a guess: `QuicConnRemovePath`
+    // matches a wildcard local address with port 0 against any path, so the
+    // remote alone selects. That is the only handle `portal_core::path` has on
+    // a path it opened with port 0 and never saw a `PathAdded` for.
+    //
+    // **Four is a lifetime budget, and the discriminator for that is next door.**
+    // Whether a path that *did* validate is reclaimed cannot be asked here:
+    // put after question 7's window it wedged — the second
+    // `get_path_statistics` never returned, twice, and since that call queues an
+    // operation to msquic's connection worker and *blocks the calling thread* it
+    // took the runtime with it, 900 seconds being a wedge rather than a timeout.
+    // Moved to the end of the question it completed but had nothing to say,
+    // since the removal is asynchronous and the count was already capped. **A
+    // step that measures nothing is worse than an absent one**, so it is gone
+    // from here; `path_stats_wedge.rs` asks it on a connection of its own. What
+    // it reports is that a path which never validated keeps its slot past sixty
+    // seconds in three runs of three, and that a validated one goes both ways
+    // between runs — so the half measured below is the settled half.
+    let wildcard = SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0));
+    let count = |what: &str| -> anyhow::Result<usize> {
+        Ok(client
+            .get_path_statistics()
+            .with_context(|| format!("the path count {what}"))?
+            .len())
+    };
+    let after_q7 = count("after question 7")?;
+    println!(
+        "      8. paths: {paths_before_q7} before question 7 opened one, {after_q7} after \
+         msquic abandoned it"
+    );
+
+    // (b) Does the wildcard handle reach a path that is still there? Removed at
+    // once, before any validation timeout can have disposed of it.
+    let hole_a = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+        .context("binding the first silent socket")?;
+    let addr_a = hole_a.local_addr().context("its address")?;
+    let opened_a = client.add_path(SocketAddr::new(addr_a.ip(), 0), addr_a);
+    let present = count("with a doomed path just opened")?;
+    let while_present = client.remove_path(wildcard, addr_a);
+    let settled_a = slots_back(&client, after_q7).await?;
+    println!(
+        "      8. (b) opened: {}, removed while present: {}, count {after_q7} -> {present} \
+         -> back in {settled_a:?}",
+        said(&opened_a),
+        said(&while_present)
+    );
+
+    // (c) And the same handle once msquic has given up on one by itself.
+    let base_b = count("before the second doomed path")?;
+    let hole_b = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+        .context("binding the second silent socket")?;
+    let addr_b = hole_b.local_addr().context("its address")?;
+    let opened_b = client.add_path(SocketAddr::new(addr_b.ip(), 0), addr_b);
+    let settled_b = slots_back(&client, base_b).await?;
+    let after_cleanup = client.remove_path(wildcard, addr_b);
+    println!(
+        "      8. (c) opened: {}, count {base_b} back in {settled_b:?}, removed after \
+         msquic disposed of it: {}",
+        said(&opened_b),
+        said(&after_cleanup)
+    );
+
+    // (d) The budget: open until refused, then see whether it returns.
+    let base_c = count("before opening until refused")?;
+    let mut holes = Vec::new();
+    let mut refusal = None;
+    while holes.len() <= MAX_PATHS {
+        let hole = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .context("binding a silent socket")?;
+        let addr = hole.local_addr().context("its address")?;
+        match client.add_path(SocketAddr::new(addr.ip(), 0), addr) {
+            Ok(()) => holes.push(hole),
+            Err(e) => {
+                refusal = Some(e);
+                break;
+            }
+        }
+    }
+    let peak = count("at the peak")?;
+    let settled_c = slots_back(&client, base_c).await?;
+    let hole_d = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+        .context("binding the last silent socket")?;
+    let addr_d = hole_d.local_addr().context("its address")?;
+    let once_more = client.add_path(SocketAddr::new(addr_d.ip(), 0), addr_d);
+    println!(
+        "      8. (d) {} doomed paths opened from a count of {base_c}, peak {peak}, {}; \
+         back to {base_c} in {settled_c:?}; add_path again: {}",
+        holes.len(),
+        match &refusal {
+            Some(e) => format!("then refused with {e}"),
+            None => format!("never refused (bound at {MAX_PATHS})"),
+        },
+        said(&once_more)
+    );
+
+    // The connection surviving all of that is the only thing asserted here.
+    let alive = count("at the end")?;
+    println!(
+        "PASS  8. the connection is still up with {alive} path(s) after all of that \
+         (see the lines above for the budget itself)"
+    );
     bridge.stop();
     Ok(())
+}
+
+/// How a `Result<()>` from the core reads in question 8's lines.
+fn said<E: std::fmt::Display>(r: &Result<(), E>) -> String {
+    match r {
+        Ok(()) => "accepted".to_owned(),
+        Err(e) => format!("refused with {e}"),
+    }
+}
+
+/// Wait for the path count to come back down to `baseline`, having first gone
+/// above it.
+///
+/// Returns how long that took, or `None` if it never did within
+/// [`SLOT_PATIENCE`]. **Requires having seen the count rise**, so a poll that
+/// arrives after the whole episode is over cannot be mistaken for a slot that
+/// was never taken.
+async fn slots_back(conn: &Connection, baseline: usize) -> anyhow::Result<Option<Duration>> {
+    let started = Instant::now();
+    let mut rose = false;
+    while started.elapsed() < SLOT_PATIENCE {
+        let now = conn
+            .get_path_statistics()
+            .context("reading the path count")?
+            .len();
+        if now > baseline {
+            rose = true;
+        } else if rose {
+            return Ok(Some(started.elapsed()));
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    Ok(None)
 }
 
 /// Questions 4 and 6: a mixed pair, in both directions.

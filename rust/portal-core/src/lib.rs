@@ -26,15 +26,23 @@
 //! stream would add reliability and ordering the application did not ask for
 //! and head-of-line blocking it does not expect.
 
+/// What agent mode refuses before it starts (`docs/portal_agent_plan.md` P1).
+pub mod agent;
 /// Credentials for a run with nobody at the keyboard.
 pub mod ci;
 pub mod client;
 pub mod config;
+/// The privacy policy, and refusing to run until it is agreed to.
+pub mod consent;
 pub mod datagram;
 pub mod frame;
+/// What a Gateway is willing to be told (`docs/portal_gateway_plan.md` P0).
+pub mod gateway;
 /// Keeping a Provisioning Key's Grant alive while the work runs.
 pub mod grant;
 pub mod login;
+/// The `[network]` section both binaries' configuration files carry.
+pub mod network;
 pub mod path;
 pub mod server;
 pub mod session;
@@ -42,7 +50,7 @@ pub mod shutdown;
 pub mod transport;
 pub mod udp;
 
-/// The ALPN this speaks. Distinct from the video's `sample`: a connection is
+/// The ALPN this speaks. Distinct from the video's `mjpeg`: a connection is
 /// one or the other, and a peer that offers neither should fail at the
 /// handshake rather than at the first frame.
 pub const PORTAL_ALPN: &str = "isekai-portal-v1";

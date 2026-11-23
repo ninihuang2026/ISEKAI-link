@@ -27,8 +27,10 @@ pub mod hostname;
 pub mod https;
 pub mod identity;
 pub mod mtu;
+pub mod outcome;
 pub mod pop;
 pub mod proxy;
+mod redact;
 
 /// msquic HTTP/3 transport for the proxy control plane (feature `msquic`).
 #[cfg(feature = "msquic")]
@@ -41,3 +43,11 @@ pub mod bind;
 /// Observed-address reports from a relay leg (feature `msquic`).
 #[cfg(feature = "msquic")]
 pub mod observed;
+
+/// Interposing on an inner QUIC connection's packets (feature `msquic`).
+#[cfg(feature = "msquic")]
+pub mod datapath;
+
+/// Which of the host's own addresses the stack may use (feature `msquic`).
+#[cfg(feature = "msquic")]
+pub mod local_address;

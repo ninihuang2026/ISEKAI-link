@@ -1,6 +1,7 @@
 package tools.isekai.cameraclient
 
 import android.app.Application
+import android.content.pm.ApplicationInfo
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.os.Build
@@ -72,6 +73,17 @@ data class ViewerUiState(
  * task 6 additions on top of task 5's bare connect/status/video skeleton.
  */
 class ViewerModel(application: Application) : AndroidViewModel(application) {
+    /**
+     * Whether "Skip TLS verification" exists at all: debuggable builds only.
+     *
+     * The switch turns off certificate checks for Identity, the control plane
+     * and the peer, so on a release build anyone on the same network could
+     * take the Auth0 token. A setting saved by a debug build of the same app
+     * is ignored here rather than honoured.
+     */
+    val allowsInsecureTls: Boolean =
+        (application.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
+
     val auth = AuthStore(application)
 
     private val _settings = MutableStateFlow(ViewerSettings.load(application))
@@ -434,7 +446,7 @@ class ViewerModel(application: Application) : AndroidViewModel(application) {
             listenerId = s.listenerId.trim(),
             expectedEndpoint = s.expectedEndpoint.trim(),
             register = s.register,
-            insecureSkipVerify = s.insecureSkipVerify,
+            insecureSkipVerify = allowsInsecureTls && s.insecureSkipVerify,
             enableMigration = s.enableMigration,
             logFilter = s.logFilter.trim(),
         )

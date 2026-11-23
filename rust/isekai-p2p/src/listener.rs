@@ -26,7 +26,7 @@ use isekai_p2p_core::bind::{
     open_bind_session, BindSession, InboundActivity, MasqueClientEvent, RelayOptions,
 };
 use isekai_p2p_core::endpoint::EndpointKey;
-use isekai_p2p_core::observed::{ObservedAddress, ObservedAddressWatch};
+use isekai_p2p_core::observed::{ObservedAddress, ObservedAddressWatch, ObservedAddresses};
 use isekai_p2p_core::proxy::{
     Capability, ConnectionStateFilter, Grant, ListenerEvent, PairingCode, PeerConnection,
     ProxyClient,
@@ -68,7 +68,7 @@ pub struct ListenerSession {
     /// is the normal order, since binding waits on a connection id pasted by
     /// hand — must keep seeing updates across rebinds. So the leg's watch is
     /// forwarded into this one rather than handed out directly.
-    observed_tx: watch::Sender<Option<ObservedAddress>>,
+    observed_tx: watch::Sender<ObservedAddresses>,
     /// Which leg each accepted local connection came in on, for a caller that
     /// serves more than one peer at a time. See [`LegDirectory`].
     legs: LegDirectory,
@@ -147,6 +147,21 @@ pub enum SignalingEvent {
     /// The proxy had more connections waiting than it would list. Whoever is
     /// beyond the cut cannot be seen from here (spec §8.5.3).
     Truncated,
+    /// Nothing has reached the control plane for [`UNREACHABLE_AFTER`], so this
+    /// session has stopped. **The last event any session sends.**
+    ///
+    /// Everything here retries, so this is not "a request failed" — it is
+    /// "nothing has worked for long enough that retrying is no longer a plan".
+    /// A server that receives this should stop with a failure rather than carry
+    /// on: it is still listed as a listener, and it can no longer bind anyone
+    /// who arrives.
+    Unreachable {
+        /// How long since the last call that worked.
+        unreachable_for: Duration,
+        /// The most recent failure, which is rarely the interesting one but is
+        /// the only one still to hand.
+        error: String,
+    },
 }
 
 /// What [`ListenerSession::poll_signaling`] remembers between polls.
@@ -277,6 +292,18 @@ struct BindGuard {
     /// [`renew_connections`](ListenerSession::renew_connections) last looked.
     inbound: InboundActivity,
     seen: u64,
+    /// When [`carried_traffic`](Self::carried_traffic) last saw new bytes on
+    /// this leg, or when the leg was bound if it never has.
+    ///
+    /// Diagnostic only (isekai-link#212): [`renew_connections`] only renews a
+    /// connection's row with the proxy for a leg that is still carrying
+    /// traffic, which is expected to go permanently quiet once a session
+    /// migrates onto a direct path -- so a long-idle leg here is not itself
+    /// evidence of anything wrong. Logged at the point this leg gets dropped
+    /// so a real occurrence shows whether that drop lines up with a
+    /// direct-path migration (long idle) or looks like something else (short
+    /// idle, i.e. the leg was still the one actually carrying traffic).
+    last_traffic: tokio::time::Instant,
     /// Re-tickets this leg so the proxy does not reclaim it (spec §8.14).
     ///
     /// **Not what `renew_connections` does.** That reports state, which carries
@@ -305,6 +332,9 @@ impl BindGuard {
         let count = self.inbound.count();
         let moved = count != self.seen;
         self.seen = count;
+        if moved {
+            self.last_traffic = tokio::time::Instant::now();
+        }
         moved
     }
 }
@@ -411,7 +441,7 @@ impl ListenerSession {
             protocol: cfg.protocol.clone(),
             binds: std::collections::HashMap::new(),
             opts,
-            observed_tx: watch::channel(None).0,
+            observed_tx: watch::channel(ObservedAddresses::default()).0,
             legs: LegDirectory::default(),
             _renewal: renewal,
             _relay_rtt: relay_rtt,
@@ -479,10 +509,20 @@ impl ListenerSession {
     /// `relay_base_url` is where this connection's relay answers, from the
     /// connection view. `None` — no registered relay — keeps the old
     /// behaviour of binding against the control plane's own data path.
+    ///
+    /// `relay_family` and `info_family` are the two places the chosen family
+    /// lives — `PeerConnection::relay_family` and `RelayInfo::family`. **Both,
+    /// not just the one a listener normally reads**, so that a control plane
+    /// populating one and not the other cannot constrain one end and leave the
+    /// other free: see [`relay_family::chosen`](crate::relay_family::chosen).
+    /// `None` for both — no common family, or a control plane that does not
+    /// choose — leaves the leg picking for itself, exactly as before.
     pub async fn bind(
         &mut self,
         connection_id: &str,
         relay_base_url: Option<&str>,
+        relay_family: Option<&str>,
+        info_family: Option<&str>,
     ) -> anyhow::Result<()> {
         if self.binds.contains_key(connection_id) {
             return Ok(());
@@ -508,7 +548,9 @@ impl ListenerSession {
         let (ticket, renewable) = match self.proxy.issue_relay_ticket(connection_id).await {
             Ok(ticket) => (Some(ticket), true),
             Err(e) => match crate::relay_lease::verdict(&e) {
-                crate::relay_lease::Verdict::Refused | crate::relay_lease::Verdict::LegGone => {
+                crate::relay_lease::Verdict::Refused
+                | crate::relay_lease::Verdict::LegGone
+                | crate::relay_lease::Verdict::Elsewhere => {
                     return Err(anyhow::anyhow!(
                         "the proxy will not authorize a relay leg for {connection_id}: {e}"
                     ));
@@ -536,6 +578,7 @@ impl ListenerSession {
         // relay, and the data path refuses it — correctly, and confusingly,
         // because the refusal names a ticket problem when the mistake was the
         // host we dialled.
+        let family = crate::relay_family::chosen(info_family, relay_family, connection_id);
         let session = open_bind_session(
             relay_base_url.unwrap_or(&self.proxy_url),
             // The current one, not the one the session started with: a leg
@@ -546,9 +589,14 @@ impl ListenerSession {
             self.forward_to,
             ticket.as_ref().map(|t| t.ticket.as_str()),
             self.opts.clone(),
+            family,
         )
         .await?;
         let inbound = session.inbound_activity();
+        // Taken before the session moves into the task below. **The leg's own
+        // answer to "where did this go"**, which is where its lease has to be
+        // renewed — see `RelayLegLease::spawn`.
+        let relay_origin = session.relay_origin().to_owned();
         // Own the session in a task that drains its notifications, so an unread
         // events channel can never stall the underlying MASQUE loop. Dropping
         // the task (on close) drops the session, whose Drop cancels the relay.
@@ -583,6 +631,7 @@ impl ListenerSession {
         let lease = renewable.then(|| {
             RelayLegLease::spawn(
                 self.proxy.clone(),
+                &relay_origin,
                 connection_id.to_owned(),
                 ticket.as_ref(),
                 CancellationToken::new(),
@@ -595,6 +644,7 @@ impl ListenerSession {
                 handle,
                 inbound,
                 seen: 0,
+                last_traffic: tokio::time::Instant::now(),
                 _lease: lease,
             },
         );
@@ -675,6 +725,7 @@ impl ListenerSession {
             .map(|(id, _)| id.clone())
             .collect();
         for id in ended {
+            tracing::info!(connection_id = %id, "the relay leg's own session ended; unbinding");
             self.unbind(&id);
             state.bound.remove(&id);
             state.spent.insert(id.clone());
@@ -682,6 +733,19 @@ impl ListenerSession {
         }
         // Connections the proxy no longer lists are over; drop their legs too.
         for id in forget_gone(state, &listing.connections) {
+            // Diagnostic only (isekai-link#212): distinguishes this path from
+            // `ended` above, and `idle_for` says whether this leg had already
+            // gone quiet (expected once a session migrates to a direct path,
+            // since `renew_connections` only renews a leg that is still
+            // carrying traffic) or was still active when the proxy stopped
+            // listing it (which would point elsewhere).
+            if let Some(guard) = self.binds.get(&id) {
+                tracing::warn!(
+                    connection_id = %id,
+                    idle_for = ?guard.last_traffic.elapsed(),
+                    "the proxy no longer lists this connection; unbinding its relay leg",
+                );
+            }
             self.unbind(&id);
             events.push(SignalingEvent::Unbound { connection_id: id });
         }
@@ -717,6 +781,8 @@ impl ListenerSession {
                 .bind(
                     &connection.connection_id,
                     connection.relay_base_url.as_deref(),
+                    connection.relay_family.as_deref(),
+                    connection.relay.as_ref().and_then(|r| r.family.as_deref()),
                 )
                 .await
             {
@@ -882,7 +948,7 @@ impl ListenerSession {
 /// address to advertise.
 async fn drive_bind_session(
     mut session: BindSession,
-    observed_tx: watch::Sender<Option<ObservedAddress>>,
+    observed_tx: watch::Sender<ObservedAddresses>,
     legs: LegDirectory,
 ) {
     let mut leg = session.observed();
@@ -907,10 +973,19 @@ async fn drive_bind_session(
                         );
                         attached.attach(socket, session.observed());
                     } else {
-                        tracing::debug!("bind session event: {event:?}");
+                        // Was `debug!`: everything else this can carry --
+                        // `ResponseBodyEnded`, `ResponseBodyReceiveError`, the
+                        // `*Failed` variants -- is exactly the kind of thing
+                        // that would explain why a leg ended, and none of it
+                        // was visible at the log level portal-server normally
+                        // runs at (isekai-link#212).
+                        tracing::info!("bind session event: {event:?}");
                     }
                 }
-                None => break,
+                None => {
+                    tracing::info!("this leg's event channel closed; its session has ended");
+                    break;
+                }
             },
             changed = leg.changed(), if leg_open => {
                 leg_open = republish_observed(&mut leg, &observed_tx, changed.is_ok());
@@ -924,20 +999,25 @@ async fn drive_bind_session(
 /// Returns whether the leg's watch is still worth polling: once it has ended
 /// (`changed_ok == false`) there is nothing more to forward.
 ///
-/// Only a `Some` is forwarded. A leg that ends without ever reporting leaves
-/// the session's last known address in place rather than blanking it — the
-/// server would otherwise stop advertising a direct path across a rebind that
-/// has not reported yet.
+/// Only a non-empty set is forwarded. A leg that ends without ever reporting
+/// leaves the session's last known addresses in place rather than blanking
+/// them — the server would otherwise stop advertising a direct path across a
+/// rebind that has not reported yet.
+///
+/// The whole set, since #371: a leg with paths in two families has an address
+/// in each, and forwarding one of them is how a dual-stack end came to offer
+/// an IPv4-only peer nothing it could use.
 fn republish_observed(
     leg: &mut ObservedAddressWatch,
-    out: &watch::Sender<Option<ObservedAddress>>,
+    out: &watch::Sender<ObservedAddresses>,
     changed_ok: bool,
 ) -> bool {
     if !changed_ok {
         return false;
     }
-    if let Some(observed) = *leg.borrow_and_update() {
-        out.send_replace(Some(observed));
+    let observed = leg.borrow_and_update().clone();
+    if !observed.is_empty() {
+        out.send_replace(observed);
     }
     true
 }
@@ -1017,6 +1097,39 @@ const RESUBSCRIBE_DELAY: Duration = Duration::from_secs(3);
 /// nonce on the proxy for each attempt — the store those go in is capped. So
 /// the gap grows until it reaches this, and drops back the moment one succeeds.
 const RESUBSCRIBE_MAX_DELAY: Duration = Duration::from_secs(300);
+/// How long the control plane may be unreachable before the session gives up.
+///
+/// **Retrying forever was the old answer, and it is the wrong one for a
+/// server.** Every call this loop makes retries on its own schedule, so a blip
+/// costs latency and nothing else — that part is right and is unchanged. What
+/// was missing is an end: with the control plane gone, the Endpoint Token
+/// eventually lapses, every proxy call starts failing, `config.rs`'s renewal
+/// loop says so once and then goes quiet, and the process sits there listed as
+/// a listener that answers nothing. Its own comment names the outcome: "a
+/// restart the only way back". Nothing in the process can restart it, so it has
+/// to stop and let whatever started it decide.
+///
+/// Measured from the last call that *worked*, not from the first that failed,
+/// so a proxy answering every other request is reachable and this never fires.
+///
+/// Nothing counts under [`AcceptPolicy::Manual`], and nothing should: both arms
+/// that reach the control plane are disabled there, so the loop is not serving
+/// anyone automatically and has no contact to lose. The operator's own
+/// commands reach the proxy, and each reports its failure to whoever asked.
+///
+/// Five minutes spans many attempts at whichever rate is running: a hundred
+/// polls without a stream ([`SIGNALING_POLL_INTERVAL`] is 3s), five with one
+/// ([`RECONCILE_INTERVAL`] is 60s). It is *equal* to
+/// [`RESUBSCRIBE_MAX_DELAY`] rather than longer than it, which would matter if
+/// opening a stream counted as contact — it does not, deliberately — and
+/// comfortably past the renewal's own 240s cap. Short enough, meanwhile, that
+/// a supervisor is restarting rather than an operator noticing.
+///
+/// An Endpoint Token lives about fifteen minutes, so identity being down is
+/// caught by its own clock first: the server keeps forwarding on the token it
+/// holds until that expires, which is the answer `config.rs` argues for, and
+/// only then does this one start counting.
+const UNREACHABLE_AFTER: Duration = Duration::from_secs(300);
 /// What a caller asks a running [`ListenerSession`] to do. Each carries a
 /// reply channel.
 ///
@@ -1052,6 +1165,34 @@ pub enum ListenerCommand {
         grant_id: String,
         reply: oneshot::Sender<anyhow::Result<()>>,
     },
+}
+/// Has the control plane been unreachable long enough to stop?
+///
+/// Called only from a failed call, and answers from `last_contact` rather than
+/// from this failure: one failure says nothing, because every call here retries
+/// and a proxy answering every other request is reachable. Sends
+/// [`SignalingEvent::Unreachable`] when it answers `true`, so the caller's only
+/// job is to stop the loop.
+fn unreachable_for_too_long(
+    events: &broadcast::Sender<SignalingEvent>,
+    last_contact: tokio::time::Instant,
+    error: &str,
+) -> bool {
+    let unreachable_for = last_contact.elapsed();
+    if unreachable_for < UNREACHABLE_AFTER {
+        return false;
+    }
+    // `error!`, where every attempt before it was `warn!`/`debug!`: this is the
+    // line that explains why the process stopped.
+    tracing::error!(
+        "control plane unreachable for {}s, giving up: {error}",
+        unreachable_for.as_secs()
+    );
+    let _ = events.send(SignalingEvent::Unreachable {
+        unreachable_for,
+        error: error.to_string(),
+    });
+    true
 }
 /// Drive a [`ListenerSession`] until `shutdown`.
 ///
@@ -1095,6 +1236,10 @@ pub async fn run(
     // (see `RESUBSCRIBE_MAX_DELAY`). The proxy sends keepalives, so a stream
     // that is up says so.
     let mut stream_delivered = false;
+    // The last time anything reached the control plane, which is what
+    // `UNREACHABLE_AFTER` is measured from. Starts now rather than at zero:
+    // a listener whose first poll has not come round yet is not unreachable.
+    let mut last_contact = tokio::time::Instant::now();
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
@@ -1123,6 +1268,21 @@ pub async fn run(
                         tracing::debug!(
                             "no event stream, polling instead (retrying in {resubscribe_delay:?}): {e:#}"
                         );
+                        // A second sentinel, not the one that fires: whenever
+                        // this arm is enabled the poll is too, and it runs
+                        // every few seconds against this arm's growing backoff,
+                        // so the poll is what notices. Checked anyway because
+                        // which call carries the window should not depend on
+                        // the two arms' relative rates. Note what is *not*
+                        // here: success does not touch `last_contact`.
+                        // Accepting a subscribe is not evidence it works --
+                        // see `stream_delivered` above -- and treating it as
+                        // contact would restart the window on every reconnect
+                        // of a proxy that accepts and then closes at once,
+                        // deferring the give-up a backoff cycle at a time.
+                        if unreachable_for_too_long(&events, last_contact, &format!("{e:#}")) {
+                            break;
+                        }
                         resubscribe_delay = (resubscribe_delay * 2).min(RESUBSCRIBE_MAX_DELAY);
                         resubscribe_at = tokio::time::Instant::now() + resubscribe_delay;
                     }
@@ -1135,9 +1295,17 @@ pub async fn run(
             event = async { stream.as_mut().expect("guarded").recv().await },
                     if stream.is_some() => {
                 match event {
-                    Some(ListenerEvent::Keepalive) => stream_delivered = true,
+                    // Contact, keepalive included -- that is what a keepalive
+                    // is for. Without this a proxy whose stream is healthy
+                    // while its listing endpoint returns 5xx would be called
+                    // unreachable while it was demonstrably answering.
+                    Some(ListenerEvent::Keepalive) => {
+                        stream_delivered = true;
+                        last_contact = tokio::time::Instant::now();
+                    }
                     Some(_) => {
                         stream_delivered = true;
+                        last_contact = tokio::time::Instant::now();
                         poll.reset_immediately();
                     }
                     None => {
@@ -1184,6 +1352,9 @@ pub async fn run(
             _ = poll.tick(), if policy != AcceptPolicy::Manual => {
                 match session.poll_signaling(&mut signaling, policy).await {
                     Ok(found) => {
+                        // Reached it. An empty answer counts: "nobody is
+                        // waiting" is a working proxy saying so.
+                        last_contact = tokio::time::Instant::now();
                         for event in found {
                             tracing::info!("signaling: {event:?}");
                             // No subscribers is not a failure — the application
@@ -1192,8 +1363,15 @@ pub async fn run(
                         }
                     }
                     // The proxy being briefly unreachable is not a reason to
-                    // stop serving; the next tick tries again.
-                    Err(e) => tracing::warn!("signaling poll failed: {e:#}"),
+                    // stop serving; the next tick tries again. Being
+                    // unreachable for `UNREACHABLE_AFTER` is, because by then
+                    // the next tick has already tried, many times.
+                    Err(e) => {
+                        tracing::warn!("signaling poll failed: {e:#}");
+                        if unreachable_for_too_long(&events, last_contact, &format!("{e:#}")) {
+                            break;
+                        }
+                    }
                 }
             }
             cmd = cmd_rx.recv() => match cmd {
@@ -1217,7 +1395,12 @@ pub async fn run(
                     let result = match session.proxy.get_connection(&connection_id).await {
                         Ok(c) => {
                             session
-                                .bind(&connection_id, c.relay_base_url.as_deref())
+                                .bind(
+                                    &connection_id,
+                                    c.relay_base_url.as_deref(),
+                                    c.relay_family.as_deref(),
+                                    c.relay.as_ref().and_then(|r| r.family.as_deref()),
+                                )
                                 .await
                         }
                         Err(e) => Err(anyhow::anyhow!(
@@ -1244,6 +1427,7 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use isekai_p2p_core::transport::Binding;
 
     /// Built from the JSON the proxy actually sends, not from the struct.
     ///
@@ -1331,7 +1515,25 @@ mod tests {
         ObservedAddress {
             local: addr(port),
             observed: addr(port + 1),
+            binding: Binding::Unconnected,
         }
+    }
+
+    fn v6(port: u16) -> ObservedAddress {
+        let local = SocketAddr::from((
+            std::net::Ipv6Addr::new(0x2001, 0xdb8, 2, 0, 0, 0, 0, 0x10),
+            port,
+        ));
+        ObservedAddress {
+            local,
+            observed: local,
+            binding: Binding::Unconnected,
+        }
+    }
+
+    /// One report, as a leg's whole set.
+    fn reported(port: u16) -> ObservedAddresses {
+        [observed(port)].into_iter().collect()
     }
 
     /// The point of the session-lifetime watch: a receiver taken *before* any
@@ -1340,54 +1542,72 @@ mod tests {
     /// server started watching.
     #[test]
     fn a_receiver_taken_before_the_first_bind_sees_the_leg_report() {
-        let session = watch::channel(None).0;
+        let session = watch::channel(ObservedAddresses::default()).0;
         let mut early = session.subscribe();
-        assert_eq!(*early.borrow_and_update(), None);
+        assert!(early.borrow_and_update().is_empty());
 
-        let (leg_tx, mut leg_rx) = watch::channel(None);
-        leg_tx.send_replace(Some(observed(1000)));
+        let (leg_tx, mut leg_rx) = watch::channel(ObservedAddresses::default());
+        leg_tx.send_replace(reported(1000));
         assert!(republish_observed(&mut leg_rx, &session, true));
 
-        assert_eq!(*early.borrow_and_update(), Some(observed(1000)));
+        assert_eq!(*early.borrow_and_update(), reported(1000));
     }
 
     /// And it survives the leg being replaced: `bind` can be called again, and
     /// the same receiver picks up the new leg's address.
     #[test]
     fn the_watch_survives_a_rebind() {
-        let session = watch::channel(None).0;
+        let session = watch::channel(ObservedAddresses::default()).0;
         let mut held = session.subscribe();
 
-        let (first_tx, mut first_rx) = watch::channel(None);
-        first_tx.send_replace(Some(observed(1000)));
+        let (first_tx, mut first_rx) = watch::channel(ObservedAddresses::default());
+        first_tx.send_replace(reported(1000));
         republish_observed(&mut first_rx, &session, true);
-        assert_eq!(*held.borrow_and_update(), Some(observed(1000)));
+        assert_eq!(*held.borrow_and_update(), reported(1000));
 
-        // The first leg ends; the session keeps its last known address.
+        // The first leg ends; the session keeps its last known addresses.
         assert!(!republish_observed(&mut first_rx, &session, false));
-        assert_eq!(*held.borrow(), Some(observed(1000)));
+        assert_eq!(*held.borrow(), reported(1000));
 
         // A second leg reports, and the *same* receiver sees it.
-        let (second_tx, mut second_rx) = watch::channel(None);
-        second_tx.send_replace(Some(observed(2000)));
+        let (second_tx, mut second_rx) = watch::channel(ObservedAddresses::default());
+        second_tx.send_replace(reported(2000));
         republish_observed(&mut second_rx, &session, true);
-        assert_eq!(*held.borrow_and_update(), Some(observed(2000)));
+        assert_eq!(*held.borrow_and_update(), reported(2000));
     }
 
-    /// A leg that changes to `None` must not blank an address the server is
-    /// still advertising.
+    /// A leg that reports nothing must not blank addresses the server is still
+    /// advertising — which is what a reconnect does, since the set starts
+    /// again with each connection.
     #[test]
     fn an_empty_leg_report_does_not_clear_the_session_address() {
-        let session = watch::channel(None).0;
+        let session = watch::channel(ObservedAddresses::default()).0;
         let held = session.subscribe();
 
-        let (leg_tx, mut leg_rx) = watch::channel(None);
-        leg_tx.send_replace(Some(observed(1000)));
+        let (leg_tx, mut leg_rx) = watch::channel(ObservedAddresses::default());
+        leg_tx.send_replace(reported(1000));
         republish_observed(&mut leg_rx, &session, true);
 
-        leg_tx.send_replace(None);
+        leg_tx.send_replace(ObservedAddresses::default());
         republish_observed(&mut leg_rx, &session, true);
-        assert_eq!(*held.borrow(), Some(observed(1000)));
+        assert_eq!(*held.borrow(), reported(1000));
+    }
+
+    /// **The whole set is forwarded** (#371). A leg with a path in each family
+    /// reports an address in each, and a session that forwarded one of them is
+    /// how a dual-stack end offered an IPv4-only peer nothing it could use.
+    #[test]
+    fn a_leg_with_two_addresses_republishes_both() {
+        let session = watch::channel(ObservedAddresses::default()).0;
+        let held = session.subscribe();
+
+        let both: ObservedAddresses = [observed(1000), v6(2000)].into_iter().collect();
+        let (leg_tx, mut leg_rx) = watch::channel(ObservedAddresses::default());
+        leg_tx.send_replace(both.clone());
+        republish_observed(&mut leg_rx, &session, true);
+
+        assert_eq!(*held.borrow(), both);
+        assert_eq!(held.borrow().len(), 2);
     }
 
     /// A peer that vanished without reporting stays listed until the proxy
@@ -1420,7 +1640,7 @@ mod tests {
 
     /// A leg that has already reported the binding `port` names.
     fn leg_watch(port: u16) -> ObservedAddressWatch {
-        watch::channel(Some(observed(port))).0.subscribe()
+        watch::channel(reported(port)).0.subscribe()
     }
 
     /// Where a leg's forwarding socket delivers from — loopback, because that
@@ -1441,8 +1661,8 @@ mod tests {
         let first = legs.leg_for(forwarding(40001)).expect("the first leg");
         let second = legs.leg_for(forwarding(40002)).expect("the second leg");
 
-        assert_eq!(first.borrow().expect("reported").local, addr(1));
-        assert_eq!(second.borrow().expect("reported").local, addr(2));
+        assert_eq!(first.borrow().newest().expect("reported").local, addr(1));
+        assert_eq!(second.borrow().newest().expect("reported").local, addr(2));
     }
 
     /// An address no leg forwards from is not this listener's to answer for —
@@ -1465,7 +1685,7 @@ mod tests {
 
         for port in [40001, 40002] {
             let leg = legs.leg_for(forwarding(port)).expect("the leg");
-            assert_eq!(leg.borrow().expect("reported").local, addr(7));
+            assert_eq!(leg.borrow().newest().expect("reported").local, addr(7));
         }
     }
 
@@ -1511,6 +1731,7 @@ mod tests {
             handle: tokio::spawn(std::future::ready(())),
             inbound,
             seen: 0,
+            last_traffic: tokio::time::Instant::now(),
             _lease: None,
         }
     }
@@ -1553,5 +1774,122 @@ mod tests {
 
         leg.inbound.record();
         assert!(leg.carried_traffic(), "and it recovers if the peer returns");
+    }
+
+    /// One failed call is the normal case and must decide nothing: the proxy is
+    /// reached again on the next tick far more often than not.
+    #[tokio::test(start_paused = true)]
+    async fn one_failure_is_not_giving_up() {
+        let (events, mut watching) = broadcast::channel(8);
+        let last_contact = tokio::time::Instant::now();
+
+        tokio::time::advance(Duration::from_secs(3)).await;
+
+        assert!(!unreachable_for_too_long(
+            &events,
+            last_contact,
+            "connection refused"
+        ));
+        assert!(
+            watching.try_recv().is_err(),
+            "and it says nothing while it is still only a failure"
+        );
+    }
+
+    /// The window has to be spent in full. Anything shorter turns a proxy
+    /// restart -- or a backoff that has climbed to its own cap, which is
+    /// shorter than this by design -- into a stopped server.
+    #[tokio::test(start_paused = true)]
+    async fn giving_up_takes_the_whole_window() {
+        let (events, _watching) = broadcast::channel(8);
+        let last_contact = tokio::time::Instant::now();
+
+        tokio::time::advance(UNREACHABLE_AFTER - Duration::from_secs(1)).await;
+        assert!(
+            !unreachable_for_too_long(&events, last_contact, "connection refused"),
+            "a second short of the window is still retrying"
+        );
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(unreachable_for_too_long(
+            &events,
+            last_contact,
+            "connection refused"
+        ));
+    }
+
+    /// **The whole point of measuring from the last success.** A proxy that
+    /// answers one call in ten is reachable, and a listener that stopped
+    /// because failures had merely accumulated would stop on a flaky network it
+    /// was still working over.
+    #[tokio::test(start_paused = true)]
+    async fn a_call_that_works_puts_the_window_back() {
+        let (events, _watching) = broadcast::channel(8);
+        let mut last_contact = tokio::time::Instant::now();
+
+        tokio::time::advance(UNREACHABLE_AFTER - Duration::from_secs(1)).await;
+        assert!(!unreachable_for_too_long(
+            &events,
+            last_contact,
+            "timed out"
+        ));
+
+        // One poll gets through, which is all the loop does with a success.
+        last_contact = tokio::time::Instant::now();
+
+        tokio::time::advance(UNREACHABLE_AFTER - Duration::from_secs(1)).await;
+        assert!(
+            !unreachable_for_too_long(&events, last_contact, "timed out"),
+            "the window restarted at the call that worked"
+        );
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(
+            unreachable_for_too_long(&events, last_contact, "timed out"),
+            "and runs out from there"
+        );
+    }
+
+    /// The event carries the two things an operator reading the exit needs: how
+    /// long nothing worked, and what the last attempt said.
+    #[tokio::test(start_paused = true)]
+    async fn giving_up_says_how_long_and_why() {
+        let (events, mut watching) = broadcast::channel(8);
+        let last_contact = tokio::time::Instant::now();
+
+        tokio::time::advance(UNREACHABLE_AFTER + Duration::from_secs(42)).await;
+        assert!(unreachable_for_too_long(
+            &events,
+            last_contact,
+            "503 Service Unavailable"
+        ));
+
+        match watching.try_recv().expect("the reason is published") {
+            SignalingEvent::Unreachable {
+                unreachable_for,
+                error,
+            } => {
+                assert_eq!(unreachable_for, UNREACHABLE_AFTER + Duration::from_secs(42));
+                assert_eq!(error, "503 Service Unavailable");
+            }
+            other => panic!("expected Unreachable, got {other:?}"),
+        }
+    }
+
+    /// Nobody listening does not make the control plane reachable. The send is
+    /// deliberately ignored -- a listener serves whether or not a UI is
+    /// watching -- so the answer must not come from whether it landed.
+    #[tokio::test(start_paused = true)]
+    async fn giving_up_does_not_depend_on_anyone_listening() {
+        let (events, watching) = broadcast::channel(8);
+        drop(watching);
+        let last_contact = tokio::time::Instant::now();
+
+        tokio::time::advance(UNREACHABLE_AFTER + Duration::from_secs(1)).await;
+        assert!(unreachable_for_too_long(
+            &events,
+            last_contact,
+            "connection refused"
+        ));
     }
 }

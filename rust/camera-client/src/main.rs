@@ -14,6 +14,7 @@ use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
 async fn main() -> eframe::Result<()> {
+    isekai_link_utils::version_if_asked!();
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_span_events(tracing_subscriber::fmt::format::FmtSpan::FULL)
@@ -128,7 +129,7 @@ struct MyApp {
     /// another one.
     auth0_store_path: String,
     /// The device sign-in, and what to show while it runs.
-    auth0_login: camera_core::auth0::DeviceSignIn,
+    auth0_login: camera_core::auth0::BrowserSignIn,
     /// Set once tokens exist, from a sign-in or from `auth0_store_path`. What
     /// keeps a long viewing session's Endpoint Token renewable past the access
     /// token's few hours.
@@ -196,11 +197,11 @@ impl MyApp {
             proxy_url: "https://link.isekai.tools:6443".to_string(),
             auth0_token: String::new(),
             auth0_store_path: "camera-client-auth0.json".to_string(),
-            auth0_login: camera_core::auth0::DeviceSignIn::default(),
+            auth0_login: camera_core::auth0::BrowserSignIn::default(),
             // Filled in below from whatever a previous sign-in left behind.
             auth0_source: None,
             key_path: "camera-client-endpoint.pem".to_string(),
-            protocol: "isekai-validator-v1".to_string(),
+            protocol: camera_core::CAMERA_PROTOCOL.to_string(),
             register: true,
             capability: String::new(),
             listener_id: String::new(),
@@ -237,7 +238,7 @@ impl MyApp {
     fn with_stored_auth0(mut self) -> Self {
         let path = std::path::Path::new(&self.auth0_store_path);
         if let Ok(tokens) = camera_core::auth0::RefreshingAuth0Token::load(path) {
-            self.auth0_login = camera_core::auth0::DeviceSignIn::restored();
+            self.auth0_login = camera_core::auth0::BrowserSignIn::restored();
             self.auth0_source = Some(camera_core::auth0::RefreshingAuth0Token::with_sign_in(
                 camera_core::auth0::Auth0Config::default(),
                 tokens,
@@ -311,6 +312,7 @@ impl MyApp {
             // registration so the video connection can share it.
             let local_bind = "127.0.0.1:0".parse().expect("valid loopback addr");
             let relay_options = RelayOptions {
+                datapath_hook: None,
                 unconnected: true,
                 registration: Some(Arc::clone(&reg)),
             };
@@ -355,7 +357,7 @@ impl MyApp {
             // proxy names both.
             match camera_core::paired::check(
                 &expected_endpoint,
-                session.connection.peer_endpoint.as_deref(),
+                session.connection().peer_endpoint.as_deref(),
             ) {
                 // Said either way. A connection that was held against a pairing
                 // and one that had nothing to be held against both go on to
@@ -376,7 +378,7 @@ impl MyApp {
                     return;
                 }
             }
-            let local_port = session.local_addr.port();
+            let local_port = session.local_addr().port();
             // Dial the peer's loopback FQDN (which resolves to 127.0.0.1) so the
             // per-endpoint relay certificate can be validated. When the proxy has
             // relay certificates disabled, fall back to 127.0.0.1 unvalidated.
@@ -387,7 +389,7 @@ impl MyApp {
             // What the peer signed about its own key, if it has said anything.
             // Absent is ordinary and changes nothing; present means the
             // handshake has to produce that key (§8.6.5).
-            let pin = match camera_core::AttestedPeer::from_connection(&session.connection) {
+            let pin = match camera_core::AttestedPeer::from_connection(&session.connection()) {
                 Ok(pin) => {
                     tracing::info!(
                         peer = %pin.peer_endpoint,
@@ -536,6 +538,7 @@ impl MyApp {
     fn p2p_config(&self) -> anyhow::Result<P2pConfig> {
         let key = camera_core::load_or_generate_key(std::path::Path::new(&self.key_path))?;
         Ok(P2pConfig {
+            narrowing: Default::default(),
             identity_url: self.identity_url.clone(),
             identity_http3: false,
             proxy_url: self.proxy_url.clone(),
@@ -729,9 +732,10 @@ impl MyApp {
                         self.auth0_login.sign_out();
                     }
                 }
-                camera_core::auth0::SignInState::Waiting { user_code, url } => {
-                    ui.label("enter this code:");
-                    ui.monospace(user_code);
+                camera_core::auth0::SignInState::Waiting { url } => {
+                    // No code to transcribe: the browser redirects back to a
+                    // loopback port this process is already listening on.
+                    ui.label("finish signing in:");
                     ui.hyperlink_to("open the page", url);
                 }
                 camera_core::auth0::SignInState::SignedOut

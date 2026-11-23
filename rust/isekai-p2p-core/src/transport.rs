@@ -6,25 +6,122 @@
 //! msquic-served proxy. Header injection (Endpoint Token + PoP) is done by the
 //! caller ([`crate::proxy::ProxyClient`]); this just performs the exchange.
 
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Context as _;
 use bytes::Bytes;
 use channel_masque::H3Channel;
+/// Re-exported so a caller of [`MasqueH3Transport::connect_unconnected`] can
+/// name the family without taking a dependency on the QUIC client crate.
+pub use h3_util::client::AddressFamily;
+use h3_util::msquic_async::Established;
 use h3_util::msquic_async::H3MsQuicAsyncConnector;
 use h3_util::msquic_async::h3_msquic_async::{msquic, msquic_async};
+/// Re-exported so a caller can read [`Landing::binding`] without a dependency
+/// on the QUIC client crate.
+pub use h3_util::msquic_async::{Binding, Connected};
 use http::{Method, Request, Uri};
 use http_body_util::{BodyExt, Full};
 use tower::{Service, ServiceExt};
 
 use crate::proxy::{ControlPlaneTransport, HttpResponse};
 
+/// Which families a relay's name actually resolves to.
+///
+/// **The answer to "how should the probe budget be split between the
+/// families?" turned out to be "do not ask a family that has no address"**
+/// (plan §8.1). Measured in the field: asking for a family the name does not
+/// have costs nothing — `first_routable` has nothing to reorder and rejects at
+/// the route test rather than at a handshake — so the only expensive case left
+/// is a family that *does* resolve and black-holes UDP, which spends the whole
+/// `per_relay`. That one is visible here, before any packet is sent.
+///
+/// So a single-stack relay costs one probe instead of two. **It still costs
+/// one** — its single family is reported, because when the far end is
+/// dual-stack that one family is the half that decides. Dropping it is what
+/// stopped a direct path forming on 2026-11-04 (plan §8.1 追記 2).
+///
+/// **A resolver failure probes everything rather than nothing.** A hiccup in
+/// DNS should not quietly turn the observation off; the probe resolves again
+/// for itself and will fail there if the name really is gone.
+pub async fn families_resolved(base_url: &str) -> Vec<AddressFamily> {
+    let both = vec![AddressFamily::V4, AddressFamily::V6];
+    let Ok(uri) = base_url.parse::<Uri>() else {
+        return both;
+    };
+    let addrs = match h3_util::client::dns_resolve(&uri).await {
+        Ok(addrs) => addrs,
+        Err(err) => {
+            tracing::debug!(%err, base_url, "could not resolve a relay; probing both families");
+            return both;
+        }
+    };
+    let resolved: Vec<AddressFamily> = both
+        .iter()
+        .copied()
+        .filter(|family| addrs.iter().any(|addr| family.holds(addr)))
+        .collect();
+    if resolved.is_empty() {
+        // Resolved to nothing at all. Probing says so with a real error
+        // rather than an empty set that looks like a decision.
+        return both;
+    }
+    resolved
+}
+
+/// The family a wire spelling names, or `None` for anything else.
+///
+/// **Unknown is not an error.** A control plane that grows a third spelling,
+/// or a typo in a deployment's own config, must not cost the connection: the
+/// family is a preference and dropping it falls back to "no constraint",
+/// which is what absent already means (plan Q5, Q6). The caller logs it.
+///
+/// The inverse of [`family_name`], and the pair is what keeps a report and
+/// the answer to it talking about the same thing.
+pub fn family_from_name(name: &str) -> Option<AddressFamily> {
+    match name {
+        "v4" => Some(AddressFamily::V4),
+        "v6" => Some(AddressFamily::V6),
+        _ => None,
+    }
+}
+
+/// The wire spelling of an address family: `"v4"` / `"v6"`.
+///
+/// **One place, because two sides have to agree.** It is what
+/// [`RelayReach::families`](crate::proxy::RelayReach::families) is sent as and
+/// what `RelayInfo.family` comes back as, and `proxy` cannot name
+/// `AddressFamily` at all — that type arrives with the `msquic` feature, and
+/// the module holding the wire types builds without it.
+pub fn family_name(family: AddressFamily) -> &'static str {
+    match family {
+        AddressFamily::V4 => "v4",
+        AddressFamily::V6 => "v6",
+    }
+}
+
 /// An HTTP/3 control-plane transport to the MASQUE proxy.
 #[derive(Clone)]
 pub struct MasqueH3Transport {
     channel: H3Channel<H3MsQuicAsyncConnector, Full<Bytes>>,
     uri: Uri,
+    /// Connections the connector hands back, for the measuring path. `None`
+    /// for one from [`MasqueH3Transport::connect`], which does not watch —
+    /// nothing there needs to know.
+    conns: Option<Arc<Mutex<tokio::sync::mpsc::Receiver<Established>>>>,
+}
+
+/// Where a measuring connection actually ended up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Landing {
+    /// The peer. Its family is the one the relay answered in — which is not
+    /// necessarily the one that was asked for.
+    pub remote: SocketAddr,
+    /// The socket mode the connector settled on, which the request's success
+    /// does not reveal: asking for an unconnected socket is not getting one.
+    pub binding: Binding,
 }
 
 impl MasqueH3Transport {
@@ -65,27 +162,157 @@ impl MasqueH3Transport {
             .context("failed to build request")
     }
 
+    /// `scheme://authority` — where this transport sends, with no path.
+    ///
+    /// Lets a caller ask "am I already connected there?" before opening a
+    /// second connection to the same host.
+    pub fn origin(&self) -> String {
+        match (self.uri.scheme_str(), self.uri.authority()) {
+            (Some(scheme), Some(authority)) => format!("{scheme}://{authority}"),
+            _ => self.uri.to_string(),
+        }
+    }
+
     /// Connect to the proxy at `target` (e.g. `https://link.isekai.tools:6443`).
     pub fn connect(target: &str) -> anyhow::Result<Self> {
+        Self::build(target, None)
+    }
+
+    /// Ask the relay at `target` the way a **relay leg** would: on an
+    /// unconnected, shared binding, preferring `family`, with no TCP fallback.
+    ///
+    /// **For measuring whether a relay answers in a family, and only that.**
+    /// A leg's socket is unconnected, and the two modes do not behave the same
+    /// on a 464XLAT host: a connected socket is associated with the CLAT
+    /// translator's path at `connect()` time and works through it, while an
+    /// unconnected one is only `bind()`-ed and does not (isekai-link#213).
+    /// So a measurement taken on `connect`'s connected socket answers a
+    /// different question from the one a leg will ask, and on a 464XLAT host
+    /// it answers it wrongly — "v4 works", for a family the leg cannot use.
+    ///
+    /// **Success here is not the answer — [`landing`](Self::landing) is.**
+    /// Two things make the request's success say less than it looks like it
+    /// says, and both are read off the landing rather than assumed:
+    ///
+    /// - The family is a *preference*. If nothing in it routes, the connector
+    ///   still reaches the others, which is right for a leg and not enough for
+    ///   a measurement: a name with no `AAAA` probed with `AddressFamily::V6`
+    ///   succeeds over v4. `landing().remote` is which family was really used.
+    /// - The socket mode is a preference too. The connector answers a request
+    ///   for an unconnected binding with an ordinary connected socket in three
+    ///   cases, and the request still succeeds — while measuring something a
+    ///   leg cannot reproduce. Two of them can happen here: a CLAT translator
+    ///   stub for a local address, and no resolved address that could be bound
+    ///   and connected. The third, the QMUX/TCP fallback, is removed rather
+    ///   than detected: this path is built without a QMUX configuration at
+    ///   all, so a failed QUIC start returns the error (see `build`).
+    ///   `landing().binding` is the connector's own answer for which it was,
+    ///   so none of it has to be inferred from the addresses.
+    ///
+    /// Must be called from inside a tokio runtime.
+    pub fn connect_unconnected(target: &str, family: AddressFamily) -> anyhow::Result<Self> {
+        Self::build(target, Some(family))
+    }
+
+    /// Where the connection this transport last used ended up.
+    ///
+    /// **Call it after an exchange has succeeded, and it does not race.** The
+    /// connector hands the connection over once the handshake is done and
+    /// before it builds the HTTP/3 connection the request goes out on, so a
+    /// completed request means the connection is already queued here.
+    ///
+    /// **Does not wait, on purpose.** The sender lives in the connector this
+    /// transport owns, so it is never dropped while `self` is alive and an
+    /// awaiting `recv()` would pend forever rather than report "nothing was
+    /// connected". Taking whatever is queued cannot hang, and an empty queue
+    /// is the honest `None`.
+    ///
+    /// **Newest wins.** The queue is in order of dial, and the channel
+    /// reconnects when a driver dies: a connection established and
+    /// immediately lost, with the request served by the next one, leaves two.
+    /// The last is the one that answered.
+    ///
+    /// `None` means nothing was connected, or a transport from
+    /// [`connect`](Self::connect), which does not watch.
+    pub fn landing(&self) -> Option<Landing> {
+        let conns = self.conns.as_ref()?;
+        let mut conns = conns.lock().ok()?;
+        let mut newest = None;
+        while let Ok(conn) = conns.try_recv() {
+            newest = Some(conn);
+        }
+        let established = newest?;
+        Some(Landing {
+            remote: established.conn.get_remote_addr().ok()?,
+            binding: established.binding,
+        })
+    }
+
+    /// Everything both constructors share, so they cannot drift on the parts
+    /// that are not the point: the certificate check and the QMUX fallback.
+    fn build(target: &str, measuring: Option<AddressFamily>) -> anyhow::Result<Self> {
         let uri: Uri = target.parse().context("invalid proxy target URI")?;
-        let (registration, config) = make_client_config(None, false)?;
-        let (registration, config_qmux) = make_client_config(Some(registration), true)?;
+        let (registration, config) = make_client_config(None, false, Liveness::ControlPlane)?;
+        // **The TCP fallback, and why the measuring path must not have it.**
+        // See `bind::relay_connector` for the mechanism; for the control plane
+        // it is what lets a host whose egress drops UDP reach it at all -- a
+        // control plane serving QMUX on its TCP port is dialled at the same
+        // address, so there is nothing to choose and nothing to pass.
+        //
+        // A measurement is a different question. The fallback dials TCP and
+        // resolves the host itself, so the family preference does not reach
+        // it: a relay whose AAAA host has UDP/443 firewalled and TCP/443 open
+        // would answer `/health` over TCP and be recorded as a family that
+        // works -- for a leg that is UDP only and would have nowhere to go.
+        // Without a QMUX configuration the connector returns the QUIC error
+        // instead, which is the honest "this family did not answer".
+        let config_qmux = match measuring {
+            Some(_) => None,
+            None => {
+                // `make_client_config` hands back the registration it was
+                // given, so the one dropped here is the one still held.
+                let (_, config_qmux) =
+                    make_client_config(Some(registration.clone()), true, Liveness::ControlPlane)?;
+                Some(config_qmux)
+            }
+        };
         // The certificate has to name the host we dialled, and that is checked
         // here rather than assumed of the layer below (#134).
         let host = uri
             .host()
             .context("proxy target URI has no host")?
             .to_owned();
-        let connector = H3MsQuicAsyncConnector::new(
+        let mut connector = H3MsQuicAsyncConnector::new(
             uri.clone(),
             config,
-            Some(config_qmux),
-            false,
+            config_qmux,
+            measuring.is_some(),
             registration,
         )
-        .with_peer_certificate_callback(crate::hostname::refuse_other_hosts(host));
+        .with_peer_certificate_callback(crate::hostname::refuse_other_hosts(host))
+        // Read as the connector is built rather than passed in: what these
+        // describe is the host's network, and `connect` has a dozen callers
+        // that have no business knowing about it (see
+        // [`crate::local_address`]).
+        .with_local_address_policies(crate::local_address::current().as_policies());
+        // Watched only where it is asked for, and read by the caller rather
+        // than by a task of our own -- see [`landing`](Self::landing) for why
+        // that is what makes it race-free.
+        let conns = match measuring {
+            Some(family) => {
+                connector = connector.with_preferred_address_family(family);
+                let (conn_tx, conn_rx) = tokio::sync::mpsc::channel(4);
+                connector = connector.with_channel(conn_tx);
+                Some(Arc::new(Mutex::new(conn_rx)))
+            }
+            None => None,
+        };
         let channel = H3Channel::<_, Full<Bytes>>::new(connector, uri.clone(), None);
-        Ok(Self { channel, uri })
+        Ok(Self {
+            channel,
+            uri,
+            conns,
+        })
     }
 }
 
@@ -211,19 +438,6 @@ fn shared_registration() -> anyhow::Result<Arc<msquic_async::Registration>> {
     Ok(registration)
 }
 
-/// Shut the msquic registration down and wait until every connection and stream
-/// derived from it has been closed. Returns `false` if `timeout` elapsed first.
-///
-/// Call this once, after everything holding an msquic handle has been dropped
-/// and before leaving `main`. `shutdown()` asks the connections to go away,
-/// which ends the background h3 drivers holding them; `wait_idle()` then
-/// resolves once the last handle is closed, which is exactly the condition
-/// under which `RegistrationClose` returns promptly instead of blocking in
-/// `CxPlatRundownReleaseAndWait`.
-///
-/// On timeout the registration is deliberately **leaked** rather than dropped:
-/// something still holds a handle, so `RegistrationClose` would block forever,
-/// and the caller is expected to fall back to a hard exit.
 /// Drain the registration without closing it, for a caller that is about to
 /// leave the process without running destructors.
 ///
@@ -255,6 +469,19 @@ pub async fn drain_msquic(timeout: Duration) -> bool {
     drained
 }
 
+/// Shut the msquic registration down and wait until every connection and stream
+/// derived from it has been closed. Returns `false` if `timeout` elapsed first.
+///
+/// Call this once, after everything holding an msquic handle has been dropped
+/// and before leaving `main`. `shutdown()` asks the connections to go away,
+/// which ends the background h3 drivers holding them; `wait_idle()` then
+/// resolves once the last handle is closed, which is exactly the condition
+/// under which `RegistrationClose` returns promptly instead of blocking in
+/// `CxPlatRundownReleaseAndWait`.
+///
+/// On timeout the registration is deliberately **leaked** rather than dropped:
+/// something still holds a handle, so `RegistrationClose` would block forever,
+/// and the caller is expected to fall back to a hard exit.
 pub async fn shutdown_msquic(timeout: Duration) -> bool {
     let registration = REGISTRATION
         .lock()
@@ -283,6 +510,129 @@ pub async fn shutdown_msquic(timeout: Duration) -> bool {
     }
 }
 
+/// How soon a client connection should conclude that the far end has stopped
+/// answering.
+///
+/// **Two answers, because the two kinds of connection are losing different
+/// things.** A control-plane request that fails can be retried; a relay leg
+/// that dies unnoticed takes a *peer connection* with it, and has a deadline
+/// to beat doing so — see [`RELAY_LEG_KEEPALIVE`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Liveness {
+    /// The control plane. A blip should cost a retry, not the connection, so
+    /// this keeps msquic's own disconnect timeout and a keepalive sized only
+    /// to stay inside the idle timeout.
+    ControlPlane,
+    /// A relay leg carrying a peer connection: the initiator's connect leg, or
+    /// a listener's bind leg. **Both halves**, and [`RELAY_LEG_KEEPALIVE`]
+    /// says why the listener's is in here too.
+    RelayLeg,
+    /// A published public address.
+    ///
+    /// **Patient, like the control plane, and for the opposite reason to a
+    /// leg.** Nothing replaces one of these and nothing watches it:
+    /// `isekai_p2p::public` has no renewal loop and no health check by
+    /// design, and its driving loop simply falls out when the events channel
+    /// closes, with nothing logged and nothing re-opened. Giving it a leg's
+    /// impatience would end a published listener on a few seconds of
+    /// interrupted uplink, leaving an address that still resolves and answers
+    /// nothing until somebody restarts it.
+    PublicAddress,
+}
+
+/// How often an idle control-plane connection pings.
+///
+/// Without it, whether one of these survives depends on the caller happening
+/// to send something every thirty seconds, and a client between requests has
+/// no such guarantee. Ten seconds leaves two attempts inside the idle timeout.
+const CONTROL_PLANE_KEEPALIVE: u32 = 10_000;
+
+/// How often a **relay leg** pings, and how long it may then go unanswered.
+///
+/// **These two numbers are a deadline, not a preference.** When the relay
+/// stops answering, the peer connection's own relay *path* starts its
+/// `DisconnectTimeoutMs` — sixteen seconds, msquic's default — from its first
+/// unacknowledged packet, and when that expires msquic closes the **whole
+/// connection**, however healthy its direct path is
+/// (`loss_detection.c`, and `docs/relay_repath_plan.md` §7.3). Everything that
+/// replaces the leg has to finish inside that.
+///
+/// A leg notices its own death after `keepalive + disconnect timeout`: the
+/// ping is what makes loss detection have something outstanding to run on, and
+/// the disconnect timeout is how long it waits. At the control plane's
+/// settings that is 10 + 16 = **26 seconds**, which is why re-attaching used
+/// to lose the race — measured at 18 to 26 seconds, against a budget of 16
+/// (§7.4). At these it is 2 + 6 = **8**, leaving the replacement's measured
+/// 1.9 s and the new path's 64 ms inside the budget with room to spare.
+///
+/// **The keepalive alone would not do it**, which is worth saying because it
+/// looks like the whole fix: a one-second ping still leaves 1 + 16 = 17
+/// seconds. The ping decides when the clock *starts*; the disconnect timeout
+/// decides when it *finishes*.
+///
+/// **What this costs is sensitivity, and the cost is not symmetric.**
+///
+/// On the initiator's connect leg it is small: six seconds of interrupted
+/// network now ends a leg that would have survived, and losing one stopped
+/// being permanent — `isekai_p2p::initiator` stands a replacement up in about
+/// two seconds, and `reattach_delay`'s `REATTACH_MIN_INTERVAL` floor there
+/// keeps a flapping relay from turning that into a `peer_connect` every few
+/// hundred milliseconds (§0.3). Before that existed these numbers would have
+/// been reckless.
+///
+/// **A listener's bind leg gets them too, and there nothing replaces it.**
+/// `isekai_p2p::listener` puts a connection whose leg died into `spent` and
+/// never binds that id again, and the initiator cannot tell — its own leg is
+/// healthy, so nothing asks for a replacement. The peer connection's relay
+/// path then goes unacknowledged and takes the whole connection with it.
+/// **That was true before this change and is now true for shorter blips**:
+/// about eight seconds of interrupted uplink on the listener's side rather
+/// than about twenty-five.
+///
+/// It is here anyway because the re-attach does not work without it. The
+/// initiator opens its replacement path about ten seconds in, and the
+/// listener has to have a live leg by then for the proxy to bind the new
+/// connection to — one that took twenty-six seconds to notice would still be
+/// on its dead leg when `portal_core::path`'s patience ran out. So the
+/// exposure is deliberate, and what would remove it is the listener learning
+/// to re-bind a connection whose leg died while the connection is still being
+/// claimed (`docs/relay_repath_plan.md` §0.2 B, rejected there on grounds this
+/// measurement partly answers).
+///
+/// **It also tightens the handshake.** `DisconnectTimeoutMs` is not
+/// conditioned on the handshake being finished — the loss-detection timer
+/// guards only on there being an outstanding packet — so a leg's handshake
+/// budget becomes six seconds rather than the ten `HandshakeIdleTimeoutMs`
+/// defaults to. One round trip plus retransmissions fits that on any ordinary
+/// path; a very slow or very lossy one may not, and there the replacement's
+/// eight attempts are what covers it.
+const RELAY_LEG_KEEPALIVE: u32 = 2_000;
+/// See [`RELAY_LEG_KEEPALIVE`].
+const RELAY_LEG_DISCONNECT_TIMEOUT: u32 = 6_000;
+
+/// How long a **path** on one of these connections may go without sending
+/// before it gets a PING.
+///
+/// `PathKeepAliveIntervalMs`, and deliberately not the `KeepAliveIntervalMs`
+/// above. The two look interchangeable and are not: the connection keepalive
+/// is re-armed by activity anywhere on the connection, so once a connection
+/// has two paths and the traffic is on one of them it never fires — and the
+/// other path decays, taking its NAT mapping with it.
+/// `isekai_p2p::peer::DIRECT_PATH_KEEPALIVE` documents that distinction at
+/// length, and it cost a field test to learn; it is the reason this is here
+/// and not a second connection keepalive.
+///
+/// Ten seconds, matching that constant and the listener's
+/// (`isekai_link_utils::PATH_KEEP_ALIVE_INTERVAL_MS`): well inside the 30 s
+/// idle timeout, and a path carrying traffic of its own never gets a redundant
+/// PING.
+///
+/// **This covers only our own paths.** The timer runs off each connection's
+/// settings and defaults to 0, so whether the proxy pings is the proxy's
+/// business. What this holds open is the mapping *our* paths own, which is the
+/// half that matters to a client behind a NAT.
+const PATH_KEEPALIVE: u32 = 10_000;
+
 /// Build an msquic client registration + configuration (ALPN `h3` or `h3qx-01`
 /// for qmux), mirroring the `agent` crate's client setup.
 ///
@@ -294,6 +644,7 @@ pub async fn shutdown_msquic(timeout: Duration) -> bool {
 pub(crate) fn make_client_config(
     registration: Option<Arc<msquic_async::Registration>>,
     is_qmux: bool,
+    liveness: Liveness,
 ) -> anyhow::Result<(Arc<msquic_async::Registration>, Arc<msquic::Configuration>)> {
     let registration = match registration {
         Some(registration) => registration,
@@ -304,85 +655,188 @@ pub(crate) fn make_client_config(
     } else {
         [msquic::BufferRef::from("h3")]
     };
-    let configuration = registration.open_configuration(
-        &alpn,
-        Some(
-            &msquic::Settings::new()
-                .set_IdleTimeoutMs(30_000)
-                // Keep the connection from going idle into that timeout.
-                //
-                // Without it, whether one of these survives depends on the
-                // caller happening to send something every thirty seconds —
-                // a control-plane client between requests, or a relay leg
-                // whose peer has gone quiet, has no such guarantee. Ten
-                // seconds leaves two attempts inside the timeout.
-                //
-                // This is the *connection* keepalive and not
-                // `PathKeepAliveIntervalMs`: it is re-armed by any activity
-                // anywhere on the connection, so it fires only when the whole
-                // thing is quiet, which is exactly the case being covered.
-                // Keeping an idle *path* warm is a different setting and a
-                // different problem (see `camera-core`'s video connection).
-                .set_KeepAliveIntervalMs(10_000)
-                // `DestCidUpdateIdleTimeoutMs` is left at its default, and its
-                // absence is a decision rather than an omission.
-                //
-                // Every configuration in this repository used to pin it to 0,
-                // switching off the destination CID rotation to work around an
-                // msquic defect. That defect is fixed, so none of them does now.
-                //
-                // **This does not get the rotation back, and is not meant to.**
-                // The gate is 20 s since the last flush (`send.c`), and the
-                // keepalive above flushes every 10, so on any connection
-                // configured like this one it will not fire. What the removal
-                // achieves is that a workaround whose reason is gone stops
-                // being carried — and stops being copied into the next
-                // configuration somebody writes. Wanting the rotation to
-                // actually happen would mean settling the keepalive interval
-                // against that 20 s, which is a different question.
-                .set_PeerBidiStreamCount(100)
-                .set_PeerUnidiStreamCount(100)
-                .set_DatagramReceiveEnabled()
-                // Floor this connection's MTU high enough to carry a *relayed*
-                // inner QUIC packet in one datagram, from the very first one.
-                //
-                // The arithmetic, because the number matters and the failure is
-                // silent. The inner video connection cannot go below 1248:
-                // msquic clamps `MaximumMtu` up to QUIC_DPLPMTUD_MIN_MTU
-                // (`core/settings.c`), so a full inner packet is 1248 bytes and
-                // there is no way to ask for less. As a CONNECT-UDP payload
-                // that is 1248 + 1 context-id byte, and the HTTP datagram
-                // carrying it prefixes a quarter-stream-id varint — so about
-                // 1250 goes on the wire. That varint is one byte because a
-                // relay leg opens an H3 connection of its own and CONNECT-UDP
-                // is its first request stream; a quarter stream id needs two
-                // bytes only past 63, which is stream id 255. A caller that
-                // kept opening requests on one connection would cross that,
-                // and would owe this sum another byte. This connection's max-datagram length
-                // runs about 42 bytes under its MTU. So the floor has to be at
-                // least ~1292; anything lower and **every** full-size inner
-                // packet fails to send and is dropped, while
-                // ACKs and control packets still fit — which looks like a lossy
-                // path rather than a misconfigured one.
-                //
-                // 1350 clears that with room for a longer connection ID, and is
-                // as low as it can usefully go. It was 1400, which is more than
-                // needed and excludes networks that carry 1360 but not 1400 —
-                // one such network is what turned this up. Paths below ~1300
-                // remain unsupported: the inner connection has a hard 1248-byte
-                // floor, so there is nothing left to give.
-                .set_MinimumMtu(1350)
-                .set_MaximumMtu(1500)
-                .set_StreamMultiReceiveEnabled()
-                // Ask the proxy to report the address it observes this
-                // connection at. On a relay leg that report is how the Endpoint
-                // learns its own NAT mapping, which the video connection then
-                // names as a direct-path candidate
-                // (docs/p2p_mode_migration_plan.md §2.2.3). Harmless on the
-                // control-plane connections, which simply never look at it.
-                .set_ReceiveObservedAddressReports(),
-        ),
-    )?;
+    let settings = msquic::Settings::new()
+        .set_IdleTimeoutMs(30_000)
+        // Keep the connection from going idle into that timeout.
+        //
+        // Without it, whether one of these survives depends on the
+        // caller happening to send something every thirty seconds —
+        // a control-plane client between requests, or a relay leg
+        // whose peer has gone quiet, has no such guarantee.
+        //
+        // This is the *connection* keepalive and not
+        // `PathKeepAliveIntervalMs`: it is re-armed by any activity
+        // anywhere on the connection, so it fires only when the whole
+        // thing is quiet, which is exactly the case being covered.
+        // Keeping an idle *path* warm is a different setting and a
+        // different problem (see `camera-core`'s video connection).
+        //
+        // On a relay leg it is also doing a second job — making the
+        // leg's death noticeable in time — which is what the shorter
+        // interval is for. See [`RELAY_LEG_KEEPALIVE`].
+        .set_KeepAliveIntervalMs(match liveness {
+            Liveness::ControlPlane | Liveness::PublicAddress => CONTROL_PLANE_KEEPALIVE,
+            Liveness::RelayLeg => RELAY_LEG_KEEPALIVE,
+        })
+        // `DestCidUpdateIdleTimeoutMs` is left at its default, and its
+        // absence is a decision rather than an omission.
+        //
+        // Every configuration in this repository used to pin it to 0,
+        // switching off the destination CID rotation to work around an
+        // msquic defect. That defect is fixed, so none of them does now.
+        //
+        // **This does not get the rotation back, and is not meant to.**
+        // The gate is 20 s since the last flush (`send.c`), and the
+        // keepalive above flushes every 10 seconds here — every 2 on a relay
+        // leg — so on any connection configured like this one it will not
+        // fire. What the removal
+        // achieves is that a workaround whose reason is gone stops
+        // being carried — and stops being copied into the next
+        // configuration somebody writes. Wanting the rotation to
+        // actually happen would mean settling the keepalive interval
+        // against that 20 s, which is a different question.
+        .set_PeerBidiStreamCount(100)
+        .set_PeerUnidiStreamCount(100)
+        .set_DatagramReceiveEnabled()
+        // Floor this connection's MTU high enough to carry a *relayed*
+        // inner QUIC packet in one datagram, from the very first one.
+        //
+        // The arithmetic, because the number matters and the failure is
+        // silent. The inner video connection cannot go below 1248:
+        // msquic clamps `MaximumMtu` up to QUIC_DPLPMTUD_MIN_MTU
+        // (`core/settings.c`), so a full inner packet is 1248 bytes and
+        // there is no way to ask for less. As a CONNECT-UDP payload
+        // that is 1248 + 1 context-id byte, and the HTTP datagram
+        // carrying it prefixes a quarter-stream-id varint — so about
+        // 1250 goes on the wire. That varint is one byte because a
+        // relay leg opens an H3 connection of its own and CONNECT-UDP
+        // is its first request stream; a quarter stream id needs two
+        // bytes only past 63, which is stream id 255. A caller that
+        // kept opening requests on one connection would cross that,
+        // and would owe this sum another byte. This connection's max-datagram length
+        // runs about 42 bytes under its MTU. So the floor has to be at
+        // least ~1292; anything lower and **every** full-size inner
+        // packet fails to send and is dropped, while
+        // ACKs and control packets still fit — which looks like a lossy
+        // path rather than a misconfigured one.
+        //
+        // 1350 clears that with room for a longer connection ID, and is
+        // as low as it can usefully go. It was 1400, which is more than
+        // needed and excludes networks that carry 1360 but not 1400 —
+        // one such network is what turned this up. Paths below ~1300
+        // remain unsupported: the inner connection has a hard 1248-byte
+        // floor, so there is nothing left to give.
+        .set_MinimumMtu(1350)
+        .set_MaximumMtu(1500)
+        .set_StreamMultiReceiveEnabled()
+        // Ask the proxy to report the address it observes this
+        // connection at. On a relay leg that report is how the Endpoint
+        // learns its own NAT mapping, which the video connection then
+        // names as a direct-path candidate
+        // (docs/p2p_mode_migration_plan.md §2.2.3). Harmless on the
+        // control-plane connections, which simply never look at it.
+        .set_ReceiveObservedAddressReports();
+    // **Only the legs**, and `RELAY_LEG_KEEPALIVE` has the arithmetic. Left at
+    // msquic's sixteen seconds for the control plane, where a connection that
+    // gave up this readily would turn a blip into a failed request.
+    let settings = match liveness {
+        Liveness::ControlPlane | Liveness::PublicAddress => settings,
+        Liveness::RelayLeg => settings.set_DisconnectTimeoutMs(RELAY_LEG_DISCONNECT_TIMEOUT),
+    };
+    // **Several local addresses at once, instead of one at a time.** A
+    // phone holds Wi-Fi and cellular together, a laptop holds Ethernet and
+    // Wi-Fi, and until this a connection to the proxy used exactly one of
+    // them: the other was somewhere to migrate to if the first went away.
+    //
+    // The groundwork was already here, and that is what makes this a
+    // settings change rather than an API one. `AddAddressMode` defaults to
+    // `AUTO` -- "the connection manages its own paths" -- so every
+    // connection built here already assembles a candidate pair table from
+    // *every* address the host has (`QuicLibraryGetLocalAddresses`) and
+    // already reconciles it. What multipath changes is what the reconciler
+    // may then do with a second address, in two places:
+    //
+    // * `QuicConnReconcileCreatePaths` skips a pair whose remote already
+    //   has a path, and says why -- "without multipath a second local
+    //   address to it would be a migration". With multipath it opens the
+    //   path instead.
+    // * `QuicConnReconcileMigrate` returns immediately once multipath is
+    //   negotiated. There is no migration step left to take.
+    //
+    // So a relay leg whose address changes now **gains a path beside the
+    // old one** rather than moving onto it. That is a different shape from
+    // what v0.9.0 measured on the testbed, where the leg migrated -- and
+    // where a defect in exactly that migration (a migrated path landing on
+    // a connected socket, seera-networks/msquic#203) is what kept IPv4
+    // direct paths from validating. Make-before-break with both paths live
+    // does not go through that code at all, and `addrchange-check` is what
+    // can say what it does go through.
+    //
+    // **It is an offer, not a switch.** `MultipathNegotiated` is set only
+    // where the peer offered the transport parameter back, so against a
+    // proxy or a relay that does not, every connection here is the one it
+    // was before. Two things do follow from negotiating it: the
+    // reconciler's "has this path id an unused destination CID" gate is
+    // multipath-only, so the `PATH_CIDS_BLOCKED` machinery v0.9.0 brought
+    // in starts applying to these connections; and a leg with two paths
+    // reports an observed address for each, while [`crate::observed`]'s
+    // watch holds one at a time.
+    //
+    // # What this costs, chosen rather than missed
+    //
+    // **Every viable address gets a path, and "viable" is a low bar.**
+    // `QuicCandidatePairIsViable` applies two hard filters and no others: the
+    // family must match, and loopback/link-local scope must match in both
+    // directions. A docker bridge address, a VPN address and a stale private
+    // one are all viable against a public proxy, so a host carrying them opens
+    // paths it cannot validate -- each costing a UDP binding and a destination
+    // CID out of `QUIC_MAX_PATH_COUNT`, which is 4 and is also the active CID
+    // limit. msquic rate-limits the resulting churn itself, and says why:
+    // retirement "can outrun the peer's NEW_CONNECTION_ID issuance".
+    //
+    // **An operator can now narrow that set**, which is what this said was a
+    // different change and is no longer: `crate::local_address` carries the
+    // excluded prefixes and the connector above is given them. What is left of
+    // the cost is the host nobody has told anything about, where every address
+    // is still tried.
+    //
+    // **The single-address case trades an unthrottled migration for a
+    // reconciler pass.** With one address -- a phone, or any host being
+    // renumbered -- the two shapes are not equivalent. Today
+    // `QuicConnProcessLocalAddressChange` finds no validated alternate and
+    // migrates the active path onto the replacement at once, keeping the port:
+    // "a shared binding is keyed on the port, so keep the one the connection
+    // already has". That is what the testbed measured for v0.9.0 -- the leg
+    // moving to the new address *on its own port*. Under multipath only an
+    // already-validated alternate is promoted, so with nothing to promote the
+    // lost path is abandoned and the reconciler opens the new one: rate-limited,
+    // and on a fresh ephemeral port, because a table pair's local address
+    // carries no port at all.
+    //
+    // **And a second path inherits `MinimumMtu`.** `QuicPathInitialize` starts
+    // every path at it and PLPMTUD never probes below it, so on an interface
+    // under the 1350 set above the path validates -- a PATH_CHALLENGE is padded
+    // to 1200 -- and then drops every full-size relayed packet. A cellular IPv6
+    // interface at the 1280 minimum is exactly that. The floor cannot come
+    // down; the sum above it says why.
+    //
+    // **Not on QMux, which can never hold a second path.** `QuicConnQMuxAlloc`
+    // allocates no path ID, so `QuicConnQueueReconcile` and the local-address
+    // change handler both bail out for one -- and the transport-parameter site
+    // is guarded on `MultipathEnabled` alone, so without this a QMux
+    // connection would advertise `initial_max_path_id` and, against a peer that
+    // offered it back, switch on every `MultipathNegotiated` branch in the
+    // stack on the one connection kind the fork keeps clear of path code. The
+    // path keepalive goes with it: there is no second path for it to hold open,
+    // and it is the connection keepalive above that keeps a QMux tunnel warm.
+    let settings = if is_qmux {
+        settings
+    } else {
+        settings
+            .set_MultipathEnabled()
+            .set_PathKeepAliveIntervalMs(PATH_KEEPALIVE)
+    };
+    let configuration = registration.open_configuration(&alpn, Some(&settings))?;
     // **`USE_TLS_BUILTIN_CERTIFICATE_VALIDATION` is deliberately not set here.**
     // It was, briefly, and it is wrong on three of the four platforms:
     //
@@ -436,4 +890,31 @@ pub(crate) fn make_client_config(
     }
     configuration.load_credential(&credential)?;
     Ok((registration, Arc::new(configuration)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The pair has to agree, or a report and the answer to it are about
+    /// different things: this side sends `family_name` and reads back
+    /// `family_from_name`, and the control plane sits between them.
+    #[test]
+    fn the_spelling_survives_a_round_trip() {
+        for family in [AddressFamily::V4, AddressFamily::V6] {
+            assert_eq!(family_from_name(family_name(family)), Some(family));
+        }
+        assert_eq!(family_name(AddressFamily::V4), "v4");
+        assert_eq!(family_name(AddressFamily::V6), "v6");
+    }
+
+    /// Anything else drops the constraint rather than failing. A spelling this
+    /// does not know is a control plane newer than this binary, or a typo —
+    /// neither is a reason to lose the connection.
+    #[test]
+    fn an_unknown_spelling_is_no_constraint() {
+        for name in ["", "V4", "ipv4", "inet6", "4", "v7"] {
+            assert_eq!(family_from_name(name), None, "{name:?}");
+        }
+    }
 }

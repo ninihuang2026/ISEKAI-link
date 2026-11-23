@@ -32,12 +32,23 @@ on:
       # transitive crate that will not cross-compile for the NDK usually arrives
       # as a lockfile-only `cargo update`.
       - 'rust/channel-masque/**'
+      # `privacy` too: the consent gate `camera-core` calls, and the one crate
+      # this list had still not reached. Checked now rather than remembered:
+      # `.github/scripts/check-workflow-paths.py`.
+      - 'rust/privacy/**'
       - 'rust/Cargo.lock'
       - 'submodules/tonic-h3'
       - 'rust/Cargo.toml'
       - '.cargo/config.toml'
       - 'ios/**'
       - 'submodules/msquic-async-rs'
+      # **The composite action these steps call.** `submodules` decides what a
+      # job fetches, and it was not watched, so a change to it would have run
+      # no workflow that uses it. The same hole as `scripts/**` and for the
+      # same reason: a path filter has to cover the inputs, not just the file
+      # it is written in. (This workflow caches no cargo build at all, so
+      # `rust-cache` is not among its inputs.)
+      - '.github/actions/**'
       - '.github/workflows/ios-ffi.yml'
   pull_request:
     paths:
@@ -57,19 +68,30 @@ on:
       # transitive crate that will not cross-compile for the NDK usually arrives
       # as a lockfile-only `cargo update`.
       - 'rust/channel-masque/**'
+      # `privacy` too: the consent gate `camera-core` calls, and the one crate
+      # this list had still not reached. Checked now rather than remembered:
+      # `.github/scripts/check-workflow-paths.py`.
+      - 'rust/privacy/**'
       - 'rust/Cargo.lock'
       - 'submodules/tonic-h3'
       - 'rust/Cargo.toml'
       - '.cargo/config.toml'
       - 'ios/**'
       - 'submodules/msquic-async-rs'
+      # **The composite action these steps call.** `submodules` decides what a
+      # job fetches, and it was not watched, so a change to it would have run
+      # no workflow that uses it. The same hole as `scripts/**` and for the
+      # same reason: a path filter has to cover the inputs, not just the file
+      # it is written in. (This workflow caches no cargo build at all, so
+      # `rust-cache` is not among its inputs.)
+      - '.github/actions/**'
       - '.github/workflows/ios-ffi.yml'
   workflow_dispatch:
 
 jobs:
   apple-native:
     name: Build FFI + Swift bindings (macOS native)
-    runs-on: macos-14
+    runs-on: macos-15
     defaults:
       run:
         working-directory: rust
@@ -97,7 +119,7 @@ jobs:
 
   ios-app:
     name: Build iOS app + relay integration test
-    runs-on: macos-14
+    runs-on: macos-15
     env:
       # An Auth0 access token for the live Identity/Proxy. Absent (forks, or
       # before anyone sets it) the integration test is skipped and the job stays
@@ -230,7 +252,7 @@ jobs:
   ios-ipa:
     name: Package an unsigned device .ipa
     if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/submodules

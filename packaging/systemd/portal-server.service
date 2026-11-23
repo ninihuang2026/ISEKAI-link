@@ -1,0 +1,239 @@
+# Leave a portal server running.
+#
+# **This file ships inside the Linux release archive**, at
+# `portal-ubuntu-latest/systemd/portal-server.service`, so the copy you have is
+# the one that matches the binaries beside it. Follow the steps below **in this
+# order**: enabling the service before the first three gives you one with no
+# binary, no token store and no registered Endpoint, which fails in a hundredth
+# of a second and keeps failing.
+#
+# 1. Unpack the release where it will live.
+#
+#      unzip portal-ubuntu-latest.zip
+#      sudo mv portal-ubuntu-latest /usr/local/portal
+#      sudo chown -R root:root /usr/local/portal
+#      sudo chmod -R go-w /usr/local/portal
+#      sudo cp /usr/local/portal/systemd/portal-server.service /etc/systemd/system/
+#
+#    **The chown is not tidiness.** `unzip` runs as you, and `mv` renames
+#    rather than re-owning, so without it `/usr/local/portal/bin/portal-server`
+#    stays owned -- and writable -- by your own account while being what a
+#    system service executes. Anyone who holds that account could replace the
+#    binary and have systemd run it on the next restart. `go-w` as well,
+#    because a loose umask leaves the archive's files group-writable (measured:
+#    775 under umask 002).
+#
+#    **`/usr/local/portal/portal-server` is the archive's launcher, and that is
+#    what ExecStart runs.** It finds its own directory, points the loader at the
+#    bundled `lib/` -- nothing on a host installs libmsquic, which is the whole
+#    reason the archive carries libraries -- and then `exec`s the real binary
+#    under `bin/`. So no shell is left in the middle: the service's main process
+#    is `portal-server` itself, and SIGTERM reaches it rather than a wrapper.
+#    Nothing has to be set for this, and the directory can be moved as long as
+#    ExecStart moves with it.
+#
+# 2. An account for it to run as. Not DynamicUser -- see User= below.
+#
+#      sudo useradd --system --home-dir /var/lib/portal-server \
+#          --shell /usr/sbin/nologin portal
+#
+# 3. Sign in once, as that user, and register the Endpoint. **Both commands
+#    need --accept-privacy-policy**: the agreement is recorded per user, this
+#    account has no record, and without the flag the run refuses before it
+#    reaches the browser step -- 297 lines of policy and exit 1, with no
+#    sign-in URL printed at all. XDG_CONFIG_HOME matches the unit so the record
+#    and the key end up where the service will look for them.
+#
+#      sudo install -d -o portal -g portal -m 0700 /var/lib/portal-server
+#      sudo -u portal XDG_CONFIG_HOME=/var/lib/portal-server \
+#          /usr/local/portal/portal-server --login --accept-privacy-policy \
+#          --organization org_… \
+#          --key /var/lib/portal-server/portal-server.pem
+#      sudo -u portal XDG_CONFIG_HOME=/var/lib/portal-server \
+#          /usr/local/portal/portal-server --register --accept-privacy-policy \
+#          --key /var/lib/portal-server/portal-server.pem \
+#          --config /etc/portal-server/portal-server.toml
+#
+#    The sign-in is what keeps a long-running server working: an --auth0-token
+#    cannot be refreshed and takes the session with it when it expires, while
+#    these tokens refresh themselves. On a host with no browser, forward the
+#    callback port (`ssh -L 38700:127.0.0.1:38700`) -- see "Signing in over
+#    SSH" in docs/portal.md, and prefer it to --device-code, which cannot carry
+#    an organization.
+#
+# 4. Then, and only then:
+#
+#      sudo systemctl daemon-reload
+#      sudo systemctl enable --now portal-server
+#      journalctl -u portal-server -f
+
+[Unit]
+Description=ISEKAI portal server
+Documentation=https://github.com/seera-networks/ISEKAI-link/blob/main/docs/portal.md
+# It dials the control plane as it starts, so a host that is not on the network
+# yet fails immediately. The ordering saves the first attempt; Restart= below is
+# what actually covers a network that arrives late.
+Wants=network-online.target
+After=network-online.target
+
+# **No start limit, deliberately.** The obvious thing here is a few tries and
+# then give up, and it is wrong for this service. A startup failure is not slow:
+# an unreachable control plane refuses the Identity request and the process is
+# gone in 0.01s (measured), with no retry of its own -- the five-minute
+# tolerance below belongs to an established session, not to startup. So any
+# burst is spent in the time it takes to type the next command: five tries 30s
+# apart is two minutes, after which a network that turned up three minutes late
+# leaves a dead server and a human to notice. For a server whose whole restart
+# story is "exit and let the supervisor start it again", recovering by itself
+# matters more than a quiet journal.
+StartLimitIntervalSec=0
+
+[Service]
+# Not notify: this server does not talk to systemd. It prints a ready line on
+# stdout as its last word, which is for a human or a CI step to wait on, not an
+# sd_notify.
+Type=exec
+
+# **A fixed user, never DynamicUser.** The Endpoint key must survive restarts:
+# a new key is a new Endpoint ID, and every grant anyone made against the old
+# one stops applying. DynamicUser brings a new identity and an empty state
+# directory, which would silently re-register the server as a stranger.
+User=portal
+Group=portal
+
+# /var/lib/portal-server, created 0700 on first start and kept across restarts.
+# The key, the refreshing tokens and the consent record all live here.
+StateDirectory=portal-server
+StateDirectoryMode=0700
+
+# **%S/portal-server, not the path spelled out.** %S is the state directory
+# root (/var/lib for a system service), so this and --key below follow
+# StateDirectory= instead of having to be edited with it. Renaming the state
+# directory and missing one of them is a bad failure: point --key at a
+# directory the service cannot write and the tokens stop refreshing, or at an
+# empty one and it generates a key that was never registered, after which every
+# start fails at the token request with an error that says nothing about a
+# rename.
+Environment=XDG_CONFIG_HOME=%S/portal-server
+
+# **Nothing to set for the release archive** -- its launcher does this itself,
+# which is why ExecStart points at the launcher and not at `bin/portal-server`.
+#
+# A binary built from source has no launcher and needs the path by hand. Find
+# it first and paste what comes back, as a literal:
+#
+#   ls -d rust/target/release/build/seera-msquic-*/out/lib*
+#
+# **A glob cannot be used here.** systemd passes `Environment=` through
+# verbatim -- no shell, no expansion -- so a `*` in the value is a directory
+# that does not exist, and the service dies with the
+# `error while loading shared libraries: libmsquic.so.2` this line exists to
+# prevent (measured). The glob would not even be unambiguous in a shell: cargo
+# leaves one build directory per configuration, four of them on the machine
+# this was written on. And the tail is `lib` or `lib64` depending on the
+# distribution, which is why the `ls` above ends in `lib*`.
+#Environment=LD_LIBRARY_PATH=/home/you/src/ISEKAI-link/rust/target/release/build/seera-msquic-2cc9ddcc34d30d95/out/lib
+
+# **--key is absolute on purpose.** Its default is the relative
+# `portal-server.pem`, which would be resolved against the working directory
+# and put the Endpoint's identity wherever the unit happened to start.
+#
+# **--accept-privacy-policy on every start, not once.** The agreement is
+# recorded, and it is asked again whenever the policy is revised. A service
+# that relies on the record stops starting the day the policy changes: the run
+# refuses with exit 1 after printing the whole policy -- 297 lines, measured --
+# into the journal, once per restart attempt. That is not hypothetical; the
+# version moved on 2026-10-16 (#297). Passing the flag means the revision is
+# agreed to by whoever installed this unit, which is the same person either way.
+ExecStart=/usr/local/portal/portal-server \
+    --accept-privacy-policy \
+    --key %S/portal-server/portal-server.pem \
+    --config /etc/portal-server/portal-server.toml
+
+# **The pairing that makes a lost control plane survivable.** The server stops
+# with an error when nothing has reached the control plane for five minutes
+# (#301): it is still listed as a Peer Listener while it can bind nobody who
+# arrives, and nothing inside the process can fix that, so it exits and leaves
+# the decision here. on-failure is what takes that decision. A deliberate
+# `systemctl stop` exits 0 and is left stopped.
+#
+# Backoff rather than a fixed gap, so that a cause which is never going to
+# clear -- a revoked Endpoint, an unreadable config -- settles down to one
+# attempt every ten minutes instead of two a minute forever. RestartSteps and
+# RestartMaxDelaySec want systemd 254 or newer; an older one ignores them and
+# restarts every 30s, which is the behaviour this would have had anyway.
+Restart=on-failure
+RestartSec=30
+RestartSteps=5
+RestartMaxDelaySec=600
+
+# **Long enough to be withdrawn.** Stopping cancels the session, waits for the
+# Peer Listener to be withdrawn (3s inside a 5s bound) and then for msquic to
+# release its handles (5s) -- about ten seconds in the worst case. Killed
+# earlier, the listener stays listed for its whole lease, pointing at a process
+# that is gone, and anyone who tries to reach it connects to nothing.
+TimeoutStopSec=20
+
+# Default SIGTERM, and deliberately no hurrying it along: a second signal makes
+# the process exit immediately, skipping the withdrawal above. systemd's
+# SIGTERM-then-SIGKILL-at-the-timeout is exactly right.
+KillSignal=SIGTERM
+
+# A forwarder holds a local socket per forwarded connection on top of msquic's
+# own, and systemd's default soft limit is 1024. Reached, it surfaces as
+# forwards that fail for no stated reason rather than as a limit.
+LimitNOFILE=65536
+
+# Nothing here needs privilege. The relay leg is an outbound QUIC connection,
+# the forwards reach services that are already local, and the only listening
+# socket this program ever opens is the loopback callback for --login, which is
+# run by hand and not by this unit.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+# Keeps the service out of /home. **Mind the interaction with the account:** an
+# account whose home is under /home gets an unwritable consent record and a
+# warning on every start -- systemd sets $HOME from the account database, so
+# without XDG_CONFIG_HOME above the record would be aimed there. The useradd
+# line at the top puts the home under /var/lib for this reason.
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+
+# **Not enabled, and not because it fails.** The server starts and reaches the
+# Identity API with this on, but a probe with no control plane cannot get past
+# that -- nothing has exercised a live relay leg or a forward under it, and W^X
+# is the restriction most likely to break something deeper in a QUIC stack
+# rather than at startup. Turn it on if you can watch real traffic through it;
+# do not turn it on because this comment says it started.
+#MemoryDenyWriteExecute=yes
+
+# Everything else above was run: `portal-server` under these reaches the same
+# point as the same command with no sandbox at all. `ProtectClock`,
+# `ProtectHostname` and `ProtectProc` want systemd 247 or newer; an older one
+# logs them as unknown and carries on without them, so this unit degrades
+# rather than breaks -- check the journal rather than assuming.
+
+# **Names are resolved here**, so this cannot be narrowed to the catalogue's
+# addresses. The catalogue forbids hostnames, but --identity-url and
+# --proxy-url default to names, and the relay is dialed by whichever name the
+# control plane hands back -- with a blocking `getaddrinfo`. AF_NETLINK is left
+# out because glibc degrades without it, which this ran under; add it if your
+# resolver does not.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

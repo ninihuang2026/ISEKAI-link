@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use argh::FromArgs;
+use isekai_p2p::agent::{set_excluded_local_prefixes, ExcludedPrefixes};
 use isekai_p2p::{load_or_generate_key, P2pConfig};
 use portal_core::server::Protocol;
 use tokio_util::sync::CancellationToken;
@@ -52,6 +53,15 @@ the prefix. Repeatable, and the port is yours to choose:
   --map 15432:db          the same service on a port that is free
   --map udp:5353:dns      reach `dns` at 127.0.0.1:5353
 
+A UDP forward can carry datagrams larger than 1163 bytes, on a stream of their
+own, when the peer is new enough to receive them. Those are retransmitted if
+they are lost, which is right for a large DNS answer and wrong for anything
+stale once it is late:
+
+  --map udp+no-retrans:5353:dns   give up on a lost one instead
+
+That applies to what this end sends. Replies always retransmit.
+
 The protocol has to be said and cannot be guessed: the server looks a name up
 under a protocol, so asking for `dns` over TCP is refused with the same answer
 as a name that does not exist.
@@ -82,9 +92,33 @@ and they issue one with --allow. Pass it with --capability and --listener. It
 is one-shot and expires in 300 seconds at most, so have the command ready
 before they issue it.
 
---whoami needs nothing but --key and makes no network call."
+--whoami prints the Endpoint ID from --key alone, and asks Identity for the
+role beside it -- which needs the sign-in, and waits up to ten seconds. The
+Endpoint ID is printed either way, and it is the only thing on stdout."
 )]
 struct Args {
+    // **A `//` comment, not a `///` one.** argh_derive joins every doc line
+    // into the description it prints, so a rationale written above this field
+    // as documentation ends up in `--help` as a paragraph about a macro the
+    // reader cannot see. This file learned that the hard way.
+    //
+    // `version_if_asked!` at the top of `main` is what answers, before argh
+    // runs and before anything with a side effect. The switch is declared here
+    // only so `--help` lists it, which is why nothing reads it.
+    /// print the version and exit. Must be the first argument; -V also works
+    #[argh(switch)]
+    #[allow(dead_code)]
+    version: bool,
+    /// agree to the privacy policy and carry on. It is recorded, so this is
+    /// asked once rather than on every run -- and again when the policy changes
+    #[argh(switch)]
+    accept_privacy_policy: bool,
+    /// print the privacy policy and exit
+    #[argh(switch)]
+    show_privacy_policy: bool,
+    /// forget this program's recorded agreement to the privacy policy and exit
+    #[argh(switch)]
+    withdraw_privacy_consent: bool,
     /// identity API base URL (HTTPS). Defaults to the deployment the camera
     /// apps use
     #[argh(
@@ -96,14 +130,11 @@ struct Args {
     #[argh(switch)]
     identity_http3: bool,
     /// proxy base URL. Defaults to the deployment the camera apps use
-    #[argh(
-        option,
-        default = "String::from(\"https://link.isekai.tools:6443\")"
-    )]
+    #[argh(option, default = "String::from(\"https://link.isekai.tools:6443\")")]
     proxy_url: String,
-    /// auth0 access token, used only to obtain the Endpoint Token. Cannot be
-    /// refreshed -- `--login` is the way to stay signed in. Not needed with
-    /// --whoami
+    /// auth0 access token, used to obtain the Endpoint Token and to ask
+    /// Identity what this sign-in is. Cannot be refreshed -- `--login` is the
+    /// way to stay signed in
     #[argh(option)]
     auth0_token: Option<String>,
     /// sign in to Auth0 once, saving tokens that refresh from then on, and
@@ -127,9 +158,32 @@ struct Args {
     device_name: Option<String>,
     /// path to this Endpoint's signing key. Generated on first use; keep it,
     /// because a new one is a new Endpoint ID and the capability you were
-    /// issued stops meaning anything
-    #[argh(option, default = "PathBuf::from(\"portal-client.pem\")")]
-    key: PathBuf,
+    /// issued stops meaning anything. Defaults to `portal-client.pem`, and is
+    /// refused with --agent, whose key never reaches the filesystem
+    #[argh(option)]
+    key: Option<PathBuf>,
+    /// run one task as the signed-in person, under a key that lives only for
+    /// it. Needs --auth0-tokens, and refuses --key
+    #[argh(switch)]
+    agent: bool,
+    /// the Auth0 Organization to sign in to, as an `org_…` id. **This decides
+    /// which tenant an Endpoint is registered under**: without one, Identity
+    /// files it personally. Only meaningful with --login
+    #[argh(option)]
+    organization: Option<String>,
+    /// sign in by typing a code into a browser somewhere else, for a host
+    /// whose browser is not on it. Cannot carry --organization
+    #[argh(switch)]
+    device_code: bool,
+    /// which Gateway should hear about this Endpoint (repeatable). Not a
+    /// permission -- it selects which entitlement raises a lease, and omitting
+    /// it raises one at every Gateway offering the protocol
+    #[argh(option)]
+    gateway: Vec<String>,
+    /// what this task is called, recorded at registration so the audit log
+    /// says which run made the Endpoint
+    #[argh(option)]
+    task: Option<String>,
     /// print this Endpoint's ID and exit -- what the server needs for --allow
     #[argh(switch)]
     whoami: bool,
@@ -162,7 +216,8 @@ struct Args {
     #[argh(option)]
     capability: Option<String>,
     /// a local port to map onto a service, as `port:name` or
-    /// `udp:port:name`. TCP without the prefix. Repeatable
+    /// `udp:port:name`. TCP without the prefix. `udp+no-retrans:` gives up on
+    /// a lost oversize datagram instead of retransmitting it. Repeatable
     #[argh(option)]
     map: Vec<String>,
     /// the address to bind mapped ports on. Loopback by default, because a
@@ -170,6 +225,11 @@ struct Args {
     /// server's services
     #[argh(option, default = "std::net::IpAddr::from([127, 0, 0, 1])")]
     bind: std::net::IpAddr,
+    /// stay on the relay: offer no direct-path candidate, so no direct path is
+    /// probed and every byte crosses the relay. For reproducing what a session
+    /// behind two unpunchable NATs does, on a machine where punching works
+    #[argh(switch)]
+    relay_only: bool,
     /// register this Endpoint with an ENROLLMENT KEY instead of signing in.
     /// For a job with nobody at the keyboard. The key comes from
     /// ISEKAI_ENROLLMENT_KEY or --enrollment-key-file, never from an argument
@@ -257,6 +317,21 @@ struct Args {
     /// so it is also the answer to "why did my connection go that way"
     #[argh(switch)]
     relays: bool,
+    /// path to this client's configuration: which of the host's own addresses
+    /// its connections may use. Only the `[network]` section, and an absent
+    /// file means nothing is excluded -- see --example-config
+    #[argh(option, default = "PathBuf::from(DEFAULT_CONFIG)")]
+    config: PathBuf,
+    /// print a starter configuration on stdout and exit
+    #[argh(switch)]
+    example_config: bool,
+    /// an address and prefix this host must not open its own connections from,
+    /// as `172.17.0.0/16`, or a bare address for a single one. Repeatable, and
+    /// **added to** the `[network]` section of --config rather than replacing
+    /// it. For interfaces the proxy and the relay cannot answer on -- a
+    /// container bridge, a VPN that does not route to them
+    #[argh(option)]
+    exclude_local: Vec<String>,
     /// which Endpoints to list: `active` (default), `revoked` or `all`
     #[argh(option)]
     endpoint_status: Option<String>,
@@ -266,7 +341,8 @@ struct Args {
     #[argh(option)]
     revoke_endpoint: Option<String>,
     /// why an Endpoint is being retired: `device_lost`, `endpoint_deleted`,
-    /// `admin_revoke` or `security_incident`. It lands in the audit log
+    /// `admin_revoke`, `security_incident` or `task_finished`. It lands in the
+    /// audit log
     #[argh(option)]
     reason: Option<String>,
     /// free text kept with the revocation, for whoever reads the audit log
@@ -274,11 +350,28 @@ struct Args {
     note: Option<String>,
 }
 
+/// Where a stored key lives when `--key` said nothing.
+///
+/// **The default moved off the argument on purpose.** As an argh default,
+/// `--key` could not tell "the operator named this path" from "nobody said
+/// anything", and agent mode has to: naming a path is a refusal, and a path
+/// this constant supplied is not.
+const DEFAULT_KEY: &str = "portal-client.pem";
+
+/// How long an agent run waits for its Grant to be made.
+///
+/// **Tens of seconds, not minutes.** The Gateway's stream delivers in seconds
+/// when it is connected; when it is not, what is being waited on is its
+/// reconnect and the reconciliation that follows (identity §8.10.2), and a task
+/// that sat through that would be a task nobody could tell from a hung one.
+const GRANT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// The audience the **proxy** checks a binding assertion against (§8.13.4).
 const PROXY_AUDIENCE: &str = "isekai-proxy";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    isekai_link_utils::version_if_asked!();
     // **stderr, and `info` unless `RUST_LOG` says otherwise.**
     //
     // Two fixes in one. `fmt()` writes to *stdout* by default, which puts log
@@ -301,6 +394,21 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
     let args: Args = argh::from_env();
+    // **Before `run`, and before anything `run` would do.** Registering a
+    // device and then asking whether personal information may be collected is
+    // asking after the fact. Nothing here opens a transport, so it costs a
+    // process that has not agreed nothing but the reading.
+    match privacy_gate(&args) {
+        // `leave` never returns, so these are the end of `main` rather than a
+        // value it produces; `return leave(..).await` makes the `.await`
+        // unreachable and says so at every build.
+        Ok(Some(code)) => portal_core::shutdown::leave(code).await,
+        Ok(None) => {}
+        Err(e) => {
+            eprintln!("Error: {e:#}");
+            portal_core::shutdown::leave(1).await
+        }
+    }
     // **Every path out of `run` goes through the same wind-down**, which is the
     // only shape that works here: `PeerDirectory`, the sessions and the
     // one-shot commands all open control-plane transports on the shared msquic
@@ -317,7 +425,10 @@ async fn main() -> anyhow::Result<()> {
     // **Filled in by `run` once an Endpoint exists**, so that returning the
     // slot does not depend on which way `run` left.
     let mut enrolled: Option<P2pConfig> = None;
-    let code = match run(args, &mut enrolled).await {
+    // **Taken by `run` when it revokes**, which it does before folding the
+    // connection. What stays here is every way out that never got that far.
+    let mut task: Option<P2pConfig> = None;
+    let mut code = match run(args, &mut enrolled, &mut task).await {
         Ok(()) => 0,
         Err(e) => {
             // Printed here because `_exit` skips the reporting `main` would
@@ -334,19 +445,135 @@ async fn main() -> anyhow::Result<()> {
     if let Some(cfg) = enrolled {
         portal_core::ci::release_the_slot(&cfg).await;
     }
+    // The same reasoning for the task Endpoint, for the returns that happen
+    // before the ordinary revocation point.
+    if let Some(cfg) = task {
+        code = revoke_or_report(&cfg, code).await;
+    }
     portal_core::shutdown::leave(code).await
 }
 
-async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()> {
+/// Revoke the task's Endpoint, and let a failure reach the exit code.
+///
+/// **Unlike returning an enrolment slot, this is not best effort.** A slot
+/// comes back by itself at the next idle sweep; an Endpoint registered on the
+/// Auth0 route has no sweep behind it at all (plan §2.4), so a revocation that
+/// did not happen leaves it registered for good. The task's own result is kept
+/// when it failed — an exit code already saying "this went wrong" should not be
+/// overwritten by a second reason — but a task that succeeded and could not put
+/// its Endpoint away did not entirely succeed.
+async fn revoke_or_report(cfg: &P2pConfig, code: i32) -> i32 {
+    match portal_core::agent::revoke_the_task_endpoint(cfg).await {
+        Ok(()) => code,
+        Err(e) => {
+            eprintln!(
+                "Error: the task ran but its Endpoint could not be revoked: {e:#}\n\
+                 It stays registered -- nothing sweeps Endpoints registered this way -- \
+                 though its Grants lapse when the lease does. Revoke it by hand with \
+                 `portal-client --revoke-endpoint {} --reason task_finished`",
+                cfg.key.endpoint_id(),
+            );
+            if code == 0 {
+                1
+            } else {
+                code
+            }
+        }
+    }
+}
+
+async fn run(
+    args: Args,
+    enrolled: &mut Option<P2pConfig>,
+    task: &mut Option<P2pConfig>,
+) -> anyhow::Result<()> {
+    if args.example_config {
+        // Before the key and the token: this is what somebody runs when they
+        // have neither and want to know what the file can say.
+        print!("{}", portal_core::network::EXAMPLE);
+        return Ok(());
+    }
+
+    // **Before every way out of this function.** `--whoami`, `--relays`,
+    // `--endpoints` and a dozen others return early and all of them dial the
+    // control plane, so a list read further down would be accepted and
+    // silently ignored on exactly the runs that are easiest to debug with it.
+    //
+    // `--config` defaults to a file that need not exist, and an absent one
+    // excludes nothing: this binary has never needed a configuration file and
+    // still does not. One that exists and cannot be read is an error, because
+    // half-applying it is worse than refusing it.
+    let excluded = {
+        // **A path the operator named has to be there.** Absent, the default is
+        // simply "no file", which is how this binary has always run; absent
+        // after being asked for by name is a typo, and letting it through would
+        // drop the exclusions silently -- the failure this flag is arranged
+        // against everywhere else.
+        let named = args.config != std::path::Path::new(DEFAULT_CONFIG);
+        let from_file = match (args.config.exists(), named) {
+            (true, _) => portal_core::network::load(&args.config)?.exclude_local,
+            (false, true) => anyhow::bail!(
+                "no configuration file at {} (--config named it)",
+                args.config.display(),
+            ),
+            (false, false) => Vec::new(),
+        };
+        ExcludedPrefixes::union(&args.exclude_local, &from_file)?
+    };
+    set_excluded_local_prefixes(excluded)?;
+
+    // **First, because the rest of this function reads the key's path.** Agent
+    // mode has none, and what the token store defaults to is the first thing
+    // that would quietly paper over that.
+    portal_core::login::check_sign_in_args(
+        args.login,
+        args.organization.is_some(),
+        args.device_code,
+    )?;
+    portal_core::agent::check_args(portal_core::agent::Given {
+        agent: args.agent,
+        key: args.key.is_some(),
+        auth0_tokens: args.auth0_tokens.is_some(),
+        auth0_token: args.auth0_token.is_some(),
+        enroll: args.enroll,
+        whoami: args.whoami,
+        pair: args.pair.is_some(),
+        redeem: args.redeem.is_some(),
+        // **Named, not read.** Whether the key parses is a later question;
+        // this one is only whether the operator described a second authority,
+        // and the environment variable describes one as surely as the flag.
+        provisioning: args.provisioning_key_file.is_some()
+            || std::env::var_os(portal_core::ci::PROVISIONING_KEY_VAR).is_some(),
+        capability: args.capability.is_some() || args.listener.is_some(),
+        admin: args.issue_enrollment_key
+            || args.enrollment_keys
+            || args.enrollment_key_enrollments.is_some()
+            || args.revoke_enrollment_key.is_some()
+            || args.endpoints
+            || args.revoke_endpoint.is_some(),
+        login: args.login,
+        relays: args.relays,
+        gateway: !args.gateway.is_empty(),
+        task: args.task.is_some(),
+    })?;
+    let key_path = args
+        .key
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_KEY));
     let tokens = args
         .auth0_tokens
         .clone()
-        .unwrap_or_else(|| portal_core::login::tokens_beside(&args.key));
+        .unwrap_or_else(|| portal_core::login::tokens_beside(&key_path));
     // **Before the key**, which signing in does not need — and a corrupt
     // `portal-client.pem` should not block the one command that has nothing to
     // do with it. `portal-server` orders these the same way.
     if args.login {
-        return portal_core::login::sign_in(&tokens).await;
+        return portal_core::login::sign_in(
+            &tokens,
+            args.organization.as_deref(),
+            args.device_code,
+        )
+        .await;
     }
 
     // **Before the key**, because none of these need an Endpoint of this
@@ -419,19 +646,51 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
         return enrollment_admin(&args, &tokens).await;
     }
 
-    // **Said out loud, because a generated key looks exactly like a loaded one
-    // until it fails.** `--key` has a default, so running from a different
-    // directory than last time silently makes a *second* Endpoint — and the
-    // failure is `capability-endpoint-mismatch` from the proxy, several steps
-    // later, naming nothing that points back here.
-    if !args.key.exists() {
-        tracing::info!(path = %args.key.display(), "generating a new Endpoint key");
-    }
-    let key = load_or_generate_key(&args.key)?;
+    // **Generated, never written.** A stored key would make the next run the
+    // same Endpoint, inheriting this task's Grants; and revoking it would still
+    // leave the file, so a revoked Endpoint's private key would sit on disk
+    // looking like a working one. `load_or_generate_key` writes, so agent mode
+    // does not call it.
+    let key = if args.agent {
+        let key = isekai_p2p::agent::EndpointKey::generate();
+        tracing::info!(
+            endpoint_id = %key.endpoint_id(),
+            task = args.task.as_deref().unwrap_or("-"),
+            "made a key for this task; it is not written anywhere",
+        );
+        key
+    } else {
+        // **Said out loud, because a generated key looks exactly like a loaded
+        // one until it fails.** `--key` defaults, so running from a different
+        // directory than last time silently makes a *second* Endpoint — and the
+        // failure is `capability-endpoint-mismatch` from the proxy, several
+        // steps later, naming nothing that points back here.
+        if !key_path.exists() {
+            tracing::info!(path = %key_path.display(), "generating a new Endpoint key");
+        }
+        load_or_generate_key(&key_path)?
+    };
     if args.whoami {
         // Before any network call: this is what the operator needs in order to
         // ask the other side for a capability, and it costs nothing to answer.
         println!("{}", key.endpoint_id());
+        // **And which organization this run belongs to**, which is the other
+        // half of "who am I here": it decides the tenant an Endpoint registers
+        // into, and it was previously knowable only by decoding a token by
+        // hand.
+        //
+        // **On stderr, because stdout is the answer.** `EP=$(portal-client
+        // --whoami)` is how the guide tells people to use this, and a second
+        // line on stdout would put a sentence inside their Endpoint ID.
+        eprintln!(
+            "organization: {}",
+            portal_core::login::signed_in_organization(&tokens, args.auth0_token.as_deref()),
+        );
+        // **And what this sign-in is in that tenant.** A guest is narrowed to
+        // `peer-connect:initiate` and everything they hold ends on a date, and
+        // that date is not written anywhere on this machine -- it is the answer
+        // to every refusal they are about to meet, so this is where to read it.
+        eprintln!("role: {}", this_role(&args, &tokens).await);
         return Ok(());
     }
 
@@ -515,6 +774,12 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
     if args.enroll {
         *enrolled = Some(cfg.clone());
     }
+    // And every way out of an agent run owes a revocation. The clone shares the
+    // credential, so it sees the registration cell the first issue fills in —
+    // which is what says whether there is anything to revoke.
+    if args.agent {
+        *task = Some(cfg.clone());
+    }
 
     if args.relays {
         return show_relays(&cfg).await;
@@ -582,23 +847,56 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
             "--listener is only for the --capability path. On a grant the current listener \
              is found for you -- drop it, or add --capability"
         ),
-        (None, None) => portal_core::session::Reach::Grant { peer },
+        (None, None) => portal_core::session::Reach::Grant {
+            peer,
+            // **Only agent mode waits.** Its Endpoint was registered seconds
+            // ago, so its Grant is still travelling; every other client's has
+            // stood since it paired, and for those an empty answer means the
+            // server is not running — which waiting does not change.
+            wait: args.agent.then_some(GRANT_WAIT),
+        },
     };
 
-    // **Installed before the connect, and the hatch armed with it.**
-    // Registering it replaces SIGTERM's default disposition for the rest of the
-    // process, so from here a `kill` does nothing unless something polls — and
-    // the select below is a long way off, past a proxy connect that can hang.
-    // Registering early means a SIGTERM arriving during the connect is queued
-    // and delivered the moment the select starts, which is a clean stop with
-    // the slot returned; arming the hatch means a second one leaves at once
-    // even if the connect never returns.
+    // **Created here, registered only when first polled.** `terminate_signal`
+    // is an `async fn`: making and pinning the future runs none of its body, so
+    // SIGTERM keeps its default disposition until a `select!` polls it. That is
+    // why the connect below polls it too, rather than leaving it to the later
+    // `select!`. Pinned once so both can poll the same handler.
     let terminate = terminate_signal();
     tokio::pin!(terminate);
 
-    let connected = portal_core::session::connect(&cfg, reach, &shutdown)
-        .await
-        .context("connect to the portal server")?;
+    let routing = match args.relay_only {
+        true => portal_core::session::Routing::RelayOnly,
+        false => portal_core::session::Routing::PreferDirect,
+    };
+    // **A stop during the connect ends the connect.** `terminate_signal` is an
+    // `async fn`, so nothing is registered until it is first polled, and that
+    // used to be the `select!` further down. A SIGTERM during the connect met
+    // the default disposition and killed the process on the spot (exit 143),
+    // before `main` could return the enrolment slot, which then stayed out until
+    // the idle sweep -- two in a row filled the canary's key for a quarter of an
+    // hour (2026-10-17). Polled here, it is registered as the connect starts,
+    // and a server that never answers cannot hold the stop either: leaving
+    // through an error is the way out that returns the slot.
+    //
+    // The hatch is armed on receipt, as below and for the same reason
+    // (`hard_exit_on_second_signal`), and the token cancelled so the grant
+    // keeper finishes what it is doing before it is dropped.
+    let connected = tokio::select! {
+        connected = portal_core::session::connect(&cfg, reach, routing, &shutdown) => {
+            connected.context("connect to the portal server")?
+        }
+        _ = tokio::signal::ctrl_c() => {
+            portal_core::shutdown::hard_exit_on_second_signal();
+            shutdown.cancel();
+            anyhow::bail!("interrupted before the connection to the portal server was up");
+        }
+        _ = &mut terminate => {
+            portal_core::shutdown::hard_exit_on_second_signal();
+            shutdown.cancel();
+            anyhow::bail!("stopped (SIGTERM) before the connection to the portal server was up");
+        }
+    };
     println!("connection id: {}", connected.session.connection_id());
 
     // **Closed on the way out of a failure, not dropped.** A `?` here — and
@@ -633,6 +931,12 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
     // owned token, and a temporary inside the `select!` is dropped before it is
     // polled.
     let ended = connected.session.ended();
+    // **Where the relay leg is**, which is not the session's business: the leg
+    // can go while the connection carries on over a direct path, and a
+    // replacement answers somewhere new. `keep_on_the_best_path` needs it so
+    // that nothing falls back to a relay that has gone -- and so that a
+    // replacement is attached as a path when one turns up.
+    let relay_leg = connected.session.relay_leg();
     let peer = connected.peer.connection().clone();
     // **Armed only when the stop was an interrupt**, because the hatch turns the
     // *next* Ctrl+C into an immediate exit. On the other two arms nobody has
@@ -654,12 +958,26 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
         // usable — which is what this arm is here for. They cannot be two
         // tasks: a connection's events are a single queue, so a second poller
         // would take events belonging to the first.
-        _ = portal_core::path::keep_on_the_best_path(peer, shutdown.clone()) => {
+        _ = portal_core::path::keep_on_the_best_path(peer, shutdown.clone(), relay_leg) => {
             tracing::warn!("the peer connection closed; the forwards are going with it");
         }
     }
     if interrupted {
+        // **Armed before the revocation, not after.** Nothing polls the signal
+        // handlers once the `select!` has returned, so a revocation placed
+        // ahead of this would make the process deaf for the whole of its
+        // window — a second Ctrl+C doing nothing, and a CI runner's SIGTERM
+        // grace period running out into a SIGKILL. A second press means "stop
+        // now", and that answer has to keep working.
         portal_core::shutdown::hard_exit_on_second_signal();
+        // **Before the close, and only here.** `connected.close()` reports the
+        // connection closed and can wait out its timeout, which is exactly
+        // what the hatch above exists to escape — so on a forced stop the
+        // revocation has to come first or it does not come at all (plan §2.6).
+        // The cost is that the close then reports under a revoked Endpoint and
+        // warns about the listener's leg, which the proxy expires on its own;
+        // an Endpoint nothing sweeps is the more expensive of the two.
+        revoke_if_pending(task).await;
     }
     // **Told to stop before it is dropped.** Dropping the keeper aborts it,
     // which can cut a redemption mid-request and leave msquic a handle the
@@ -667,15 +985,147 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
     // and return.
     shutdown.cancel();
     connected.close().await;
+    if !interrupted {
+        // **After the close on an ordinary ending**, because revoking first
+        // would make `report_state` fail on every successful run: it goes
+        // through the auth layer that just stopped honouring this Endpoint, so
+        // the close would wait out its timeout and warn that the listener's leg
+        // stays reserved -- every time, for nothing. Nothing is racing the
+        // wind-down here, so the ordering §2.6 asks for costs nothing to give
+        // up.
+        revoke_if_pending(task).await;
+    }
     Ok(())
+}
+
+/// Revoke the task's Endpoint if there is one, leaving it for the way out if
+/// that fails.
+///
+/// **Failing does not report here.** `main` tries once more — after the
+/// connection is closed, seconds later and past whatever was in the way — and
+/// says so then. Two bounded attempts are cheap against an Endpoint that stays
+/// registered for good.
+async fn revoke_if_pending(task: &mut Option<P2pConfig>) {
+    let Some(cfg) = task.take() else { return };
+    if let Err(e) = portal_core::agent::revoke_the_task_endpoint(&cfg).await {
+        tracing::debug!("revoking the task Endpoint failed, will try once more: {e:#}");
+        *task = Some(cfg);
+    }
+}
+
+/// The path `--config` reads when nothing names one.
+///
+/// Named so the check in [`run`] can tell "the operator did not ask for a file"
+/// from "the operator named one that is not there".
+const DEFAULT_CONFIG: &str = "portal-client.toml";
+
+/// Whether this run does nothing but write a starter file.
+///
+/// **Not a use of the service, so not something to ask about**, and
+/// `portal-server`'s copy of this says what goes wrong without it: the gate
+/// prints the policy on stderr and exits non-zero, so
+/// `portal-client --example-config > portal-client.toml` truncates that file to
+/// zero bytes and the *next* step fails on an empty one. Measured on a machine
+/// that had not agreed, which is the only machine where the line is ever run.
+fn prints_a_template_only(args: &Args) -> bool {
+    args.example_config
+}
+
+/// Answer the privacy-policy flags, and refuse a run that has not agreed.
+///
+/// `Ok(None)` carries on; `Ok(Some(code))` is a run that did what it was asked
+/// and should now stop.
+fn privacy_gate(args: &Args) -> anyhow::Result<Option<i32>> {
+    if prints_a_template_only(args) {
+        return Ok(None);
+    }
+    if args.withdraw_privacy_consent {
+        portal_core::consent::withdraw(APP)?;
+        eprintln!("forgot this machine's agreement to the privacy policy for {APP}");
+        return Ok(Some(0));
+    }
+    match portal_core::consent::gate(APP, args.accept_privacy_policy, args.show_privacy_policy)? {
+        portal_core::consent::Decision::Proceed => Ok(None),
+        portal_core::consent::Decision::Printed => Ok(Some(0)),
+    }
+}
+
+/// The name this program's agreement is recorded under.
+///
+/// **Its own, not shared with `portal-server`.** Two programs on one machine
+/// are two installations to the person running them, which is the same reason
+/// the two camera applications are recorded apart.
+const APP: &str = "portal-client";
+
+/// What Identity says this sign-in is, for `--whoami`.
+///
+/// **Best effort, and it has to be.** Every other line `--whoami` prints comes
+/// from the key and the saved tokens, so the command has always answered with
+/// no network at all — and what it answers is what the operator needs in order
+/// to ask the far side for a capability. A control plane that cannot be reached
+/// must not take the Endpoint ID down with it, so a failure is reported in
+/// place of the role rather than raised.
+async fn this_role(args: &Args, tokens: &std::path::Path) -> String {
+    // **Outside the budget below, and deliberately.** This can refresh the
+    // Auth0 sign-in, and a refresh dropped halfway is how a rotated refresh
+    // token is lost: Auth0 has issued the new one and invalidated the old, and
+    // the future that would have written it to disk never got there -- leaving
+    // a store whose next use is `--login`. Every other command runs this
+    // uncancelled, and one line of output is not worth being the exception.
+    //
+    // Not `?`: being signed out is one of the answers here, not an error.
+    let auth = match portal_core::login::authenticate(tokens, args.auth0_token.as_deref()).await {
+        Ok(auth) => auth,
+        Err(e) => return format!("unknown -- not signed in ({e})"),
+    };
+    let identity = isekai_p2p::enrollment::Identity::new(&args.identity_url, args.identity_http3);
+    // **Bounded, because the transport is not.** The HTTP client is built with
+    // no timeout, so a host that black-holes packets leaves the call hanging
+    // rather than failing -- and `EP=$(portal-client --whoami)` waits for the
+    // process to exit, so the hang is the operator's too.
+    //
+    // **Only this call**, so that the host named in the message is the host
+    // that did not answer. Sharing the budget with the sign-in above would
+    // blame Identity for Auth0 being slow, and leave whatever was left of ten
+    // seconds for the round trip that is actually being timed.
+    match tokio::time::timeout(
+        WHOAMI_WAIT,
+        isekai_p2p::membership::me(&identity, &auth.token),
+    )
+    .await
+    {
+        Ok(Ok(me)) => isekai_p2p::membership::describe(&me),
+        Ok(Err(e)) => format!("unknown -- could not ask Identity ({e:#})"),
+        Err(_) => format!(
+            "unknown -- {} had not answered in {WHOAMI_WAIT:?}",
+            args.identity_url
+        ),
+    }
+}
+
+/// How long `--whoami` waits for Identity before answering without it.
+const WHOAMI_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// One row of [`show_relays`], header included, so the two cannot drift apart.
+fn relay_row(rtt: &str, families: &str, probe: &str, dp_id: &str, base_url: &str) -> String {
+    format!("{rtt:<14} {families:<8} {probe:<18} {dp_id:<28} {base_url}")
 }
 
 /// `--relays` — measure this Endpoint's relay candidates and print them.
 ///
-/// **The same probe a real session runs**, so what this prints is what the
-/// control plane would be given, not an approximation of it. It reports
-/// nothing: a diagnostic that quietly replaced the stored measurements would
-/// make looking at the system change it.
+/// **The same probe a real session runs**, so the round trips it prints are
+/// what the control plane would be given, not an approximation of them. The
+/// `families` column is a second, different probe — a relay leg's unconnected
+/// socket rather than the control plane's connected one — because that is the
+/// mode whose answer decides whether a direct path can form. The `probe`
+/// column is what that cost, per family, in milliseconds — the number
+/// `docs/relay_address_family_plan.md` §8-6 defers the initiator's budget
+/// decision to, and the reason this command is the fastest way to collect it:
+/// it runs the same observation a listener runs, on demand, instead of once a
+/// half hour into a journal.
+///
+/// It reports nothing: a diagnostic that quietly replaced the stored
+/// measurements would make looking at the system change it.
 async fn show_relays(cfg: &P2pConfig) -> anyhow::Result<()> {
     let token = isekai_p2p::issue_endpoint_token(cfg).await?.endpoint_token;
     let proxy = isekai_p2p::proxy_client(cfg, &token)?;
@@ -699,7 +1149,22 @@ async fn show_relays(cfg: &P2pConfig) -> anyhow::Result<()> {
         .iter()
         .map(|s| (s.dp_id.as_str(), s.rtt_ms))
         .collect();
+    // **Which families answer, alongside the round trips.** An operator
+    // explaining why a direct path never formed between a v6 listener and a v4
+    // initiator is asking this question, and it costs two more dials per relay
+    // in a command that was already dialling every one of them.
+    let families: std::collections::HashMap<_, _> =
+        isekai_p2p::relay_rtt::observe_families(&candidates, opts.per_relay, opts.budget)
+            .await
+            .into_iter()
+            .map(|one| (one.dp_id.clone(), one))
+            .collect();
 
+    // Named, because `families` is not guessable from its values.
+    println!(
+        "{}",
+        relay_row("rtt", "families", "probe", "dp_id", "base_url")
+    );
     for candidate in &candidates {
         // Three states, kept apart because they mean different things to the
         // choice: a number ranks, `unreachable` is dropped from a session's
@@ -707,12 +1172,72 @@ async fn show_relays(cfg: &P2pConfig) -> anyhow::Result<()> {
         let verdict = match measured.get(candidate.dp_id.as_str()) {
             Some(Some(ms)) => format!("{ms} ms"),
             Some(None) => "unreachable".to_owned(),
-            None => "not measured (the round ran out of time)".to_owned(),
+            // Short enough to stay inside its column. With a header above
+            // the rows, a value that overflows shifts `families`, `dp_id` and
+            // `base_url` right on that row alone -- and this is the ordinary
+            // outcome for a far relay that misses the budget, so an operator
+            // reading down the `families` column would land on `dp_id` text.
+            // The reason is spelled out once, below the rows.
+            None => "not measured".to_owned(),
+        };
+        // Four states, and the empty one is not "neither family works": a
+        // relay that did not answer, or that answered only through a CLAT
+        // translator's connected socket, reports nothing rather than ruling a
+        // family out — see `relay_rtt::families_answered`.
+        let observed = families.get(&candidate.dp_id);
+        let answers = match observed.map(|one| one.families()) {
+            Some(families) if families.is_empty() => "none".to_owned(),
+            Some(families) => families
+                .iter()
+                .map(|family| match family {
+                    isekai_p2p::relay_rtt::AddressFamily::V4 => "v4",
+                    isekai_p2p::relay_rtt::AddressFamily::V6 => "v6",
+                })
+                .collect::<Vec<_>>()
+                .join(","),
+            None => "?".to_owned(),
+        };
+        // **What asking cost, per family.** The initiator has roughly 750 ms
+        // for a whole measurement round, so whether it can afford to ask this
+        // is a question about these milliseconds. Both are shown because the
+        // *dead* family is the expensive one, and it is the one that would eat
+        // the budget.
+        // **Labelled, because the set is not fixed.** Only the families worth
+        // asking about are probed, so a single-stack relay has one value --
+        // an unlabelled number there reads as v4 even for a v6-only relay.
+        let probe = match observed {
+            Some(one) if one.probes.is_empty() => "none".to_owned(),
+            Some(one) => one
+                .probes
+                .iter()
+                .map(|p| {
+                    let family = match p.family {
+                        isekai_p2p::relay_rtt::AddressFamily::V4 => "v4",
+                        isekai_p2p::relay_rtt::AddressFamily::V6 => "v6",
+                    };
+                    format!("{family}={}", p.took.as_millis())
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
+            None => "-".to_owned(),
         };
         println!(
-            "{:<14} {:<28} {}",
-            verdict, candidate.dp_id, candidate.base_url
+            "{}",
+            relay_row(
+                &verdict,
+                &answers,
+                &probe,
+                &candidate.dp_id,
+                &candidate.base_url
+            )
         );
+    }
+
+    if candidates
+        .iter()
+        .any(|c| !measured.contains_key(c.dp_id.as_str()))
+    {
+        println!("\n`not measured` means the round ran out of time, not that the relay is down.");
     }
 
     let fastest = samples
@@ -935,10 +1460,16 @@ fn check_ticket(args: &Args, ticket: &str) -> anyhow::Result<isekai_p2p::agent::
 /// Separate so the caller can close the session when one fails; see there.
 async fn start_forwards(
     connected: &portal_core::session::Connected,
-    maps: Vec<(Protocol, SocketAddr, String)>,
+    maps: Vec<Mapped>,
     shutdown: &CancellationToken,
 ) -> anyhow::Result<()> {
-    for (protocol, local, service) in maps {
+    for Mapped {
+        protocol,
+        local,
+        service,
+        no_retrans,
+    } in maps
+    {
         let forwarding = match protocol {
             Protocol::Tcp => {
                 portal_core::client::forward(
@@ -957,6 +1488,7 @@ async fn start_forwards(
                     std::sync::Arc::clone(&connected.sessions),
                     local,
                     service.clone(),
+                    no_retrans,
                     shutdown.clone(),
                 )
                 .await
@@ -992,18 +1524,60 @@ async fn config(
         // **The whole point of the source.** The Endpoint Token renewal runs
         // every few minutes for the life of the session and needs a current
         // Auth0 token each time; without one it reuses one that expires.
-        isekai_p2p::Credential::auth0(auth.token, auth.source, args.register)
+        // **Agent mode always registers**, because its key was made moments
+        // ago and no Endpoint exists for it yet. The operator does not have to
+        // say so, and `--register` on its own would be a way to get it wrong.
+        isekai_p2p::Credential::auth0(auth.token, auth.source, args.register || args.agent)
     };
     Ok(P2pConfig {
+        narrowing: narrowing(args),
         identity_url: args.identity_url.clone(),
         identity_http3: args.identity_http3,
         proxy_url: args.proxy_url.clone(),
         credential,
         protocol: args.protocol.clone(),
-        device_name: args.device_name.clone(),
+        // The task's name, so the audit log says which run made this Endpoint.
+        // A device name would be a lie here: nothing about this key belongs to
+        // a device. `--task` is refused without `--agent`, so this displaces
+        // nothing an attended run asked for.
+        device_name: args.task.clone().or_else(|| args.device_name.clone()),
         token_ttl: None,
         key,
     })
+}
+
+/// What this run asks its Endpoint Token to be narrowed to.
+///
+/// **Empty outside agent mode**, which leaves every existing caller at the
+/// ceiling it has always had. Narrowing is the thing agent mode exists to do,
+/// and doing it to an attended client that never asked would take away
+/// protocols its operator is entitled to.
+fn narrowing(args: &Args) -> isekai_p2p::Narrowing {
+    if !args.agent {
+        return Default::default();
+    }
+    // **Said, because the quiet case is the expensive one.** A selector is not
+    // required (§3.1), but omitting it raises a lease at *every* Gateway
+    // offering the protocol, which spreads this task's Grants across all of
+    // them. That is a fine default for one Gateway and a surprise for ten, and
+    // the difference is invisible from here.
+    if args.gateway.is_empty() {
+        tracing::warn!(
+            protocol = %args.protocol,
+            "no --gateway given: every Gateway offering this protocol will start a lease \
+             for this Endpoint",
+        );
+    }
+    isekai_p2p::Narrowing {
+        // **One protocol, the one this task speaks.** The token's ceiling is
+        // every protocol the person is entitled to, and a task that forwards
+        // one service has no use for the rest.
+        protocols: Some(vec![args.protocol.clone()]),
+        gateways: (!args.gateway.is_empty()).then(|| args.gateway.clone()),
+        // Permissions are left alone: what a portal client needs is the same
+        // for every task, and narrowing them here would be guessing.
+        permissions: None,
+    }
 }
 
 /// Answer the Enrollment Key commands, which need no key of this Endpoint's own.
@@ -1234,11 +1808,15 @@ async fn enrollment_admin(args: &Args, tokens: &Path) -> anyhow::Result<()> {
                 _ => "slots unknown".to_owned(),
             };
             // Which of these is a bare bearer credential is the question worth
-            // answering here, the same as on the server's side.
-            let bound = match key.binding.as_ref().map(|b| b.kind.as_str()) {
-                Some("oidc") => "oidc".to_owned(),
-                Some("none") | Some("") | None => "UNBOUND".to_owned(),
-                Some(other) => other.to_owned(),
+            // answering here, the same as on the server's side -- which is why
+            // the reading is [`isekai_p2p::agent::bound_to`] rather than a
+            // second copy of it. The subject is not shown: this listing is
+            // about which keys are bare, and an enrollment key's subject is a
+            // detail `--enrollment-key-enrollments` reports per registration.
+            let bound = match isekai_p2p::agent::bound_to(key.binding.as_ref()) {
+                isekai_p2p::agent::Bound::Nothing => "UNBOUND".to_owned(),
+                isekai_p2p::agent::Bound::Oidc { .. } => "oidc".to_owned(),
+                isekai_p2p::agent::Bound::Other(kind) => kind.to_owned(),
             };
             println!(
                 "key         : {}  {bound}, {slots}, {}{label}",
@@ -1287,8 +1865,9 @@ fn revoke_reason(args: &Args) -> anyhow::Result<isekai_p2p::agent::RevokeReason>
     use isekai_p2p::agent::RevokeReason;
     let Some(reason) = args.reason.as_deref() else {
         anyhow::bail!(
-            "--revoke-endpoint needs --reason: device_lost, endpoint_deleted, admin_revoke \
-             or security_incident. It goes in the audit log, so it is not guessed for you"
+            "--revoke-endpoint needs --reason: device_lost, endpoint_deleted, admin_revoke, \
+             security_incident or task_finished. It goes in the audit log, so it is not \
+             guessed for you"
         );
     };
     match reason {
@@ -1296,6 +1875,10 @@ fn revoke_reason(args: &Args) -> anyhow::Result<isekai_p2p::agent::RevokeReason>
         "endpoint_deleted" => Ok(RevokeReason::EndpointDeleted),
         "admin_revoke" => Ok(RevokeReason::AdminRevoke),
         "security_incident" => Ok(RevokeReason::SecurityIncident),
+        // **The one that is not an exception.** An agent run writes this for
+        // itself; by hand it is for finishing what a run could not
+        // (`revoke_or_report` prints this command when its own attempt failed).
+        "task_finished" => Ok(RevokeReason::TaskFinished),
         // Named rather than lumped in with a typo: somebody reaching for these
         // has read them in a listing, and the answer is that Identity writes
         // them and a request may not.
@@ -1304,8 +1887,8 @@ fn revoke_reason(args: &Args) -> anyhow::Result<isekai_p2p::agent::RevokeReason>
              returning its slot, a key being revoked. A request cannot claim one"
         ),
         other => anyhow::bail!(
-            "unknown --reason `{other}`: device_lost, endpoint_deleted, admin_revoke \
-             or security_incident"
+            "unknown --reason `{other}`: device_lost, endpoint_deleted, admin_revoke, \
+             security_incident or task_finished"
         ),
     }
 }
@@ -1443,8 +2026,11 @@ fn print_enrollment_binding(binding: Option<&isekai_p2p::agent::BindingView>) {
         println!("bound to    : not reported -- check with --enrollment-keys");
         return;
     };
-    match binding.kind.as_str() {
-        "oidc" => {
+    // The reading is `bound_to`'s, the same as the server's twin of this
+    // function: `"none" | ""` was right here and was *not* there, so the two
+    // binaries disagreed about a binding object that arrived without a `type`.
+    match isekai_p2p::agent::bound_to(Some(binding)) {
+        isekai_p2p::agent::Bound::Oidc { .. } => {
             println!(
                 "bound to    : {} / {}",
                 binding.issuer.as_deref().unwrap_or("?"),
@@ -1458,12 +2044,27 @@ fn print_enrollment_binding(binding: Option<&isekai_p2p::agent::BindingView>) {
                 None => println!("audience    : not reported -- ask the Identity operator"),
             }
         }
-        "none" | "" => {
+        isekai_p2p::agent::Bound::Nothing => {
             println!("bound to    : nothing -- the key alone can register Endpoints.");
             println!("              Never do this for a public repository's CI.");
         }
-        other => println!("bound to    : {other}"),
+        isekai_p2p::agent::Bound::Other(kind) => println!("bound to    : {kind}"),
     }
+}
+
+/// One `--map`, parsed.
+///
+/// A struct rather than a wider tuple: the fourth thing is an option rather
+/// than another coordinate, and `(Protocol, SocketAddr, String, bool)` at four
+/// call sites is how a `bool` ends up in the wrong position.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Mapped {
+    protocol: Protocol,
+    local: SocketAddr,
+    service: String,
+    /// `udp+no-retrans:`. Oversize datagrams on this forward are given up on
+    /// at the first detected loss rather than retransmitted.
+    no_retrans: bool,
 }
 
 /// Parse `port:name` or `udp:port:name` into what to bind and what to ask for.
@@ -1478,24 +2079,67 @@ fn print_enrollment_binding(binding: Option<&isekai_p2p::agent::BindingView>) {
 /// reported as "the peer does not offer it". The prefix is optional only because
 /// TCP is the common case; it is never ambiguous, since `udp` and `tcp` are not
 /// port numbers.
-fn maps(
-    maps: &[String],
-    bind: std::net::IpAddr,
-) -> anyhow::Result<Vec<(Protocol, SocketAddr, String)>> {
+///
+/// **Options ride on the protocol word, as `udp+no-retrans:`.** They cannot go
+/// on the end: a service name is arbitrary UTF-8, so `5353:dns,no-retrans`
+/// would be ambiguous with a service actually called that. The first element is
+/// matched against a known set, which leaves no such question.
+/// Whether `head` is a protocol word, with its `+options` if it has any.
+///
+/// **The whole word, not a prefix of it.** An earlier version of the parser
+/// accepted anything starting `tcp` or `udp` as the protocol word and then fell
+/// back to TCP for what it did not recognise — so `udp6:5353:dns` and
+/// `udp-no-retrans:5353:dns`, the two likeliest typos, became silent **TCP**
+/// forwards of a service the catalogue offers over UDP. Before the option
+/// existed they failed with "`udp6` is not a port", and failing is the
+/// behaviour to keep.
+fn names_a_protocol(head: &str) -> bool {
+    matches!(head.split('+').next(), Some("tcp" | "udp"))
+}
+
+fn maps(maps: &[String], bind: std::net::IpAddr) -> anyhow::Result<Vec<Mapped>> {
     maps.iter()
         .map(|m| {
-            let (protocol, rest) = match m.split_once(':') {
-                Some(("tcp", rest)) => (Protocol::Tcp, rest),
-                Some(("udp", rest)) => (Protocol::Udp, rest),
-                _ => (Protocol::Tcp, m.as_str()),
+            let (head, rest) = match m.split_once(':') {
+                Some((head, rest)) if names_a_protocol(head) => (head, rest),
+                _ => ("tcp", m.as_str()),
             };
+            let mut words = head.split('+');
+            let protocol = match words.next() {
+                Some("udp") => Protocol::Udp,
+                // `tcp` is the only other thing `names_a_protocol` lets
+                // through, and the no-prefix case arrives as the literal.
+                _ => Protocol::Tcp,
+            };
+            let mut no_retrans = false;
+            for word in words {
+                match word {
+                    "no-retrans" => {
+                        // **Refused rather than ignored on TCP.** A stream is
+                        // reliable by nature and there is nothing here to opt
+                        // out of, so accepting the word would promise something
+                        // this does not do.
+                        anyhow::ensure!(
+                            protocol == Protocol::Udp,
+                            "`no-retrans` is for UDP forwards, in --map `{m}`",
+                        );
+                        no_retrans = true;
+                    }
+                    other => anyhow::bail!("unknown --map option `{other}`, in `{m}`"),
+                }
+            }
             let (port, service) = rest.split_once(':').with_context(|| {
                 format!("--map wants `port:service` or `udp:port:service`, got `{m}`")
             })?;
             let port: u16 = port
                 .parse()
                 .with_context(|| format!("`{port}` is not a port, in --map `{m}`"))?;
-            Ok((protocol, SocketAddr::new(bind, port), service.to_owned()))
+            Ok(Mapped {
+                protocol,
+                local: SocketAddr::new(bind, port),
+                service: service.to_owned(),
+                no_retrans,
+            })
         })
         .collect()
 }
@@ -1510,6 +2154,82 @@ mod tests {
         args.revoke_endpoint = Some("ep:abc".to_owned());
         args.reason = reason.map(str::to_owned);
         args
+    }
+
+    fn one_map(m: &str) -> anyhow::Result<Mapped> {
+        let mut parsed = maps(&[m.to_owned()], "127.0.0.1".parse().unwrap())?;
+        Ok(parsed.pop().expect("one"))
+    }
+
+    /// The shapes that worked before `no-retrans` existed still mean what they
+    /// meant, which is the part a new option is most likely to break.
+    #[test]
+    fn the_shapes_that_worked_before_still_do() {
+        let tcp = one_map("5432:db").expect("tcp by default");
+        assert_eq!((tcp.protocol, tcp.no_retrans), (Protocol::Tcp, false));
+        assert_eq!(tcp.local.port(), 5432);
+        assert_eq!(tcp.service, "db");
+
+        for m in ["tcp:5432:db", "udp:5353:dns"] {
+            let parsed = one_map(m).unwrap_or_else(|e| panic!("{m}: {e:#}"));
+            assert!(!parsed.no_retrans, "{m} did not ask for it");
+        }
+        assert_eq!(one_map("udp:5353:dns").expect("udp").protocol, Protocol::Udp);
+    }
+
+    /// **The option rides on the protocol word.** On the end it would be
+    /// ambiguous with a service called `no-retrans`, since a service name is
+    /// arbitrary UTF-8.
+    #[test]
+    fn no_retrans_is_asked_for_on_the_protocol_word() {
+        let parsed = one_map("udp+no-retrans:5353:dns").expect("parse");
+        assert_eq!(parsed.protocol, Protocol::Udp);
+        assert!(parsed.no_retrans);
+        assert_eq!(parsed.service, "dns", "and the service is untouched");
+        assert_eq!(parsed.local.port(), 5353);
+    }
+
+    /// A service may legitimately be called this, and saying so must not turn
+    /// into asking for the option.
+    #[test]
+    fn a_service_called_no_retrans_is_just_a_service() {
+        let parsed = one_map("udp:5353:no-retrans").expect("parse");
+        assert_eq!(parsed.service, "no-retrans");
+        assert!(!parsed.no_retrans, "it named a service, it did not ask");
+    }
+
+    /// **Refused rather than ignored.** A stream is reliable by nature, so
+    /// there is nothing on a TCP forward to opt out of, and accepting the word
+    /// would promise something that does not happen.
+    #[test]
+    fn no_retrans_on_a_tcp_forward_is_refused() {
+        let err = one_map("tcp+no-retrans:5432:db").expect_err("refused");
+        assert!(
+            format!("{err:#}").contains("no-retrans` is for UDP"),
+            "{err:#}",
+        );
+    }
+
+    /// **A mistyped protocol word fails rather than becoming TCP.** These two
+    /// are the typos the `+options` parser made silent, and the second is the
+    /// nastier one: a TCP forward of a UDP service, refused by the peer with
+    /// the same byte a missing service gets.
+    #[test]
+    fn a_mistyped_protocol_word_is_not_quietly_tcp() {
+        for m in ["udp6:5353:dns", "udp-no-retrans:5353:dns"] {
+            let err = one_map(m).expect_err(m);
+            let message = format!("{err:#}");
+            assert!(message.contains("is not a port"), "{m}: {message}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_map_option_says_so() {
+        let err = one_map("udp+nonsense:5353:dns").expect_err("refused");
+        assert!(
+            format!("{err:#}").contains("unknown --map option"),
+            "{err:#}",
+        );
     }
 
     #[test]

@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 
 use tokio::io::AsyncWriteExt as _;
 
-use crate::frame::{read_open, write_status, Open, Status};
+use crate::frame::{read_open, write_status, Open, Request, Status};
 use crate::udp::Sessions;
 
 /// How long to wait for a target to accept before answering `Unreachable`.
@@ -210,7 +210,21 @@ async fn forward_one(
     sessions: Arc<Sessions>,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
-    let open = read_open(&mut stream).await?;
+    let open = match read_open(&mut stream).await? {
+        Request::Open(open) => open,
+        // **Answered, not dropped.** The frame was read and the stream is at a
+        // boundary, so the opener learns that its kind was understood and its
+        // request was not -- which is what keeps it from inferring that this
+        // end takes no oversize datagrams at all. `Status::Unsupported` has
+        // the reasoning.
+        Request::NotAsAsked { service, detail } => {
+            tracing::warn!(
+                ?service,
+                "an open could not be served as asked: {detail}; refusing it by name",
+            );
+            return refuse(stream, Status::Unsupported).await;
+        }
+    };
     let service = open.service().to_owned();
     // **The lookup is protocol-aware and both kinds come through it**, which is
     // what keeps a UDP service unreachable from a TCP request and the other way
@@ -244,13 +258,33 @@ async fn forward_one(
         }
     };
 
-    let session = match open {
+    // **The opener's choice, for this session's replies.** Carried on the open
+    // frame rather than inferred: the large half of a request/response pair is
+    // usually the response, so honouring `no-retrans` only for the opener's own
+    // sends would have done half of what was asked for.
+    let (session, no_retrans) = match open {
         Open::Tcp { .. } => return forward_tcp(stream, &service, target).await,
-        Open::Udp { session, .. } => session,
+        Open::Udp {
+            session, oversize, ..
+        } => {
+            // **The answerer's half of §5.2's negotiation.** The opener said
+            // whether it can receive oversize datagrams on streams by which
+            // kind it asked with, and this is the only place that hears it --
+            // not recording it would leave this end dropping oversize payloads
+            // against a peer that could have taken them.
+            //
+            // Answering at all is this end's half: a peer that does not know
+            // the kind never gets here, because `read_open` refuses it.
+            sessions.learn_peer_told_oversize(oversize.is_some());
+            (session, oversize.is_some_and(|o| o.no_retrans))
+        }
     };
     // From here the stream carries no bytes: it is the session's lifetime
     // handle and the payloads are datagrams.
-    crate::udp::serve(sessions, session, &service, target, stream, shutdown).await
+    crate::udp::serve(
+        sessions, session, &service, no_retrans, target, stream, shutdown,
+    )
+    .await
 }
 
 /// One forwarded TCP connection, from the status byte to the last byte copied.

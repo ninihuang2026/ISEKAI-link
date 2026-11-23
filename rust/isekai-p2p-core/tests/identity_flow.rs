@@ -15,6 +15,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use isekai_p2p_core::endpoint::EndpointKey;
 use isekai_p2p_core::https::HttpsTransport;
 use isekai_p2p_core::identity::IdentityClient;
+use isekai_p2p_core::identity::Narrowing;
 use p256::ecdsa::Signature;
 use serde_json::{Value, json};
 
@@ -58,7 +59,7 @@ async fn issue_token(State(s): State<Captured>, h: HeaderMap, b: Bytes) -> Json<
         "expires_in": 900,
         "endpoint_id": "ep:abc",
         "permissions": ["peer-connect:initiate"],
-        "protocols": ["isekai-validator-v1"],
+        "protocols": ["isekai-camera-v1"],
     }))
 }
 
@@ -83,10 +84,18 @@ async fn register_and_issue_sends_correct_requests() {
     let client = IdentityClient::new(
         HttpsTransport::connect(&format!("http://{addr}")).expect("transport builds"),
     );
-    let token = client
-        .register_and_issue("AUTH0_AT", &key, Some("test-device"), Some(900))
+    let challenge = client
+        .register_challenge("AUTH0_AT", &key)
         .await
-        .expect("flow succeeds");
+        .expect("a challenge");
+    client
+        .register("AUTH0_AT", &key, &challenge, Some("test-device"))
+        .await
+        .expect("registered");
+    let token = client
+        .issue_token("AUTH0_AT", &key, &Narrowing::default(), Some(900))
+        .await
+        .expect("a token");
     assert_eq!(token.endpoint_token, "TOKEN.JWT.VALUE");
     assert_eq!(token.expires_in, 900);
 
@@ -123,4 +132,64 @@ async fn register_and_issue_sends_correct_requests() {
         .unwrap();
     Signature::from_der(&pop_sig).expect("PoP signature is DER");
     assert_eq!(body["endpoint_id"], key.endpoint_id());
+}
+
+/// **The narrowing has to reach the issue that follows a registration.**
+///
+/// The convenience call this used to go through ended in
+/// `issue_token(.., None, None, ..)`, so a caller registering a fresh key —
+/// which an agent runtime does for every task — got its first token at the full
+/// ceiling however carefully it had asked. That is the one path agent mode
+/// always takes, so it was the one where the request was furthest from reaching
+/// the wire. (The call itself is gone now: it hid a registration's outcome
+/// behind the issue's.)
+#[tokio::test]
+async fn registering_carries_the_narrowing_to_the_issue() {
+    let captured = Captured::default();
+    let app = Router::new()
+        .route("/v1/endpoints/register/challenge", post(challenge))
+        .route("/v1/endpoints/register", post(register))
+        .route("/v1/tokens/endpoint", post(issue_token))
+        .with_state(captured.clone());
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let key = EndpointKey::generate();
+    let client = IdentityClient::new(
+        HttpsTransport::connect(&format!("http://{addr}")).expect("transport builds"),
+    );
+    let narrowing = Narrowing {
+        protocols: Some(vec!["pg-sales-ro-v1".to_owned()]),
+        gateways: Some(vec!["ep:r1".to_owned()]),
+        ..Default::default()
+    };
+    let challenge = client
+        .register_challenge("AUTH0_AT", &key)
+        .await
+        .expect("a challenge");
+    client
+        .register("AUTH0_AT", &key, &challenge, Some("test-device"))
+        .await
+        .expect("registered");
+    client
+        .issue_token("AUTH0_AT", &key, &narrowing, Some(900))
+        .await
+        .expect("a token");
+
+    let calls = captured.0.lock().unwrap();
+    let (_, body) = calls
+        .iter()
+        .find_map(|(path, _, body)| (path == "/v1/tokens/endpoint").then_some((path, body)))
+        .expect("the issue was made");
+    assert_eq!(body["requested_protocols"], json!(["pg-sales-ro-v1"]));
+    // **The selector, not a claim.** It decides which Gateways hear about this
+    // Endpoint; omitting it starts a lease at every one offering the class.
+    assert_eq!(body["requested_gateways"], json!(["ep:r1"]));
+    // Untouched axes stay absent rather than becoming empty, which would be a
+    // different request.
+    assert!(body["requested_permissions"].is_null());
 }

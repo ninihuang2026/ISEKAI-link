@@ -22,7 +22,9 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 # The Auth0 device-authorization flow and refresh (`auth`).
 reqwest = { workspace = true }
-# Reading the `expires_at` the proxy puts on a lease (`initiator`).
+# Reading the `expires_at` the proxy puts on a lease (`initiator`), and the
+# `created_at` a created grant answers with (`grants`) -- both Rfc3339, which
+# is what the workspace entry's `parsing`/`formatting` features are for.
 time = { workspace = true }
 # Winding the relay leg down when a renewal says this Endpoint is refused
 # (`initiator`).
@@ -36,6 +38,10 @@ rcgen = { workspace = true }
 # path builds one, but `base64` is cheap and pure Rust, so it is not worth a
 # target section -- unlike `openssl` below, which is.
 base64 = { workspace = true }
+# The PKCE verifier and the CSRF `state` of the browser sign-in (`auth0`).
+rand = { workspace = true }
+# `S256`: the PKCE challenge is the SHA-256 of the verifier (`auth0`).
+sha2 = { workspace = true }
 # CLI-only.
 argh = { workspace = true }
 serde = { workspace = true }
@@ -55,3 +61,7 @@ openssl = { version = "0.10.66", features = ["vendored"] }
 [dev-dependencies]
 axum = { workspace = true, features = ["json", "tokio", "http1"] }
 p256 = { workspace = true }
+# `test-util` for a paused clock: the lease timings this crate has to get right
+# are minutes and hours long, and a test that actually waits for one is a test
+# nobody runs. Not in tokio's `full`, hence the explicit feature.
+tokio = { workspace = true, features = ["test-util"] }

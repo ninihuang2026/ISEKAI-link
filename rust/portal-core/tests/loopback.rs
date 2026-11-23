@@ -45,7 +45,7 @@ use std::time::Duration;
 
 use msquic_async::StreamType;
 use msquic_async::{msquic, Registration};
-use portal_core::datagram::MAX_PAYLOAD;
+use portal_core::datagram::{MAX_PAYLOAD, MAX_STREAM_PAYLOAD};
 use portal_core::server::{Catalogue, Protocol};
 use portal_core::udp::Sessions;
 use portal_core::{client, frame, server, transport, udp};
@@ -90,6 +90,37 @@ const DIAL_BUDGET: Duration = Duration::from_secs(30);
 /// were crossed, two sources would still both get uppercase back, so the tests
 /// check *which* reply reaches which local socket rather than merely that one
 /// arrives.
+/// A datagram service that hands back **what it received** rather than an
+/// answer.
+///
+/// [`shouting_datagram_service`] proves a round trip, which is the wrong
+/// instrument for the oversize receive path: the reply would be larger than
+/// `MAX_PAYLOAD` and there is no send side yet, so it would be dropped and the
+/// test would fail for a reason it is not about. This reports the arrival
+/// instead.
+async fn recording_datagram_service() -> (
+    std::net::SocketAddr,
+    tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+) {
+    let socket = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind the datagram service");
+    let addr = socket.local_addr().expect("service address");
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let mut buf = vec![0_u8; 70_000];
+        loop {
+            let Ok((n, _from)) = socket.recv_from(&mut buf).await else {
+                return;
+            };
+            if tx.send(buf[..n].to_vec()).is_err() {
+                return;
+            }
+        }
+    });
+    (addr, rx)
+}
+
 async fn shouting_datagram_service() -> std::net::SocketAddr {
     let socket = UdpSocket::bind("127.0.0.1:0")
         .await
@@ -162,6 +193,25 @@ struct Halves {
     /// `Connection` clone, so [`drain`] has to let it go before it waits —
     /// exactly what `session::Connected::close` does in the real client.
     sessions: Option<Arc<Sessions>>,
+    /// Held because **dropping it stops the hop**, so the hop lasts as long as
+    /// the `Halves` that owns it.
+    ///
+    /// An earlier version of this said the opposite — "held so the hop
+    /// outlives the connection" — and it was wrong twice over: `Hop` had no
+    /// `Drop` at all, so holding the handle did nothing, and `drain` cancels
+    /// the shutdown token as its first statement, which stopped the hop
+    /// *before* the connection closed. `Hop` cancels on drop now, which is
+    /// what makes this field mean something.
+    _hop: Option<isekai_p2p::agent::Hop>,
+    /// The **server's** side of the connection, for the one test that has to
+    /// send something the server never sends.
+    ///
+    /// Everything else in this file drives the server through the client, which
+    /// is the right way round. A unidirectional stream towards the client is
+    /// the exception: S3 does not exist, so nothing on the server opens one,
+    /// and the client's receive bounds would otherwise have no way to be
+    /// observed — its `Sessions` is the only one a test can read counters from.
+    peer_side: Option<msquic_async::Connection>,
     teardown: Teardown,
 }
 
@@ -244,11 +294,34 @@ impl Halves {
 
 /// A portal server offering `catalogue`, and a connection to it.
 async fn connected(catalogue: Catalogue) -> Halves {
-    connected_with_idle(catalogue, udp::IDLE).await
+    connected_with(catalogue, udp::IDLE, None).await
 }
 
 /// [`connected`], with a UDP sweep this side of a minute.
 async fn connected_with_idle(catalogue: Catalogue, idle: Duration) -> Halves {
+    connected_with(catalogue, idle, None).await
+}
+
+/// [`connected`], with every packet of the connection passing `hook`.
+///
+/// **The client dials a [`Hop`] rather than the listener**, so both directions
+/// cross one seam. There is no relay leg here and no candidate exchange, so
+/// nothing can migrate off it — but a test should not take that on trust:
+/// `a_hop_carries_the_whole_connection` asserts the hook actually saw traffic,
+/// which is the check that would have caught the one-sided `--relay-only`
+/// mistake the hook plan made (§1.4).
+async fn connected_through_hook(
+    catalogue: Catalogue,
+    hook: Arc<dyn isekai_p2p::agent::DatapathHook>,
+) -> Halves {
+    connected_with(catalogue, udp::IDLE, Some(hook)).await
+}
+
+async fn connected_with(
+    catalogue: Catalogue,
+    idle: Duration,
+    hook: Option<Arc<dyn isekai_p2p::agent::DatapathHook>>,
+) -> Halves {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_test_writer()
@@ -265,11 +338,16 @@ async fn connected_with_idle(catalogue: Catalogue, idle: Duration) -> Halves {
     };
 
     let serving = shutdown.clone();
+    let (peer_tx, peer_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         tokio::select! {
             _ = serving.cancelled() => {}
             accepted = listener.accept() => {
                 if let Ok(conn) = accepted {
+                    // Cloned before `serve` takes it. A clone is a handle, so
+                    // `drain` has to see it dropped -- which is why `Halves`
+                    // holds it in an `Option` like the two beside it.
+                    let _ = peer_tx.send(conn.clone());
                     let _ = server::serve(conn, catalogue, serving.clone()).await;
                 }
             }
@@ -293,12 +371,31 @@ async fn connected_with_idle(catalogue: Catalogue, idle: Duration) -> Halves {
     // that was an inference from three numbers that were all just the budget.
     // What the log says is only "longer than the budget". So: print it.
     let began = std::time::Instant::now();
+    // The hop goes between the dial and the listener, so the connection's
+    // packets have somewhere to be seen. Kept alive by `Halves` for the same
+    // reason its other handles are.
+    let hop = match hook {
+        None => None,
+        Some(hook) => Some(
+            isekai_p2p::agent::Hop::start(
+                format!("127.0.0.1:{}", bound.port()).parse().unwrap(),
+                hook,
+                shutdown.clone(),
+            )
+            .await
+            .expect("start a datapath hop"),
+        ),
+    };
+    let dial_port = hop
+        .as_ref()
+        .map_or_else(|| bound.port(), |h| h.addr().port());
+
     let session = tokio::time::timeout(
         DIAL_BUDGET,
         transport::connect(
             Some(reg.clone()),
             "127.0.0.1",
-            bound.port(),
+            dial_port,
             transport::ConnectOptions::default(),
             &shutdown,
         ),
@@ -311,6 +408,14 @@ async fn connected_with_idle(catalogue: Catalogue, idle: Duration) -> Halves {
     Halves {
         session: Some(session),
         sessions: Some(sessions),
+        _hop: hop,
+        // Arrives once the handshake the dial above completed is accepted, so
+        // it is already there; a timeout rather than a `blocking` wait because
+        // a failure here should say what it was.
+        peer_side: tokio::time::timeout(DIAL_BUDGET, peer_rx)
+            .await
+            .expect("the listener accepted inside the dial budget")
+            .ok(),
         teardown,
     }
 }
@@ -469,6 +574,7 @@ async fn datagrams_reach_the_service_and_come_back() {
         Arc::clone(halves.sessions()),
         "127.0.0.1:0".parse().unwrap(),
         "dns".to_owned(),
+        false,
         halves.teardown.shutdown.clone(),
     )
     .await
@@ -518,6 +624,7 @@ async fn two_sources_get_their_own_replies() {
         Arc::clone(halves.sessions()),
         "127.0.0.1:0".parse().unwrap(),
         "dns".to_owned(),
+        false,
         halves.teardown.shutdown.clone(),
     )
     .await
@@ -540,12 +647,18 @@ async fn two_sources_get_their_own_replies() {
     drain(halves).await;
 }
 
-/// **A payload over the limit is dropped and counted, not truncated.** The unit
-/// test in `datagram` checks that `encode` refuses one; this checks that the
-/// refusal is where the traffic actually is — nothing reaches the service, the
-/// session survives it, and the counter says so.
+/// **A payload over the datagram limit now crosses, and comes back.** This test
+/// used to assert the opposite — that 1164 bytes reached nobody — and S3 is
+/// what changed the answer. It failing is how the round trip was first
+/// observed working.
+///
+/// **Both directions, through the real send path.** The hand-written stream in
+/// `an_oversize_datagram_arrives_on_a_stream_of_its_own` pins the wire format
+/// independently of our own sender; this one goes through `Sessions::send`,
+/// which is the code an application actually reaches — and the reply proves the
+/// server's half, where no `--map` reaches and the default is what runs.
 #[tokio::test]
-async fn an_oversize_datagram_is_dropped_and_counted() {
+async fn an_oversize_datagram_crosses_and_comes_back() {
     let target = shouting_datagram_service().await;
     let halves = connected(Catalogue::new().with("dns", Protocol::Udp, target)).await;
 
@@ -553,6 +666,7 @@ async fn an_oversize_datagram_is_dropped_and_counted() {
         Arc::clone(halves.sessions()),
         "127.0.0.1:0".parse().unwrap(),
         "dns".to_owned(),
+        false,
         halves.teardown.shutdown.clone(),
     )
     .await
@@ -561,30 +675,476 @@ async fn an_oversize_datagram_is_dropped_and_counted() {
     let client = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
     client.connect(local).await.expect("connect");
 
-    // One byte over, so nothing but the limit itself decides this.
-    client
-        .send(&vec![b'a'; MAX_PAYLOAD + 1])
-        .await
-        .expect("send");
-    let mut reply = vec![0_u8; 70_000];
-    let answered = tokio::time::timeout(Duration::from_secs(2), client.recv(&mut reply)).await;
-    assert!(
-        answered.is_err(),
-        "a payload that will not fit must not arrive in pieces: {answered:?}",
+    // One byte over the datagram limit, so nothing but the limit itself decides
+    // which carrier this takes; and then something a large DNS answer's size,
+    // so the test is not only about the boundary.
+    for len in [MAX_PAYLOAD + 1, 4096] {
+        client.send(&vec![b'a'; len]).await.expect("send");
+        let mut reply = vec![0_u8; 70_000];
+        let got = tokio::time::timeout(Duration::from_secs(5), client.recv(&mut reply))
+            .await
+            .unwrap_or_else(|_| panic!("{len} bytes came back within five seconds"))
+            .expect("receive");
+        assert_eq!(got, len, "the whole datagram, not a prefix");
+        assert_eq!(
+            &reply[..got],
+            vec![b'A'; len],
+            "and it went through the service"
+        );
+    }
+
+    // Small ones still work afterwards, which is the thing to check when a
+    // second carrier appears: the first one is what everything else uses.
+    assert_eq!(&say(&client, b"after").await, b"AFTER");
+
+    assert_eq!(
+        halves.sessions().drops.total(),
+        0,
+        "and nothing was lost on the way",
     );
+
+    drain(halves).await;
+}
+
+/// **The opener's `no-retrans` reaches the answerer.** The flag is on the
+/// client's `--map` and the server has only a catalogue, so the open frame is
+/// the only way a reply can honour what was asked for — and the large half of a
+/// request/response pair is usually the reply.
+///
+/// Read on the wire rather than through a forward, because what the server does
+/// with it is invisible from here: the observable difference needs loss, which
+/// is open question 10. What this pins is that the bit travels, and that
+/// `None` and `Some(default)` are not confused for each other.
+#[tokio::test]
+async fn the_openers_no_retrans_choice_crosses() {
+    let target = shouting_datagram_service().await;
+    let halves = connected(Catalogue::new().with("dns", Protocol::Udp, target)).await;
+
+    for (session, no_retrans) in [(60, false), (61, true)] {
+        let mut stream = halves
+            .connection()
+            .open_outbound_stream(StreamType::Bidirectional, false)
+            .await
+            .expect("open a stream");
+        frame::write_open(
+            &mut stream,
+            &frame::Open::Udp {
+                service: "dns".to_owned(),
+                session,
+                oversize: Some(frame::OversizeOptions { no_retrans }),
+            },
+        )
+        .await
+        .expect("write the open");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), frame::read_status(&mut stream))
+                .await
+                .expect("the peer answered within five seconds")
+                .expect("read the status"),
+            frame::Status::Ready,
+            "no_retrans={no_retrans} was accepted",
+        );
+        drop(stream);
+    }
+
+    drain(halves).await;
+}
+
+/// Drops the first large packet the dialling end sends, once armed.
+///
+/// **Size, not position.** An opaque hook cannot tell which stream a packet
+/// carries (`docs/isekai_p2p_datapath_hook_plan.md` §3.3), and counting from
+/// the arming point would land on whatever ACK happened to go next. A stream's
+/// data packets fill the MTU and an ACK does not, so size picks the one the
+/// test means — and the quiesce before arming is what keeps anything else
+/// large from being in flight.
+struct DropOneBigOnce {
+    /// Which end's packets to take, so both halves of a request and its answer
+    /// can be tested — the answer being the larger half in the case this is
+    /// about.
+    from: Sender,
+    armed: std::sync::atomic::AtomicBool,
+    budget: std::sync::atomic::AtomicUsize,
+    dropped: std::sync::atomic::AtomicUsize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Sender {
+    Dialler,
+    Listener,
+}
+
+impl DropOneBigOnce {
+    const BIG: usize = 1000;
+
+    fn new(from: Sender) -> Arc<Self> {
+        Arc::new(Self {
+            from,
+            armed: std::sync::atomic::AtomicBool::new(false),
+            budget: std::sync::atomic::AtomicUsize::new(0),
+            dropped: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    /// **`Release`, paired with the `Acquire` in `take`.** The budget and the
+    /// flag are two stores and the hook reads them from the hop's task, so two
+    /// `Relaxed` ones let a weakly ordered machine — aarch64, which this suite
+    /// runs on — see `armed` set and the budget still zero. The packet would
+    /// pass and the test would fail on its count, which is the flaky-instrument
+    /// failure `channel-masque`'s own helper warns about and avoids only by
+    /// being set before it is shared.
+    fn arm(&self, how_many: usize) {
+        use std::sync::atomic::Ordering::{Relaxed, Release};
+        self.budget.store(how_many, Relaxed);
+        self.armed.store(true, Release);
+    }
+
+    fn dropped(&self) -> usize {
+        self.dropped.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn take(&self, from: Sender, packet: &[u8]) -> isekai_p2p::agent::Verdict {
+        use std::sync::atomic::Ordering::{Acquire, Relaxed};
+        if from != self.from || !self.armed.load(Acquire) || packet.len() < Self::BIG {
+            return isekai_p2p::agent::Verdict::Pass;
+        }
+        // One decrement, for the reason the hop's own helper gives.
+        if self
+            .budget
+            .fetch_update(Relaxed, Relaxed, |left| left.checked_sub(1))
+            .is_ok()
+        {
+            self.dropped.fetch_add(1, Relaxed);
+            isekai_p2p::agent::Verdict::Drop
+        } else {
+            isekai_p2p::agent::Verdict::Pass
+        }
+    }
+}
+
+impl isekai_p2p::agent::DatapathHook for DropOneBigOnce {
+    fn outbound(&self, packet: &[u8]) -> isekai_p2p::agent::Verdict {
+        self.take(Sender::Dialler, packet)
+    }
+    fn inbound(&self, packet: &[u8]) -> isekai_p2p::agent::Verdict {
+        self.take(Sender::Listener, packet)
+    }
+}
+
+/// The choreography open question 10 needs: a settled connection, one oversize
+/// datagram, and a packet of it lost.
+///
+/// Returns what came back, if anything, and how many packets the hook ate.
+async fn oversize_through_a_lossy_hop(
+    no_retrans: bool,
+    lose: Sender,
+) -> (Option<usize>, usize, u64) {
+    let target = shouting_datagram_service().await;
+    let hook = DropOneBigOnce::new(lose);
+    let halves = connected_through_hook(
+        Catalogue::new().with("dns", Protocol::Udp, target),
+        hook.clone(),
+    )
+    .await;
+
+    let local = udp::forward(
+        Arc::clone(halves.sessions()),
+        "127.0.0.1:0".parse().unwrap(),
+        "dns".to_owned(),
+        no_retrans,
+        halves.teardown.shutdown.clone(),
+    )
+    .await
+    .expect("forward a local UDP port");
+    let client = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+    client.connect(local).await.expect("connect");
+
+    // **Settle first.** A small round trip opens the session, and then a pause
+    // lets its acknowledgements drain -- so that when the hook is armed, the
+    // next large packet out is the one this test is about.
+    assert_eq!(&say(&client, b"first").await, b"FIRST");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    hook.arm(1);
+    let big = vec![b'x'; 4096];
+    client.send(&big).await.expect("send");
+
+    // Either it comes back, or it does not within a budget generous enough
+    // that "it did not" is about the loss rather than about the machine.
+    let came_back = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut reply = vec![0_u8; 70_000];
+        client.recv(&mut reply).await.expect("receive")
+    })
+    .await
+    .ok();
+
+    let cancelled = halves
+        .sessions()
+        .drops
+        .stream_cancelled
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let ate = hook.dropped();
+    drain(halves).await;
+    (came_back, ate, cancelled)
+}
+
+/// **`no-retrans` gives up on the datagram**, which is open question 10 of
+/// `docs/portal_oversize_udp_plan.md` and the thing S3 could only assert the
+/// absence of: that asking for it still delivers.
+///
+/// Read with `an_oversize_datagram_survives_one_loss_by_default` below — **same
+/// hop, same single dropped packet, opposite outcomes.** One test alone would
+/// only show that a forward with a packet missing lost a datagram, which is
+/// unremarkable.
+#[tokio::test]
+async fn no_retrans_gives_up_on_an_oversize_datagram_that_loses_a_packet() {
+    let (came_back, ate, cancelled) = oversize_through_a_lossy_hop(true, Sender::Dialler).await;
+
+    assert_eq!(ate, 1, "the hop dropped exactly one packet of it");
+    assert!(
+        came_back.is_none(),
+        "and the datagram was given up on rather than arriving late: {came_back:?}",
+    );
+    assert_eq!(
+        cancelled, 1,
+        "counted as asked-for rather than as a fault, which is what \
+         `stream_cancelled` is for",
+    );
+}
+
+/// The control. **Retransmission is the default**, so the same loss costs
+/// latency instead of the datagram — which is what makes the test above about
+/// `no-retrans` and not about loss.
+#[tokio::test]
+async fn an_oversize_datagram_survives_one_loss_by_default() {
+    let (came_back, ate, cancelled) = oversize_through_a_lossy_hop(false, Sender::Dialler).await;
+
+    assert_eq!(ate, 1, "the same one packet was dropped");
+    assert_eq!(
+        came_back,
+        Some(4096),
+        "and the whole datagram still arrived, retransmitted",
+    );
+    assert_eq!(cancelled, 0, "nothing was given up on");
+}
+
+/// **The answering end honours it too**, which is the half that matters: the
+/// large part of a request and its answer is usually the answer, and the
+/// answerer has no `--map` — it acts on what the open frame carried (§S5).
+///
+/// The first version of this test dropped only the dialling end's packets and
+/// the plans then said question 10 was closed. It was closed for one direction.
+///
+/// **What cannot be asserted here is the server's counter**: its `Sessions` is
+/// not reachable from a test. So the observable is the outcome, which is the
+/// one the application sees anyway.
+#[tokio::test]
+async fn no_retrans_gives_up_on_the_answer_too() {
+    let (came_back, ate, _) = oversize_through_a_lossy_hop(true, Sender::Listener).await;
+
+    assert_eq!(ate, 1, "the hop dropped one packet of the reply");
+    assert!(
+        came_back.is_none(),
+        "and the answer was given up on rather than retransmitted: {came_back:?}",
+    );
+}
+
+/// The control for the direction above, for the reason the first pair has one.
+#[tokio::test]
+async fn an_answer_survives_one_loss_by_default() {
+    let (came_back, ate, _) = oversize_through_a_lossy_hop(false, Sender::Listener).await;
+
+    assert_eq!(ate, 1, "the same one packet of the reply was dropped");
+    assert_eq!(
+        came_back,
+        Some(4096),
+        "and the answer still arrived, retransmitted",
+    );
+}
+
+/// **A hop carries the whole connection, and the hook sees it.**
+///
+/// H1 of `docs/isekai_p2p_datapath_hook_plan.md`. The assertion that matters is
+/// the count: a seam the traffic does not cross is worth nothing, and a test
+/// that only checked the forward still worked would pass just as happily with
+/// the hop bypassed. That is the shape of the mistake the hook plan made about
+/// one-sided `--relay-only` (§1.4), caught here by asking the seam what it saw.
+#[tokio::test]
+async fn a_hop_carries_the_whole_connection() {
+    #[derive(Default)]
+    struct Counting {
+        out: std::sync::atomic::AtomicUsize,
+        in_: std::sync::atomic::AtomicUsize,
+    }
+    impl isekai_p2p::agent::DatapathHook for Counting {
+        fn outbound(&self, _p: &[u8]) -> isekai_p2p::agent::Verdict {
+            self.out.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            isekai_p2p::agent::Verdict::Pass
+        }
+        fn inbound(&self, _p: &[u8]) -> isekai_p2p::agent::Verdict {
+            self.in_.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            isekai_p2p::agent::Verdict::Pass
+        }
+    }
+
+    let target = shouting_datagram_service().await;
+    let hook = Arc::new(Counting::default());
+    let halves = connected_through_hook(
+        Catalogue::new().with("dns", Protocol::Udp, target),
+        hook.clone(),
+    )
+    .await;
+
+    // The handshake alone has crossed it by now, which is the point: a hop is
+    // in the connection's path from the first packet, not from the first
+    // forward.
+    let after_handshake = (
+        hook.out.load(std::sync::atomic::Ordering::Relaxed),
+        hook.in_.load(std::sync::atomic::Ordering::Relaxed),
+    );
+    assert!(
+        after_handshake.0 > 0 && after_handshake.1 > 0,
+        "the handshake crossed the hop in both directions: {after_handshake:?}",
+    );
+
+    // And the forward works through it, small and oversize alike -- the second
+    // being the one H2 will be dropping a packet of.
+    let local = udp::forward(
+        Arc::clone(halves.sessions()),
+        "127.0.0.1:0".parse().unwrap(),
+        "dns".to_owned(),
+        false,
+        halves.teardown.shutdown.clone(),
+    )
+    .await
+    .expect("forward a local UDP port");
+    let client = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+    client.connect(local).await.expect("connect");
+
+    assert_eq!(&say(&client, b"small").await, b"SMALL");
+
+    let big = vec![b'b'; MAX_PAYLOAD + 1];
+    client.send(&big).await.expect("send");
+    let mut reply = vec![0_u8; 70_000];
+    let got = tokio::time::timeout(Duration::from_secs(5), client.recv(&mut reply))
+        .await
+        .expect("the oversize one came back within five seconds")
+        .expect("receive");
+    assert_eq!(got, big.len());
+
+    let after_traffic = (
+        hook.out.load(std::sync::atomic::Ordering::Relaxed),
+        hook.in_.load(std::sync::atomic::Ordering::Relaxed),
+    );
+    assert!(
+        after_traffic.0 > after_handshake.0 && after_traffic.1 > after_handshake.1,
+        "and the forward's own packets crossed it too: {after_handshake:?} -> {after_traffic:?}",
+    );
+
+    drain(halves).await;
+}
+
+/// **An option the peer does not know is answered, not met with silence.**
+///
+/// This is open question 12's whole point. Dropping the stream was the obvious
+/// refusal and the expensive one: a dead stream is exactly how `open_session`
+/// learns that a peer does not know `KIND_UDP_BIG`, so a refused *option*
+/// would have been read as a missing *capability* and latched after the second
+/// one — costing the connection its oversize datagrams entirely, against a peer
+/// that supports them.
+///
+/// Written by hand because no build can ask for an option it does not have: the
+/// bit here is one nothing defines. That is also the limit of this test — it
+/// shows the answer arrives, while the inference it protects cannot be driven
+/// from one build (open question 8's wall).
+#[tokio::test]
+async fn an_unknown_oversize_option_is_answered_rather_than_dropped() {
+    let target = shouting_datagram_service().await;
+    let halves = connected(Catalogue::new().with("dns", Protocol::Udp, target)).await;
+
+    let mut stream = halves
+        .connection()
+        .open_outbound_stream(StreamType::Bidirectional, false)
+        .await
+        .expect("open a stream");
+    // The frame by hand: version, the big kind, the name, the session, and a
+    // bit no option claims.
+    let mut frame = vec![2_u8, 2, 3];
+    frame.extend_from_slice(b"dns");
+    frame.extend_from_slice(&70_u32.to_be_bytes());
+    frame.push(0x80);
+    stream.write_all(&frame).await.expect("write the open");
+
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), frame::read_status(&mut stream))
+            .await
+            .expect("the peer answered within five seconds")
+            .expect("read the status"),
+        frame::Status::Unsupported,
+        "answered by name rather than by a dead stream",
+    );
+
+    // **No second assertion here, and that is deliberate.** The obvious one --
+    // "a plain session still opens" -- proves nothing: `udp_status` asks with
+    // `oversize: None`, and the answerer's capability bookkeeping governs only
+    // what *it* may send, never whether an open is accepted. It would pass
+    // whatever state anything was in.
+    //
+    // What this change protects is the opener's inference, and the opener here
+    // is a hand-written stream rather than `udp::Sessions`. That side is unit
+    // tested (`options_to_send`), and driving it end to end needs a peer that
+    // refuses an option this build knows -- which two ends of the same build
+    // cannot be. Open question 8's wall.
+
+    drop(stream);
+    drain(halves).await;
+}
+
+/// **`no-retrans` is wired, and costs nothing on a path that is not losing.**
+///
+/// Whether the stream is actually abandoned on loss is MsQuic's to decide and
+/// needs loss to show — `QuicTestMultipathPathValidationRetry` is the shape
+/// that would take, with a datapath hook. What can be checked here is the half
+/// that would break silently: that asking for it still delivers. A flag that
+/// quietly stopped a forward working would otherwise be found by whoever set
+/// it.
+#[tokio::test]
+async fn a_no_retrans_forward_still_delivers() {
+    let target = shouting_datagram_service().await;
+    let halves = connected(Catalogue::new().with("dns", Protocol::Udp, target)).await;
+
+    let local = udp::forward(
+        Arc::clone(halves.sessions()),
+        "127.0.0.1:0".parse().unwrap(),
+        "dns".to_owned(),
+        true,
+        halves.teardown.shutdown.clone(),
+    )
+    .await
+    .expect("forward a local UDP port");
+
+    let client = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+    client.connect(local).await.expect("connect");
+
+    let len = MAX_PAYLOAD + 1;
+    client.send(&vec![b'z'; len]).await.expect("send");
+    let mut reply = vec![0_u8; 70_000];
+    let got = tokio::time::timeout(Duration::from_secs(5), client.recv(&mut reply))
+        .await
+        .expect("it came back within five seconds")
+        .expect("receive");
+    assert_eq!(got, len);
+    assert_eq!(&reply[..got], vec![b'Z'; len]);
+
+    // Nothing was given up on, because nothing was lost.
     assert_eq!(
         halves
             .sessions()
             .drops
-            .oversize
+            .stream_cancelled
             .load(std::sync::atomic::Ordering::Relaxed),
-        1,
-        "and the drop is counted where an operator can see it",
+        0,
     );
-
-    // The session is still usable, which is the difference between dropping a
-    // datagram and failing a forward.
-    assert_eq!(&say(&client, b"after").await, b"AFTER");
 
     drain(halves).await;
 }
@@ -618,6 +1178,7 @@ async fn a_quiet_session_is_swept_and_the_next_datagram_opens_another() {
         Arc::clone(halves.sessions()),
         "127.0.0.1:0".parse().unwrap(),
         "dns".to_owned(),
+        false,
         halves.teardown.shutdown.clone(),
     )
     .await
@@ -671,6 +1232,7 @@ async fn a_reused_session_id_is_refused() {
         &frame::Open::Udp {
             service: "dns".to_owned(),
             session: 77,
+            oversize: None,
         },
     )
     .await
@@ -692,6 +1254,208 @@ async fn a_reused_session_id_is_refused() {
     drain(halves).await;
 }
 
+/// Put one oversize datagram on a unidirectional stream of its own.
+///
+/// Returns the stream, because **the caller has to keep it until the drain**: a
+/// finished stream is still a handle the registration waits on, and dropping it
+/// early is what made the first version of these tests fail with every
+/// assertion passing.
+///
+/// The head comes from `frame::big_datagram_head` — the real writer — because a
+/// test that spells out bytes stops testing the format the moment the format
+/// moves.
+async fn send_big_datagram(halves: &Halves, session: u32, payload: &[u8]) -> msquic_async::Stream {
+    let mut stream = halves
+        .connection()
+        .open_outbound_stream(StreamType::Unidirectional, false)
+        .await
+        .expect("open a unidirectional stream");
+    stream
+        .write_all(&frame::big_datagram_head(session))
+        .await
+        .expect("write the head");
+    stream.write_all(payload).await.expect("write the payload");
+    // **Finished, not dropped.** Closing a stream that has not finished aborts
+    // it and the datagram never lands -- `camera_core::video::push_one` and
+    // `server::refuse` both say so, and S3's send path will do the same.
+    std::future::poll_fn(|cx| stream.poll_finish_write(cx))
+        .await
+        .expect("finish the stream");
+    stream
+}
+
+/// **The oversize receive path, end to end.** A payload larger than
+/// `MAX_PAYLOAD` crosses on a unidirectional stream of its own and reaches the
+/// service — which is the whole of S2, and the first time anything larger than
+/// 1163 bytes has gone through a forward.
+///
+/// There is no send side yet, so the stream is written by hand with
+/// `frame::big_datagram_head`: the real writer, not bytes spelled out here,
+/// because a test that hand-rolls the header stops testing the format the
+/// moment the format moves.
+#[tokio::test]
+async fn an_oversize_datagram_arrives_on_a_stream_of_its_own() {
+    let (target, mut arrived) = recording_datagram_service().await;
+    let halves = connected(Catalogue::new().with("dns", Protocol::Udp, target)).await;
+
+    // Opening with the big kind is also the assertion that this build grants
+    // it: before S2 `read_open` refused the kind and this would be a dead
+    // stream rather than a `Ready`.
+    let mut session = halves
+        .connection()
+        .open_outbound_stream(StreamType::Bidirectional, false)
+        .await
+        .expect("open a stream");
+    frame::write_open(
+        &mut session,
+        &frame::Open::Udp {
+            service: "dns".to_owned(),
+            session: 42,
+            oversize: Some(frame::OversizeOptions::default()),
+        },
+    )
+    .await
+    .expect("write the open");
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), frame::read_status(&mut session))
+            .await
+            .expect("the peer answered within five seconds")
+            .expect("read the status"),
+        frame::Status::Ready,
+        "the big kind is granted now that there is an accept loop behind it",
+    );
+
+    // Four kilobytes: comfortably past `MAX_PAYLOAD`, and the size a large DNS
+    // answer actually is.
+    let payload = vec![0xa5_u8; 4096];
+    let stream = send_big_datagram(&halves, 42, &payload).await;
+
+    let got = tokio::time::timeout(Duration::from_secs(5), arrived.recv())
+        .await
+        .expect("the service heard something within five seconds")
+        .expect("a datagram");
+    assert_eq!(got.len(), payload.len(), "the whole datagram, not a prefix");
+    assert_eq!(got, payload);
+
+    // Both, before the drain: a finished stream is still a handle the
+    // registration waits on, which `drain` is the one thing that notices.
+    drop(stream);
+    drop(session);
+    drain(halves).await;
+}
+
+/// **A stream claiming more than UDP can carry is refused, not assembled.**
+/// Nothing this protocol sends is that large, so the only way to see one is a
+/// peer choosing how much memory this end should take.
+///
+/// **The session is held open throughout**, and the first version of this test
+/// was worthless for not doing that: `udp_status` drops the lifetime stream
+/// when it returns, so the server tore the session down before the oversize
+/// stream was read and "the service heard nothing" would have passed with the
+/// size check deleted — the delivery would simply have landed on
+/// `unknown_session` instead. A good oversize datagram afterwards is what
+/// separates "the size was refused" from "there was nothing to deliver to".
+#[tokio::test]
+async fn a_stream_larger_than_a_datagram_can_be_is_dropped() {
+    let (target, mut arrived) = recording_datagram_service().await;
+    let halves = connected(Catalogue::new().with("dns", Protocol::Udp, target)).await;
+
+    let mut session = halves
+        .connection()
+        .open_outbound_stream(StreamType::Bidirectional, false)
+        .await
+        .expect("open a stream");
+    frame::write_open(
+        &mut session,
+        &frame::Open::Udp {
+            service: "dns".to_owned(),
+            session: 43,
+            oversize: Some(frame::OversizeOptions::default()),
+        },
+    )
+    .await
+    .expect("write the open");
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), frame::read_status(&mut session))
+            .await
+            .expect("the peer answered within five seconds")
+            .expect("read the status"),
+        frame::Status::Ready,
+    );
+
+    let too_big = send_big_datagram(&halves, 43, &vec![0_u8; MAX_STREAM_PAYLOAD + 1]).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), arrived.recv())
+            .await
+            .is_err(),
+        "one byte over what UDP can carry delivered nothing",
+    );
+
+    // The session is still there and still works, so what was refused was the
+    // size rather than the destination.
+    let fine = vec![0x5a_u8; 4096];
+    let good = send_big_datagram(&halves, 43, &fine).await;
+    let got = tokio::time::timeout(Duration::from_secs(5), arrived.recv())
+        .await
+        .expect("the service heard the good one within five seconds")
+        .expect("a datagram");
+    assert_eq!(got, fine);
+
+    drop(too_big);
+    drop(good);
+    drop(session);
+    drain(halves).await;
+}
+
+/// **A stream that never finishes is given up on, and counted.** The reader
+/// holds an `Arc<Sessions>`, and so a `Connection` clone — a handle
+/// `RegistrationClose` blocks on, which is the hazard
+/// `Sessions::start_with_idle` and `session::Connected::close` both describe.
+/// Without a bound, a peer that writes the six-byte head and stops keeps that
+/// task parked until the connection dies, and the transport lets it do so a
+/// hundred times over.
+///
+/// Measured on the **client's** `Sessions`, because its counters are the only
+/// ones a test can read — hence `Halves::peer_side`, since nothing on the
+/// server opens a unidirectional stream until S3.
+#[tokio::test]
+async fn a_stream_that_never_finishes_is_given_up_on() {
+    let target = shouting_datagram_service().await;
+    let idle = Duration::from_millis(300);
+    let halves =
+        connected_with_idle(Catalogue::new().with("dns", Protocol::Udp, target), idle).await;
+
+    let mut stalled = halves
+        .peer_side
+        .as_ref()
+        .expect("the server side of the connection")
+        .open_outbound_stream(StreamType::Unidirectional, false)
+        .await
+        .expect("open a unidirectional stream towards the client");
+    stalled
+        .write_all(&frame::big_datagram_head(45))
+        .await
+        .expect("write the head");
+    // And now nothing: no payload, no FIN. Held rather than dropped, because
+    // dropping resets the stream and the reader would finish for that reason
+    // instead of for the one this test is about.
+
+    // Generously past the deadline, which is `idle` above.
+    tokio::time::sleep(idle * 3).await;
+    assert_eq!(
+        halves
+            .sessions()
+            .drops
+            .stream_lost
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "the reader gave up on it rather than waiting for the connection to end",
+    );
+
+    drop(stalled);
+    drain(halves).await;
+}
+
 /// **The path watcher is also how the client learns the peer went away**, and
 /// that dual job is load-bearing: a connection's events are a single queue, so
 /// `portal-client` cannot both watch paths and separately watch for closure —
@@ -710,11 +1474,24 @@ async fn the_path_watcher_returns_when_the_connection_ends() {
     // the second half would put two pollers on one event queue, which is the
     // thing this module says must not happen — and a `JoinHandle` dropped after
     // a timeout detaches rather than aborts, so the first would still be there.
+    // **The sender is held**, not dropped at the end of the expression. A
+    // dropped one makes the first `changed()` answer `Err`, which the watcher
+    // reads as "nothing will move this leg again" and stops listening — so the
+    // test would pass having exercised the wrong arm. Held, and with a leg in
+    // place, it is the state a loopback connection is actually in: a relay
+    // that is there and never moves.
+    let (_leg, leg) = tokio::sync::watch::channel(Some(
+        halves
+            .connection()
+            .get_remote_addr()
+            .expect("a live connection"),
+    ));
     let mut watching = tokio::spawn(portal_core::path::keep_on_the_best_path(
         halves.connection().clone(),
         // Its own token, so what ends this is the connection and not the
         // teardown — the cancel arm would pass this test for the wrong reason.
         CancellationToken::new(),
+        leg,
     ));
     assert!(
         tokio::time::timeout(Duration::from_millis(500), &mut watching)
@@ -767,6 +1544,7 @@ async fn udp_status(halves: &Halves, service: &str, session: u32) -> frame::Stat
         &frame::Open::Udp {
             service: service.to_owned(),
             session,
+            oversize: None,
         },
     )
     .await
@@ -823,8 +1601,9 @@ async fn exchange(client: &mut TcpStream, message: &[u8; 5]) -> [u8; 5] {
 async fn drain(mut halves: Halves) {
     halves.teardown.shutdown.cancel();
     let session = halves.session.take().expect("drained once");
-    // Before the wait, not during it: see the field's own comment.
+    // Before the wait, not during it: see the fields' own comments.
     drop(halves.sessions.take());
+    drop(halves.peer_side.take());
     drop(halves);
     let drained = session.drain(Duration::from_secs(5)).await;
     assert!(drained, "the registration still had live handles after 5s");

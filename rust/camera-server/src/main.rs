@@ -92,6 +92,7 @@ fn deliver_frame(
 
 #[tokio::main]
 async fn main() -> eframe::Result<()> {
+    isekai_link_utils::version_if_asked!();
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_span_events(tracing_subscriber::fmt::format::FmtSpan::FULL)
@@ -279,6 +280,18 @@ fn describe(event: &SignalingEvent) -> String {
             format!("could not keep a peer's connection alive: {error}")
         }
         SignalingEvent::Truncated => "more peers are waiting than the proxy will list".to_string(),
+        // Said on screen rather than acted on, which is the opposite of what
+        // `portal-server` does with it -- and deliberately. There is an
+        // operator in front of this one: exiting out from under them would
+        // take the window, and the explanation with it, off the screen. So the
+        // line stays, plainly enough to act on.
+        SignalingEvent::Unreachable {
+            unreachable_for,
+            error,
+        } => format!(
+            "lost the control plane {}s ago and gave up — restart to reconnect: {error}",
+            unreachable_for.as_secs()
+        ),
     }
 }
 
@@ -381,7 +394,7 @@ struct MyApp {
     /// another one. Beside the Endpoint key and guarded the same way.
     auth0_store_path: String,
     /// The device sign-in, and what to show the operator while it runs.
-    auth0_login: camera_core::auth0::DeviceSignIn,
+    auth0_login: camera_core::auth0::BrowserSignIn,
     /// Set once tokens exist, from a sign-in or from `auth0_store_path`. This is
     /// what keeps the session alive past the access token's few hours: the
     /// Endpoint Token is reissued every few minutes and each issue needs a
@@ -457,11 +470,11 @@ impl MyApp {
             proxy_url: "https://link.isekai.tools:6443".to_string(),
             auth0_token: String::new(),
             auth0_store_path: "camera-server-auth0.json".to_string(),
-            auth0_login: camera_core::auth0::DeviceSignIn::default(),
+            auth0_login: camera_core::auth0::BrowserSignIn::default(),
             // Filled in below from whatever a previous sign-in left behind.
             auth0_source: None,
             key_path: "camera-server-endpoint.pem".to_string(),
-            protocol: "isekai-validator-v1".to_string(),
+            protocol: camera_core::CAMERA_PROTOCOL.to_string(),
             register: true,
             client_endpoint_id: String::new(),
             client_connection_id: String::new(),
@@ -494,7 +507,7 @@ impl MyApp {
     fn with_stored_auth0(mut self) -> Self {
         let path = std::path::Path::new(&self.auth0_store_path);
         if let Ok(tokens) = camera_core::auth0::RefreshingAuth0Token::load(path) {
-            self.auth0_login = camera_core::auth0::DeviceSignIn::restored();
+            self.auth0_login = camera_core::auth0::BrowserSignIn::restored();
             self.auth0_source = Some(camera_core::auth0::RefreshingAuth0Token::with_sign_in(
                 camera_core::auth0::Auth0Config::default(),
                 tokens,
@@ -576,6 +589,7 @@ impl MyApp {
                 }
             };
             let cfg = P2pConfig {
+                narrowing: Default::default(),
                 identity_url,
                 identity_http3: false,
                 proxy_url,
@@ -622,6 +636,20 @@ impl MyApp {
                                         s.activity.push_back(describe(&event));
                                         while s.activity.len() > ACTIVITY_LINES {
                                             s.activity.pop_front();
+                                        }
+                                        // **The status line has to move too.**
+                                        // It is the authoritative one on
+                                        // screen, and left at "listener ...
+                                        // ready" it tells an operator the
+                                        // opposite of the line just added: the
+                                        // session has ended, the Peer Listener
+                                        // is withdrawn, and pairing, grants and
+                                        // bind all fail from here. The activity
+                                        // line says what happened; this says
+                                        // what is true now.
+                                        if matches!(event, SignalingEvent::Unreachable { .. }) {
+                                            s.status = "P2P: control plane unreachable; the listener has stopped — restart to reconnect"
+                                                .to_string();
                                         }
                                     }
                                     // A peer that just bound may have paired a
@@ -847,9 +875,10 @@ impl MyApp {
                         self.auth0_login.sign_out();
                     }
                 }
-                Auth0State::Waiting { user_code, url } => {
-                    ui.label("enter this code:");
-                    ui.monospace(user_code);
+                Auth0State::Waiting { url } => {
+                    // No code to transcribe: the browser redirects back to a
+                    // loopback port this process is already listening on.
+                    ui.label("finish signing in:");
                     ui.hyperlink_to("open the page", url);
                 }
                 Auth0State::SignedOut | Auth0State::Failed(_) => {
@@ -1011,9 +1040,15 @@ impl MyApp {
                 shared.status.clone(),
                 shared.info.clone(),
                 shared.capability.clone(),
-                // Read through the watch while the lock is held; the value is a
-                // pair of addresses, so copying it out is cheap.
-                shared.observed.as_ref().and_then(|w| *w.borrow()),
+                // Read through the watch while the lock is held; a pair of
+                // addresses is cheap to copy out.
+                //
+                // **One of possibly several** (#371): a leg with a path per
+                // family has an address in each, and this shows the one
+                // reported most recently. It is the mapping the proxy sees,
+                // which is true of it; what the direct path is built from is
+                // every one of them, not this.
+                shared.observed.as_ref().and_then(|w| w.borrow().newest()),
             )
         };
         if !status.is_empty() {

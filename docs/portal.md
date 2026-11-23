@@ -29,6 +29,27 @@ You need an **ISEKAI account**, and a browser once, on each machine. Everything
 else — Endpoint keys, certificates, tokens — is generated or fetched on first
 use.
 
+### The privacy policy, once per program
+
+Both programs print the policy and refuse to start until they are told you
+agree to it:
+
+```sh
+portal-server --show-privacy-policy      # read it on its own
+portal-server --accept-privacy-policy …  # agree, and carry on with the run
+```
+
+**It is recorded**, per user and per program, so it is asked once rather than
+on every run — and again when the policy is revised, which is what the version
+at the top of it is for. `--withdraw-privacy-consent` forgets the answer on
+this machine.
+
+An unattended job passes the flag every time instead: a fresh runner has no
+record to inherit. The policy itself is
+[here](https://github.com/seera-networks/ISEKAI-link/blob/main/docs/privacy-policy.en.md)
+([日本語](https://github.com/seera-networks/ISEKAI-link/blob/main/docs/privacy-policy.ja.md)),
+and the programs print whichever your locale asks for.
+
 ### Download a release
 
 Grab the archive for your platform from
@@ -46,6 +67,9 @@ The archive carries the libraries these need — `libmsquic` above all, which
 nothing installs — so it runs on a machine that has never built this. On Linux
 and macOS the two names at the top level are launchers that point the loader at
 the bundled `lib/`; on Windows the DLLs sit beside the executables.
+
+The Linux archive also carries `systemd/portal-server.service`, for
+[leaving the server running](#leaving-it-running-under-systemd).
 
 ### Or build it
 
@@ -91,16 +115,169 @@ portal-client --login          # on the machine with the local ports
 ```
 To sign in, open:
 
-    https://seera-networks.jp.auth0.com/activate?user_code=CVNR-SWDW
+    https://seera-networks.jp.auth0.com/authorize?response_type=code&…
 
-and confirm the code:  CVNR-SWDW
-
-Waiting…
+Waiting for the browser to come back…
 ```
 
-Open it, confirm the code, and that machine is signed in for good: the tokens
-land beside the Endpoint key and **refresh themselves from then on**. No command
-after this needs a token.
+Open it, sign in, and that machine is signed in for good: the tokens land
+beside the Endpoint key and **refresh themselves from then on**. No command
+after this needs a token. The browser redirects to a loopback port this process
+opened, so there is nothing to transcribe.
+
+### Which organization, and therefore which tenant
+
+```sh
+portal-client --login --organization org_…
+```
+
+**An Endpoint is filed under the organization its sign-in named.** Identity
+reads the `org_id` claim, and a token without one is filed personally — so a
+machine signed in without an organization registers into the individual tenant.
+
+**Better than typing the id: let Auth0 ask.** With *Display Organization
+Prompt* turned on for the application, omitting `--organization` makes Universal
+Login ask which organization to sign in to, **by name**, and the claim reaches
+the token just the same. `org_a1b2c3` is not something anyone can check by
+looking at it; a name in a browser is.
+
+Pass the id when the choice has to be made without a person — a script, an
+unattended machine, or a tenant with no prompt. Auth0 shows it under
+Organizations, and the *name* is not accepted in its place.
+
+`ISEKAI_AUTH0_ORGANIZATION` names one for the camera apps, which have no field
+to type it into. It is read wherever the flag would be, so the sign-in checks
+what arrived against it the same way.
+
+**The sign-in says which organization it landed in**, by name where the tenant
+sends one:
+
+```
+Signed in to seera-networks (org_a1b2c3).
+```
+
+and says so plainly when it landed in none. Asking for one and getting another —
+or none — is a warning, not a silence. Afterwards, `--whoami` answers the same
+question without signing in again:
+
+```
+$ portal-client --whoami
+ep:8c3f28d3…
+organization: seera-networks (org_a1b2c3)
+role: member
+```
+
+The Endpoint ID is on stdout and the rest on stderr, so
+`EP=$(portal-client --whoami)` still yields the id and nothing else.
+
+**`role` is Identity's answer, not this machine's.** How a tenant resolves and
+who counts as an administrator are settings of the deployment, so the question
+is asked rather than worked out from the token in hand — and it is the only way
+to see a **guest** membership and the date it ends. The network call is the one
+thing in this command that can fail, and it is allowed to: it gives Identity ten
+seconds, then says what happened and prints the Endpoint ID anyway. This command
+answered with no network at all until now, and `EP=$(…)` waits for it to exit.
+
+**The id is read from the access token**, which is the same claim Identity reads
+to decide the tenant — so this answers for machines that signed in before any of
+this existed, with no second sign-in.
+
+**The name is harder, and may need one line in Auth0.** Auth0 puts `org_id` in
+the tokens; whether it puts `org_name` beside it depends on the tenant, and on
+this one it does not. Without a name there is only the id, which is the one
+thing nobody can check by looking at it. So an Action can supply it:
+
+```js
+// Auth0 → Actions → Login flow, beside whatever already sets tenant_roles
+exports.onExecutePostLogin = async (event, api) => {
+  if (event.organization) {
+    api.accessToken.setCustomClaim(
+      "https://identity.isekai.tools/org_name",
+      event.organization.name,
+    );
+  }
+};
+```
+
+Read from the access token it needs no recording and no second sign-in: the next
+token refresh carries it, and `--whoami` starts printing the name. `org_name`,
+where a tenant does send it, is used the same way.
+
+### Moving an Endpoint to an organization
+
+**A registration cannot follow a sign-in.** An Endpoint ID is derived from its
+keypair, and one key registers once — Identity refuses the same key in a second
+tenant. So a machine that was signed in personally and is now signed in to an
+organization keeps pointing at an Endpoint the new tenant does not contain, and
+every call fails with:
+
+```
+Error: Identity could not verify ep:… . It answers this both for a bad signature
+and for an Endpoint it does not find in the tenant the Auth0 token names, …
+: Identity API returned 401: {"type":".../problems/pop-signature-invalid", …}
+```
+
+which is Identity hiding the truth from a stranger and, incidentally, from its
+owner: it answers the same thing for a bad signature and for an Endpoint it
+cannot find. The signature was fine.
+
+Moving means a **new key, registered under the organization**:
+
+```sh
+portal-client --revoke-endpoint ep:… --reason endpoint_deleted   # while still personal
+portal-client --login --organization org_…
+mv portal-client.pem portal-client.pem.personal
+portal-client --register --map …
+```
+
+**Revoke before signing in to the organization**, because revoking resolves its
+tenant from the Auth0 token as well: once the sign-in names an organization, the
+old Endpoint answers `404` from that machine, for the same reason as above.
+
+Out of order is not a dead end — revoking is a Route A command and needs no key,
+so `--login` back to a personal session, revoke, and sign in to the organization
+again. But left alone the Endpoint stays registered: **nothing sweeps Endpoints
+on this route**, so "I will get to it" means "for good".
+
+Everything that named the old Endpoint has to be redone against the new one:
+pairing, capabilities, tickets, and the entitlements that decide its ceiling —
+those are keyed by tenant as well, so the ones written while personal do not
+apply to the organization.
+
+### Signing in over SSH
+
+The redirect goes to `127.0.0.1` on the machine that is signing in, which a
+browser somewhere else cannot reach. **Forward the port rather than giving up
+the organization**:
+
+```sh
+ssh -L 38700:127.0.0.1:38700 the-host          # from the machine with the browser
+portal-server --login --organization org_…
+```
+
+Open the printed URL locally; the redirect lands on your own `127.0.0.1:38700`
+and the tunnel carries it to the waiting process. **38700 is the default**, so
+nothing has to be set for this to work — the port has to be known in advance to
+be forwarded, and it is in the `redirect_uri` Auth0 checks, so it must also be
+among the application's Allowed Callback URLs, which is the reason it is fixed
+rather than ephemeral. `ISEKAI_AUTH0_CALLBACK_PORT` moves it if 38700 is taken
+or if the tenant lists a different one; the forward and the Allowed Callback URL
+then have to agree with whatever it says.
+
+**`channel N: open failed: connect failed: Connection refused` after signing in
+is `ssh` saying the tunnel had nowhere to go** — the sign-in finished, the
+process stopped listening, and the browser asked for one more thing. Check the
+saved token rather than the message: if the sign-in worked, the file is there
+and carries the organization.
+
+**`--device-code` is the last resort, and it costs the organization.** It signs
+in by code typed into a browser anywhere — the only flow that needs no loopback
+at all — but the device grant has no way to carry an organization. Auth0 accepts
+the parameter and ignores it (measured: `/authorize` refuses an organization that
+does not exist, `/oauth/device/code` answers `200` for the same one, and the
+token comes back with no `org_id`). So everything that sign-in registers goes to
+the individual tenant. `--device-code` refuses `--organization` rather than
+pretending otherwise.
 
 **Each binary has its own store**, because each is a separate Endpoint with its
 own key — `portal-server-auth0.json` beside `portal-server.pem`,
@@ -179,6 +356,71 @@ path below needs it by hand.
 `--register` is only needed the first time, when the key is new. Keep
 `portal-server.pem`: a new key is a new Endpoint ID, and every grant made
 against the old one stops applying.
+
+### Leaving it running, under systemd
+
+The Linux archive ships the unit it needs, at
+`portal-ubuntu-latest/systemd/portal-server.service` — the same file as
+[`packaging/systemd/portal-server.service`](../packaging/systemd/portal-server.service),
+and the copy that matches the binaries beside it. Put the unpacked directory
+where it will stay and install from there:
+
+```sh
+unzip portal-ubuntu-latest.zip
+sudo mv portal-ubuntu-latest /usr/local/portal
+sudo chown -R root:root /usr/local/portal       # unzip ran as you; mv kept that
+sudo chmod -R go-w /usr/local/portal
+sudo cp /usr/local/portal/systemd/portal-server.service /etc/systemd/system/
+```
+
+The `chown` matters: without it the binary a system service executes stays
+writable by the account that unpacked the archive.
+
+`ExecStart` then runs `/usr/local/portal/portal-server`, which is the
+launcher — it finds its own directory, points the loader at the bundled `lib/`,
+and `exec`s the real binary, so the service's main process is `portal-server`
+itself and a stop signal reaches it rather than a wrapper. Nothing about the
+library path has to be set.
+
+The unit's own comments carry the rest. A few things in it are worth knowing
+before you write your own instead.
+
+**Sign in as the service's user, once, before enabling it** — and pass
+`--accept-privacy-policy` to *that* command too. The agreement is recorded per
+user, a fresh service account has no record, and without the flag `--login`
+refuses before it ever prints a sign-in URL. The Endpoint key and the Auth0
+tokens then live together, and the tokens are what keep a long-running server
+working: an `--auth0-token` cannot be refreshed and takes the session with it
+when it expires. A host with no browser forwards the callback port, as in
+[Signing in over SSH](#signing-in-over-ssh).
+
+**Pass `--accept-privacy-policy` on every start.** The agreement is recorded,
+but it is asked again whenever the policy is revised — so a service that leans
+on the record stops starting the day that happens, refusing with a non-zero
+exit after printing the whole policy into the journal, once per restart
+attempt. The flag means the person who installed the unit agreed, which is who
+would have been asked anyway.
+
+**`Restart=on-failure` is the other half of the five-minute rule.** The server
+stops with an error when nothing has reached the control plane for five minutes:
+it is still listed as a Peer Listener while it can bind nobody who arrives, and
+nothing inside the process can mend that, so it exits and leaves the decision to
+whatever started it. Without a restart line that is just a server that stopped.
+A `systemctl stop` exits cleanly and stays stopped.
+
+**Do not pair it with a start-rate limit**, which is the obvious next line and
+the one that will leave you with a dead server. A failure to *start* is not
+slow — an unreachable control plane refuses the request and the process is gone
+in about a hundredth of a second, with no retry of its own, because the
+five-minute tolerance belongs to a session that was already established. So any
+burst is spent in seconds, and a network that turns up three minutes after a
+reboot exhausts it and stays down until somebody notices. Back the restarts off
+instead.
+
+Give it `TimeoutStopSec` in the twenties, too. Stopping withdraws the Peer
+Listener and then waits for msquic to let go — about ten seconds at worst — and
+a listener killed before that stays listed for its whole lease, pointing at a
+process that is gone.
 
 ## 3. Show a pairing code
 
@@ -266,6 +508,48 @@ which is a second door onto the server's services — do it deliberately.
 
 ---
 
+## If the host has addresses that go nowhere useful
+
+Both programs let the QUIC stack decide which of the host's own addresses to
+send from, and it will try all of them: it pairs every address the machine has
+with the proxy and the relay, and opens a path from each. On a machine with one
+network that is exactly right and there is nothing to do here.
+
+On a machine with a container bridge, a VPN that does not route to the proxy, or
+a management interface, those addresses are tried too. They cannot work — the
+proxy's answer has nowhere to come back to — and each attempt costs a socket and
+one of the four connection IDs a connection has to spend. Naming them takes them
+out of the running:
+
+```sh
+portal-server --exclude-local 172.17.0.0/16 --exclude-local 10.8.0.0/24
+portal-client --exclude-local 172.17.0.0/16
+```
+
+Or, for something that should outlast the command line, in the `[network]`
+section — of `portal-server.toml` for the server, and of a file of its own for
+the client:
+
+```sh
+portal-client --example-config > portal-client.toml
+```
+
+```toml
+[network]
+exclude_local = ["172.17.0.0/16", "10.8.0.0/24"]
+```
+
+The flag and the file are **added together**, so a prefix that matters for one
+run does not have to be written into the file. An entry is an address and a
+prefix length; a bare address means the whole of it, so `10.1.2.3` is
+`10.1.2.3/32`. At most 16 entries, and anything that is not an address and
+prefix is refused by name before either program touches the network.
+
+This excludes addresses from being chosen *automatically*. It is not a firewall
+and it is not about what peers may reach — that is the catalogue, above.
+
+---
+
 ## What this does not do
 
 **It does not authenticate the service.** The forward carries whatever the
@@ -274,13 +558,58 @@ with has a database with no password — a tunnel makes the *transport*
 private, and says nothing about what is at the end of it. Put the same
 authentication on a forwarded service that you would put on an exposed one.
 
-**UDP payloads over 1163 bytes are dropped**, counted, and never split. A
-datagram service that silently splits is worse than one that silently loses,
-because the application cannot tell the difference.
+**UDP payloads over 1163 bytes travel differently**, and the difference is
+visible. Up to 1163 bytes a payload rides a QUIC datagram: it arrives at once
+or not at all, which is what UDP means. Over that it gets a QUIC stream of its
+own, which is **retransmitted if it is lost** — so it arrives late rather than
+not at all.
 
-That number is not a setting. It is what a QUIC datagram has left after the
-connection's 1248-byte MTU has paid for IPv6 and UDP headers, the QUIC packet
-and DATAGRAM frame, and the four bytes portal spends naming the session:
+Nothing is ever split. A datagram service that silently splits is worse than one
+that silently loses, because the application cannot tell the difference.
+
+```
+  up to 1163      a datagram. May be lost; never late
+  1164 .. 65507   a stream of its own. Late rather than lost -- unless this
+                  end is already behind, which is counted when it happens
+  over 65507      refused -- larger than UDP itself carries
+```
+
+"Already behind" is a real case rather than a hedge: a forward that offers more
+oversize datagrams at once than the connection can carry drops them instead of
+holding them, because waiting there would stop the port being read at all and
+lose the small ones too. The same is true of one that arrives in pieces slower
+than the forward will wait for.
+
+**Both ends have to be new enough.** The size a forward can carry is agreed when
+a session opens, and a peer from before this existed takes the datagram carrier
+only — against one of those, **payloads over 1163 bytes are dropped and
+counted**, as they were everywhere before. Nothing has to be configured for the
+larger sizes; they are used when both ends have them.
+
+**If late is worse than lost, say so:**
+
+```sh
+portal-client --map udp+no-retrans:5353:dns
+```
+
+Oversize datagrams on that forward are given up on at the first sign of loss
+instead of being retransmitted — UDP's own semantics, at the cost of the
+datagram. **It covers both directions**: the choice goes out with the session,
+so the server's replies honour it too. That matters because the large half of a
+request and its answer is usually the answer. A large DNS answer wants the
+default; a protocol whose data is stale once it is late wants this.
+
+> One number worth knowing before choosing: a datagram spread over N packets
+> with no retransmission is lost at roughly N times a single packet's rate. A
+> 4 KB answer is four packets and change. That is the fragility IP
+> fragmentation always had, which is faithful to UDP and not what a resolver
+> wants.
+
+### Where 1163 comes from
+
+It is not a setting. It is what a QUIC datagram has left after the connection's
+1248-byte MTU has paid for IPv6 and UDP headers, the QUIC packet and DATAGRAM
+frame, and the four bytes portal spends naming the session:
 
 ```
   1248  the peer connection's MTU, which msquic will not go under
@@ -301,12 +630,16 @@ short everywhere.
 > accepted here and refused by the connection. None were, because every relayed
 > path is IPv4, where 20 more bytes fit; the gap was only ever reachable on an
 > IPv6 direct path.
+>
+> And this page then said payloads over 1163 were dropped, full stop, which was
+> true until they were not. The limit is where the carrier changes now, not
+> where the forward gives up.
 
 The case to know is DNS: EDNS0 commonly advertises a 1232-byte buffer, so a
-large response can exceed this — and it is dropped with no truncation bit and no
-ICMP, which leaves a stub resolver waiting out a timeout rather than retrying
-over TCP. Ordinary queries are well under it. A resolver configured for a
-smaller buffer is fine.
+large response is over the datagram limit — and now crosses on a stream rather
+than being dropped. Against a peer from before this existed it is still
+dropped, with no truncation bit and no ICMP, which leaves a stub resolver
+waiting out a timeout rather than retrying over TCP.
 
 **One peer at a time per client.** The session model supports more; the
 command line does not, yet. `--peer` chooses which of several paired servers to
@@ -511,7 +844,8 @@ steps:
     run: |
       set -euo pipefail
       LOG="$RUNNER_TEMP/portal-client.log"
-      portal-client --enroll --oidc github \
+      portal-client --accept-privacy-policy \
+        --enroll --oidc github \
         --key "$RUNNER_TEMP/ci-endpoint.pem" \
         --label "gha-${GITHUB_RUN_ID}" \
         --map 15432:db > "$LOG" 2>&1 < /dev/null &
@@ -530,7 +864,11 @@ steps:
       kill -KILL "$PID" 2>/dev/null || true
 ```
 
-Four things in there are load-bearing.
+Five things in there are load-bearing.
+
+**`--accept-privacy-policy`.** Both programs refuse to start without it until
+the agreement has been recorded, and a runner is a new machine every time, so
+there is never a record to inherit.
 
 **`--key` under `$RUNNER_TEMP`.** One key registers one Endpoint, so a reused
 keypair is refused on the second run — a fresh one per job is the design, not
@@ -631,6 +969,375 @@ portal-client \
 keyboard. That is the point of it rather than a limitation: what you are handing
 over is one connection, not a way back in.
 
+## Letting the account decide
+
+Everything above is the far side letting you in: a code typed by a person, a
+ticket cut for a guest, a key bound to a workflow. **This one is decided
+somewhere else.** An entitlement on the account says that someone may reach a
+class of service through a particular server; the two programs carry that out,
+and nobody shows a code or holds a secret.
+
+It takes both halves, which are new modes of the two programs you already have:
+
+| | runs as | |
+| --- | --- | --- |
+| `portal-server --gateway-config` | a **Gateway** | turns entitlements into grants |
+| `portal-client --agent` | an **agent runtime** | runs one task under a key made for it |
+
+```
+  an entitlement, on the account
+        │
+        │   the agent asks for a token narrowed to one protocol and one
+        │   Gateway -- and issuing it is what raises the lease
+        ▼
+   Identity ──── lease ────▶  portal-server --gateway-config
+                                   │  checked against this server's envelope
+                                   ▼
+                             a grant at the proxy
+                                   │
+   portal-client --agent ──────────┘   connects, forwards, revokes itself
+```
+
+**Neither program registers the entitlement.** That is account administration —
+the dashboard, or Identity's API — and it is what says which Endpoint is the
+Gateway for which protocol class. Until one exists the agent raises no lease,
+no grant is made, and its wait runs out.
+
+### The Gateway side
+
+```sh
+portal-server --example-gateway-config > gateway.toml   # a starter to edit
+portal-server --gateway-config gateway.toml \
+              --protocol pg-sales-ro-v1                 # the class it serves
+```
+
+**`--protocol` has to name the class in the file**, and it does not default to
+it. A grant this Gateway makes is for **its own Endpoint** under the policy's
+protocol, and the agent holding one looks for a listener of exactly that string
+— while this process opens one listener, under `--protocol`, which defaults to
+`isekai-portal-v1`. Leave it and every grant is for something nobody is
+listening on. The server refuses to start rather than let that happen:
+
+```
+Error: this server listens on `isekai-portal-v1` and the gateway policy declares
+`pg-sales-ro-v1`. … Pass --protocol with the class you mean
+```
+
+The same string appears in four places and they must all agree: the entitlement
+on the account, `[protocols."…"]` in this file, the server's `--protocol`, and
+the agent's.
+
+The file says what this server is **willing to be told**: which window labels it
+understands, what values an attribute may take, and what operations exist. The
+control plane chooses within that; it cannot add to it.
+
+```toml
+[protocols."pg-sales-ro-v1"]
+windows = ["business_hours"]
+
+[protocols."pg-sales-ro-v1".attributes]
+region = { type = "enum", allowed = ["kanto", "kansai", "kyushu"] }
+
+[[protocols."pg-sales-ro-v1".operations]]
+name     = "query_sales"
+sql      = "SELECT id, region, amount FROM sales WHERE region = $1 AND month = $2"
+bind     = ["{{region}}", "$month"]
+max_rows = 1000
+
+[protocols."pg-sales-ro-v1".operations.params]
+month = { type = "string", pattern = '^[0-9]{4}-[0-9]{2}$' }
+```
+
+**Leaving a key out is not "anything".** No `windows` means no label is
+recognised, so every row carrying one is refused — which is the safe way round,
+because the other reading serves a row meant for business hours around the
+clock. A row naming a window this file does not list, or an attribute outside
+its schema, is **not applied**, and the server says which:
+
+```
+gateway policy: serving a protocol class  protocol=pg-sales-ro-v1 operations=1 windows=1
+policy: reconciled with the control plane  offered=2 applied=1 refused=1
+policy: not applied: attribute `region` is out of range: kyoto   lease=al_…
+policy: granted  grant=gr_… allowed=ep:4d5e6f… protocol=pg-sales-ro-v1 ttl=1739 leases=1 ours=true
+```
+
+The file is read at **startup**, before anything else: a statement with three
+placeholders and two bindings, or a pattern that does not compile, is refused
+there rather than the first time it would have mattered.
+
+Three things about the grants it makes are worth knowing.
+
+**It removes only what it made.** That is the `ours=true` above. Grants are
+keyed by the pair and the protocol, so creating one over a pair you had already
+paired with succeeds, answers with *your* grant id, and would otherwise be
+deleted when the lease ended. A grant it did not make is left alone — including
+one it finds already there at startup.
+
+**A refusal is per row.** The proxy caps grants at 64 per Endpoint and answers
+`429` for the one over, leaving the rest untouched, so the log says
+`policy: could not grant` and the policy is applied in part. The cap is a
+deployment setting and not something the Gateway can work around.
+
+**The stream ending is routine.** Identity closes it when the token that opened
+it expires, which is what forces the proof of possession to be checked again;
+the server reconciles and opens another. A lease that simply runs out is noticed
+by the server's own clock, because nothing is sent when one lapses.
+
+### The agent side
+
+```sh
+portal-client --login --organization org_…       # once, as the person;
+                                                 # saves portal-client-auth0.json
+
+portal-client --agent --task nightly-report \
+    --auth0-tokens portal-client-auth0.json \
+    --protocol pg-sales-ro-v1 --gateway ep:7a8b9c… --map 5432:db
+```
+
+**`--auth0-tokens` is not optional here**, which it is everywhere else. The
+saved sign-in is normally named after the key file, and this mode has no key
+file — so there is nothing to derive it from and the run is refused before it
+starts. It has to be the refreshing sign-in rather than a pasted
+`--auth0-token`: the revocation at the end is an authenticated call, and a long
+task would reach it holding a token that expired hours ago.
+
+That run makes a key **for the task and nothing else**: it is generated in
+memory, never written, and gone when the process is. It registers, asks for a
+token narrowed to that one protocol and that one Gateway, waits for the grant
+that arrives because of it, forwards, and on the way out revokes the Endpoint
+it registered.
+
+**`--gateway` is not a permission.** It selects which entitlement raises a
+lease. Omit it and a lease starts at *every* Gateway offering the protocol —
+harmless with one and a surprise with ten — so the client warns when it is
+missing.
+
+**It waits up to 30 seconds for the grant**, which no other client does. Every
+other client's grant has stood since it paired, so an empty answer there means
+the server is not running; this Endpoint was registered seconds ago and its
+grant is still in flight. In a live deployment the measured wait was **796 ms**.
+
+**The flags it refuses are the ones that would contradict it**, and each is
+refused on the arguments, before anything is spent:
+
+| | why |
+| --- | --- |
+| `--key` | stores a key that outlives the task; this mode keeps one that does not |
+| `--enroll` | authenticates a workload with an Enrollment Key. `--agent` runs as the signed-in person |
+| `--pair`, `--redeem`, a Provisioning Key | ways of being let in by the peer. An agent is let in by an entitlement |
+| `--whoami` | has no answer: the key was made seconds ago and reachability comes from the entitlement, not from being named |
+| `--capability`, `--listener` | were issued for an Endpoint that already existed. This one is made for the task, so none of them can match it |
+| `--auth0-token` | cannot be refreshed. The revocation at the end would fail on a long task |
+
+(`--login`, `--relays` and the account-level commands are refused too: each
+returns before a key is ever made, so `--agent` beside one would mean nothing
+and exit 0 — which is how an operator comes to believe a task-scoped run
+happened when an ordinary one did.)
+
+**The revocation is not best effort.** Returning a CI enrolment slot can be left
+to the idle sweep, but nothing sweeps an Endpoint registered this way — a
+revocation that did not happen leaves it registered for good. So a task that
+succeeded and could not put its Endpoint away exits non-zero and says so. (A
+task that had already failed keeps its own exit code.) It is tried twice, and
+**where it sits depends on how the run ended.** On a forced stop — Ctrl+C, or a
+CI runner's SIGTERM — it goes *before* the connection is closed, because closing
+reports the connection and can wait out a timeout, which is the thing a forced
+stop is escaping. On an ordinary ending it goes after, because revoking first
+makes that report fail on every successful run: it goes through the auth layer
+that has just stopped honouring this Endpoint. A second Ctrl+C skips it
+entirely.
+
+Reachability does not depend on that going through: the token renewal is the
+lease's clock, so a process that vanishes loses its grant within one lease TTL
+either way. Revoking is how you stop waiting for that.
+
+### What is not enforced yet
+
+**Nothing executes the operations.** `portal-server` links no database driver;
+the statements in that file are parsed, checked against their bindings, and held.
+What the Gateway does with a policy row today is decide whether to make a grant
+for it — the part that would run `query_sales` and bind `{{region}}` to what the
+control plane chose is a separate piece of work.
+
+The limits are **validated, not enforced**, in the same sense. A row whose
+window label or attribute values fall outside the envelope is never applied, so
+it yields no grant at all. But a connection that no policy covers, or one over
+`max_concurrent`, is counted and logged rather than refused:
+
+```
+policy: a connection the policy covers   peer=ep:4d5e6f… open=1 max_concurrent=Some(4)
+policy: over the concurrent limit; enforcement would refuse it
+policy: no policy covers this peer; enforcement would refuse it
+```
+
+The point of that is being able to see how many connections *would* be turned
+away before switching it on, which is not a number anyone can guess.
+`docs/portal_gateway_plan.md` has the shape of what is still missing.
+
+One more limit worth knowing: a grant is keyed by the pair and the protocol, so
+**two leases for the same agent and the same protocol share one grant**, and the
+Gateway removes it when the last of them goes. Telling them apart needs a change
+at the proxy.
+
+## Joining as a contractor
+
+An organization can admit someone **until a date**: a freelancer for the length
+of a contract, a supplier for a trial. That is a **guest** membership, and it is
+the one kind of member whose access stops on its own.
+
+Nothing about signing in is different:
+
+```sh
+portal-client --login --organization org_…
+portal-client --whoami
+```
+
+```
+ep:8c3f28d3…
+organization: acme (org_a1b2c3)
+role: guest (until 2027-01-31T23:59:59Z)
+```
+
+**That date is the answer to everything that happens afterwards**, and it is
+not written anywhere else on the machine. Nothing counts down to it and nothing
+warns; the day it passes, issuing a token stops working.
+
+### What a guest may do, and what stops
+
+A guest **may connect** and **may not let anyone else in**. In permissions that
+is one word — `peer-connect:initiate` — and everything below turns on its
+absence rather than on a list of prohibitions:
+
+| | a guest |
+| --- | --- |
+| redeem a pairing code or a Ticket, and forward | **yes** — this is the whole point |
+| run `portal-server` | no. Standing a Peer Listener up is opening a door |
+| show a pairing code, cut a Ticket, `--allow` | no. All three are the same permission |
+| issue an Enrollment Key | no, and this one is refused separately — an unattended key would outlive the contract |
+| be a Gateway | no |
+
+A refusal says the same thing from either side — `not available to a guest`
+from the proxy, `guests cannot …` from Identity — but the client says it as soon
+as it has a token, rather than leaving it to be discovered one refusal at a
+time:
+
+```
+WARN this sign-in is a guest of the tenant: it may connect, and it may not open
+     a way in for anyone else -- no Peer Listener, pairing code, Ticket,
+     capability or grant. Everything it holds stops at the date above
+     until=2027-01-31T23:59:59Z permissions=peer-connect:initiate
+```
+
+So the working shape is the ordinary one with the roles fixed: **the
+organization runs `portal-server` and hands out the way in**, the guest redeems
+it and forwards. A Ticket suits this best — it expires on its own, and a
+contract that ends is exactly the case tickets were written for.
+
+### When the contract ends
+
+Two endings, and the client tells them apart because what to do about them is
+not the same:
+
+```
+Error: this guest membership has ended. Everything it was issued stops with it
+-- ask whoever invited you to extend it, which is one call on their side and
+takes effect at the next renewal: Identity API returned 403:
+{"type":"…/membership-expired","detail":"membership expired at 2027-01-31T23:59:59Z"}
+```
+
+```
+Error: this guest membership was revoked, which is not the same as running out:
+an administrator of the tenant ended it early. The date it would have run to is
+no longer the point
+```
+
+**The exact moment is stated rather than hidden.** Concealing whether something
+exists is a rule about strangers, and this is somebody asking after their own
+membership.
+
+What stops, and when:
+
+- **Issuing a token** stops at the moment the contract ends. It is a comparison
+  against the clock rather than a sweep, so there is nothing to wait for.
+- **A token already in hand stops too.** The contract's end travels in the token
+  as its own claim, separate from the expiry, and the proxy compares against
+  that — so a token with ten minutes left on it is refused the moment the
+  contract ends, as `401 token-expired`. It is the same second on both sides.
+- **Nothing derived from the contract outlives it.** Grants, the relay leg's
+  lease, the addresses and rows held behind it are all cut to the contract's end
+  when they are made.
+- **A live connection is not torn down** at that instant. One still on the relay
+  stops when its leg's lease lapses — which is the contract's end at the latest,
+  because that lease was cut to it. One that has moved to a direct path is
+  between the two machines and is not reached by any of this.
+
+`--whoami` keeps answering afterwards, and says which ending it was:
+
+```
+role: guest -- membership expired at 2027-01-31T23:59:59Z
+role: guest -- membership was revoked
+```
+
+**An extension is a single act on the organization's side**, and it takes effect
+at the guest's next token renewal — no second sign-in, no new Endpoint.
+
+### The administrator who is also a guest
+
+If someone is an administrator of the tenant *and* has a live guest membership,
+**the guest membership wins** — it is a narrowing record, and narrowing is what
+it is for. Said out loud, because the alternative is an administrator wondering
+where their administration went:
+
+```
+role: guest (until 2027-01-31T23:59:59Z) -- an administrator here, but the guest membership wins
+```
+
+It is refused when the membership is created, but administration can be granted
+afterwards, and the moment it is granted is not something Identity is told
+about.
+
+## Letting somebody in by Endpoint ID
+
+`--pair` and `--ticket` both arrange standing access by handing something over
+and having it redeemed. When you already know the peer's Endpoint ID, there is
+nothing to hand over:
+
+```sh
+portal-server --grant ep:4d5e6f… --grant-label "masa's laptop"
+```
+
+```
+granted     : gr_5f6a7b…  ep:4d5e6f…  (isekai-portal-v1, masa's laptop)
+              stands until revoked (--revoke gr_5f6a7b…)
+```
+
+**A grant is the pair *and* the protocol**, and the protocol comes from
+`--protocol` — whose default is `isekai-portal-v1`. One for a protocol this
+server does not serve reaches nothing, which is why the line prints it.
+
+Dated access instead of standing:
+
+```sh
+portal-server --grant ep:4d5e6f… --grant-expires-in 3600
+```
+
+The line then names the expiry **the proxy decided**, not the seconds asked
+for: it clamps, so the two need not agree. Do not reach for `--grant-ttl` here
+— that one is the life of the grant a redeemed `--ticket` or
+`--provisioning-key` makes, and passing it with `--grant` is refused rather
+than ignored.
+
+> **Creating over a pair that already has a grant updates it**, label and
+> expiry included, and the proxy answers with the existing id. The line says so
+> when that happens, because if something else made that grant — a
+> `--gateway-config` run, a redeemed ticket — that owner may still revoke it,
+> and the access you believe you just arranged would go with it.
+
+The Endpoint ID is checked before anything signs in: `ep:` followed by 64
+lowercase hex digits. A half-copied id is the likeliest mistake here, and the
+control plane answers the same way for an unknown Endpoint as for a revoked
+one, so it cannot tell you which.
+
 ## Taking access away
 
 ```sh
@@ -639,6 +1346,7 @@ portal-server --grants
 
 ```
 grant       : gr_5f6a7b…  ep:4d5e6f…  (pairing, masa's laptop)
+grant       : gr_8c9d0e…  ep:1a2b3c…  (manual, until 2026-11-05T10:00:00Z)
 ```
 
 ```sh
@@ -649,9 +1357,11 @@ Both answer and exit without serving anything. That is not just tidiness: a
 second Peer Listener under this Endpoint is one more row for every client that
 looks one up, so asking "who is in?" must not put one there.
 
-A grant stands until revoked, so this is the counterpart of pairing and not an
-afterthought. Grants belong to the Endpoint rather than to a listener, so they
-survive restarts — which means nothing expires them by accident either.
+A grant stands until revoked unless one was dated with `--grant-expires-in`,
+in which case `--grants` names the expiry. Either way this is the counterpart
+of pairing and not an afterthought. Grants belong to the Endpoint rather than
+to a listener, so they survive restarts — which means nothing expires an
+undated one by accident either.
 
 ### Taking a device away
 
@@ -721,6 +1431,12 @@ connection counters and which path they are about.
 | `no relay leg claims this connection` | a connection arrived that no leg accounts for. It works, over the relay only |
 | forwarding works but stays slow | check for `forwarding moved onto the direct path`. Without it you are on the relay, which is a round trip through someone else's machine |
 | a DNS query times out and small ones work | the response is over the size limit above |
+| the program prints the privacy policy and stops | it has not been told you agree to it. `--accept-privacy-policy` agrees and is recorded; `--show-privacy-policy` prints it without agreeing |
+| `403` on everything, and `--whoami` says `membership expired` / `was revoked` | a guest membership has ended. It is not a fault on this machine: ask the organization to extend it, and the next renewal picks it up |
+| `insufficient-permission` when standing a server up, showing a pairing code, or cutting a Ticket | a guest may connect and may not let anyone else in. `--whoami` says whether this sign-in is one |
+| the agent's wait runs out although the Gateway logged `policy: granted` | the grant is for a protocol nothing listens on. The Gateway's `--protocol` must name the class its policy declares; it is refused at startup now, so this is a server started before that check |
+| the agent's wait runs out with no grant | nothing raised a lease. Either no entitlement names this person and protocol, or the Gateway it names is not running with `--gateway-config`. The Gateway's log says what it was offered |
+| `policy: not applied: …` on the Gateway | a policy row the server will not act on, and the rest of the line says why. An unlisted window label or an attribute outside its schema is a disagreement with your `gateway.toml`; `the lease is too short` (under 120 s) and `no deadline` are not — those are the row itself, and there is nothing in the file to fix |
 | `capability-endpoint-mismatch` | the capability was issued for a different Endpoint. Usually a second key: `--key` defaults to `portal-client.pem` in the working directory, so running from another directory makes a new Endpoint. The client says `generating a new Endpoint key` when it does |
 | nothing below `error` in the log | you are on a build before this was fixed — `RUST_LOG=info` |
 
@@ -742,3 +1458,6 @@ considered and rejected. The short version:
   a connection off the relay. The camera apps use the same code.
 - The service catalogue (§4.3) is the one real policy decision, and the reason
   the initiator can never name an address.
+- **`docs/portal_gateway_plan.md`** and **`docs/portal_agent_plan.md`** are the
+  two halves of the chapter above, including what each deliberately leaves for
+  later.

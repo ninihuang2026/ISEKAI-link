@@ -1,5 +1,5 @@
 [workspace]
-members = ["agent", "camera-client", "camera-core", "camera-server", "camera-ui", "channel-masque", "isekai-client-ffi", "isekai-p2p", "isekai-p2p-core", "utils", "webrtc-app",
+members = ["agent", "camera-client", "camera-core", "camera-server", "camera-ui", "channel-masque", "isekai-client-ffi", "isekai-p2p", "isekai-p2p-core", "privacy", "utils", "webrtc-app",
     "portal-core", "portal-server", "portal-client",
 ]
 resolver = "3"
@@ -8,7 +8,15 @@ package.edition = "2021"
 # single tag, so fourteen manifests each carrying their own number was an
 # invitation to bump thirteen of them. Members inherit with
 # `version.workspace = true`.
-package.version = "0.4.0"
+#
+# **`portal-client-ffi` is outside this and has to be bumped by hand.** It is
+# its own workspace root, so inheritance cannot reach it, and it has its own
+# tracked `Cargo.lock` that records this workspace's crates by version -- so a
+# bump here leaves that lock stale until it is regenerated, and
+# `cargo build --locked` in that directory fails on the tag. Both were missed
+# at 0.7.0 and caught in review; it is written down here so the next bump does
+# not rediscover it.
+package.version = "0.10.1"
 
 [workspace.dependencies]
 anyhow = "1"
@@ -20,6 +28,7 @@ channel-masque = { path = "channel-masque" }
 camera-core = { path = "camera-core" }
 camera-ui = { path = "camera-ui" }
 isekai-p2p = { path = "isekai-p2p" }
+isekai-privacy = { path = "privacy" }
 isekai-p2p-core = { path = "isekai-p2p-core" }
 bytes = "1"
 eframe = "0.34.3"
@@ -57,6 +66,9 @@ rustls-pemfile = "2"
 schannel = "0.1.27"
 serde = { version = "1.0.164", features = ["derive", "rc" ] }
 serde_json = "1"
+# Gateway policy parameter patterns (`portal-core::gateway`), compiled when the
+# file is read so a bad one is a startup failure rather than a runtime one.
+regex = { version = "1", default-features = false, features = ["std", "perf", "unicode"] }
 sha2 = "0.10"
 thiserror = "2.0.16"
 time = { version = "0.3", features = ["parsing", "formatting"] }

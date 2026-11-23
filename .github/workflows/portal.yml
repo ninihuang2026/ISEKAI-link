@@ -64,6 +64,47 @@ on:
       - 'rust/isekai-p2p-core/**'
       - 'rust/utils/**'
       - 'submodules/msquic-async-rs'
+      # The rest of that same graph. These were missing, and #302 is what it
+      # cost: a fix to nothing but `channel-masque` -- the H3 transport every
+      # crate above dials the control plane through -- matched no path here, so
+      # Compile, "Forward a service" and the binary build all sat out the
+      # change, on a transport this workflow exists to test. `tonic-h3` is
+      # where that crate's `h3-util` comes from, bare because a submodule is
+      # one gitlink entry and a `/**` glob never matches the pointer moving.
+      # `privacy` is the consent gate both binaries call before anything else.
+      #
+      # Remembering this list is what failed twice. It is checked now:
+      # `.github/scripts/check-workflow-paths.py`.
+      - 'rust/channel-masque/**'
+      - 'rust/privacy/**'
+      - 'submodules/tonic-h3'
+      # **The manifest and the lock.** A release is cut from a commit that
+      # moves `package.version` and nothing else, so without these a tag on it
+      # matches no path and the release job never runs -- the bundles are not
+      # built and nothing is attached. The header above predicted this for a
+      # `docs/`-only commit; a version bump is the case that actually happens.
+      # They earn their place apart from releases too: a dependency bumped in
+      # the workspace manifest changes what portal compiles against, and until
+      # now that could break it and stay green.
+      - 'rust/Cargo.toml'
+      - 'rust/Cargo.lock'
+      # **What goes into the archive, besides the binaries.** The bundle now
+      # carries `packaging/systemd/portal-server.service`, and the machinery
+      # that puts it there is `scripts/bundle-apps.*`. Without these a tag cut
+      # on a commit that changed only the unit matches no path, this workflow
+      # does not start, and the release gets no bundles at all -- the same hole
+      # the header describes for a `docs/`-only commit. `workflow-paths.yml`
+      # cannot police this one: it closes crate graphs, and neither a shell
+      # script nor a unit file is a crate.
+      - 'packaging/**'
+      - 'scripts/**'
+      # **The composite actions these steps call.** Both of them decide what a
+      # job actually does -- `submodules` what gets fetched, `rust-cache` what
+      # gets restored -- and neither was watched, so a change to either would
+      # have run no workflow that uses it. The same hole as `scripts/**` and
+      # for the same reason: a path filter has to cover the inputs, not just
+      # the file it is written in.
+      - '.github/actions/**'
       - '.github/workflows/portal.yml'
   pull_request:
     paths:
@@ -82,6 +123,47 @@ on:
       - 'rust/isekai-p2p-core/**'
       - 'rust/utils/**'
       - 'submodules/msquic-async-rs'
+      # The rest of that same graph. These were missing, and #302 is what it
+      # cost: a fix to nothing but `channel-masque` -- the H3 transport every
+      # crate above dials the control plane through -- matched no path here, so
+      # Compile, "Forward a service" and the binary build all sat out the
+      # change, on a transport this workflow exists to test. `tonic-h3` is
+      # where that crate's `h3-util` comes from, bare because a submodule is
+      # one gitlink entry and a `/**` glob never matches the pointer moving.
+      # `privacy` is the consent gate both binaries call before anything else.
+      #
+      # Remembering this list is what failed twice. It is checked now:
+      # `.github/scripts/check-workflow-paths.py`.
+      - 'rust/channel-masque/**'
+      - 'rust/privacy/**'
+      - 'submodules/tonic-h3'
+      # **The manifest and the lock.** A release is cut from a commit that
+      # moves `package.version` and nothing else, so without these a tag on it
+      # matches no path and the release job never runs -- the bundles are not
+      # built and nothing is attached. The header above predicted this for a
+      # `docs/`-only commit; a version bump is the case that actually happens.
+      # They earn their place apart from releases too: a dependency bumped in
+      # the workspace manifest changes what portal compiles against, and until
+      # now that could break it and stay green.
+      - 'rust/Cargo.toml'
+      - 'rust/Cargo.lock'
+      # **What goes into the archive, besides the binaries.** The bundle now
+      # carries `packaging/systemd/portal-server.service`, and the machinery
+      # that puts it there is `scripts/bundle-apps.*`. Without these a tag cut
+      # on a commit that changed only the unit matches no path, this workflow
+      # does not start, and the release gets no bundles at all -- the same hole
+      # the header describes for a `docs/`-only commit. `workflow-paths.yml`
+      # cannot police this one: it closes crate graphs, and neither a shell
+      # script nor a unit file is a crate.
+      - 'packaging/**'
+      - 'scripts/**'
+      # **The composite actions these steps call.** Both of them decide what a
+      # job actually does -- `submodules` what gets fetched, `rust-cache` what
+      # gets restored -- and neither was watched, so a change to either would
+      # have run no workflow that uses it. The same hole as `scripts/**` and
+      # for the same reason: a path filter has to cover the inputs, not just
+      # the file it is written in.
+      - '.github/actions/**'
       - '.github/workflows/portal.yml'
   workflow_dispatch:
 
@@ -95,7 +177,7 @@ jobs:
       # says for the same reason.
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-14]
+        os: [ubuntu-latest, macos-15]
     defaults:
       run:
         working-directory: rust
@@ -107,7 +189,7 @@ jobs:
         shell: pwsh
         working-directory: submodules/msquic-async-rs/seera-msquic
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-cache
         with:
           workspaces: rust
       # The integration tests stand up a real QUIC connection between the two
@@ -179,7 +261,7 @@ jobs:
         working-directory: submodules/msquic-async-rs/seera-msquic
       - uses: dtolnay/rust-toolchain@stable
         if: env.HAVE_KEYS == 'true'
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-cache
         if: env.HAVE_KEYS == 'true'
         with:
           workspaces: rust
@@ -216,12 +298,17 @@ jobs:
       # so a reused one is refused the second time. The forwarding side orders
       # no certificate; the serving side does, which is why its key is the one
       # that would matter if this ran often enough to meet the ACME limits.
+      # **`--accept-privacy-policy` on each of the three.** Both programs refuse
+      # to start until they are told the policy is agreed to; the agreement is
+      # recorded per user, and a runner is a fresh machine every time, so an
+      # unattended job passes the flag rather than inheriting a record.
       - name: Enrol the server and offer the service
         if: env.HAVE_KEYS == 'true'
         run: |
           set -euo pipefail
           LOG="$RUNNER_TEMP/portal-server.log"
           cargo run -q -p portal-server -- \
+            --accept-privacy-policy \
             --enroll --oidc github \
             --key "$RUNNER_TEMP/server-endpoint.pem" \
             --cert-key "$RUNNER_TEMP/server-cert.pem" \
@@ -248,6 +335,7 @@ jobs:
           # reading the catalogue, because a Grant names an Endpoint rather
           # than a listener.
           cargo run -q -p portal-server -- \
+            --accept-privacy-policy \
             --key "$RUNNER_TEMP/server-endpoint.pem" \
             --enroll --oidc github \
             --provisioning-key \
@@ -275,6 +363,7 @@ jobs:
           set -euo pipefail
           LOG="$RUNNER_TEMP/portal-client.log"
           cargo run -q -p portal-client -- \
+            --accept-privacy-policy \
             --enroll --oidc github \
             --provisioning-key-file "$RUNNER_TEMP/provisioning.key" \
             --key "$RUNNER_TEMP/client-endpoint.pem" \
@@ -342,7 +431,7 @@ jobs:
         shell: pwsh
         working-directory: submodules/msquic-async-rs/seera-msquic
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-cache
         with:
           workspaces: rust
       # `--all-targets` so the test binaries compile too: a `cfg` that only
@@ -371,8 +460,21 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     strategy:
       fail-fast: false
+      # **Ubuntu is pinned here, and the `test` job above is deliberately left
+      # rolling.** What this job produces is downloaded and run on someone
+      # else's machine, so the image is the floor it will run above: built on
+      # `ubuntu-latest`, which became 26.04 on 2026-11-14, these binaries stop
+      # running on the 24.04 LTS where v0.8.5's did. Pinning keeps that floor
+      # where it was, at the cost of renaming the asset to
+      # `portal-ubuntu-24.04.zip`.
+      #
+      # The tests stay on `ubuntu-latest` on purpose: they are the thing that
+      # should meet a new image first, and they are not shipped to anybody.
+      # `camera-apps.yml` pins for a harder reason as well — OpenCV 4.11.0
+      # cannot be compiled against 26.04's FFmpeg 8 at all — and `android.yml`
+      # has pinned since before either.
       matrix:
-        os: [ubuntu-latest, macos-14, windows-latest]
+        os: [ubuntu-24.04, macos-15, windows-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps:
@@ -387,7 +489,7 @@ jobs:
         shell: pwsh
         working-directory: submodules/msquic-async-rs/seera-msquic
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-cache
         with:
           workspaces: rust
 

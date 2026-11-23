@@ -82,7 +82,43 @@ pub enum Credential {
         /// Auth0 authentication state, so it is not a choice the unattended
         /// route has; leaving it at the top level would make a field that is
         /// silently ignored there — the same defect this enum removes.
+        ///
+        /// **What the caller asked for, not what is still outstanding.** This
+        /// field is read on every issue, including the renewals, so on its own
+        /// it would ask for registration again every few minutes;
+        /// [`registered`](Self::Auth0::registered) is what makes it happen
+        /// once.
         register: bool,
+        /// Which Endpoint this credential has already registered, if any.
+        ///
+        /// **Shared across clones, and it has to be** — the same reason
+        /// [`Enrollment::cell`](crate::Enrollment) gives. `P2pConfig` is
+        /// `Clone`, the renewal task holds one, and `register` is a static
+        /// argument that `issue` re-reads on every renewal. Without this, the
+        /// second issue would present an already-registered keypair and take
+        /// `409 endpoint-already-registered` — and since the Auth0 arm has no
+        /// arm for that, the renewals would fail from then on and the session
+        /// would lose its token mid-task.
+        ///
+        /// This matters to agent mode above all, because a task-scoped key is
+        /// freshly generated and so *must* register — meaning agent mode takes
+        /// this path on every run, where an attended client with a stored key
+        /// passes `--register` once and never again.
+        registered: Arc<OnceCell<String>>,
+        /// Whether this credential has ever tried to register.
+        ///
+        /// **What tells "never registered" from "registered, answer lost".**
+        /// `registered` only settles when the response came back; a
+        /// registration the server accepted whose reply was dropped — or whose
+        /// body would not parse — leaves it empty and the Endpoint in
+        /// existence. That is the same Endpoint nothing revokes and no sweep
+        /// reaches, arrived at by a different road.
+        ///
+        /// The enrolment route keeps this for the same reason, and has to work
+        /// harder with it: one Enrollment Key grows many Endpoints, so a `409`
+        /// there may be somebody else's. Agent mode's keypair is seconds old,
+        /// so any registration that landed is provably its own.
+        attempted: Arc<std::sync::atomic::AtomicBool>,
     },
     /// §8.8: an Enrollment Key, for a job with nobody at the keyboard.
     Enrollment(Enrollment),
@@ -99,6 +135,8 @@ impl Credential {
             token: token.into(),
             source,
             register,
+            registered: Arc::new(OnceCell::new()),
+            attempted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -120,6 +158,70 @@ impl Credential {
     }
 }
 
+impl Credential {
+    /// Whether this credential may have brought an Endpoint into existence.
+    ///
+    /// **The question is "could there be something to revoke", and the
+    /// pessimistic answer is the safe one.** A run that never reached its
+    /// registration created nothing, and revoking would buy a round trip to be
+    /// told so; a run whose registration was accepted and whose *answer* was
+    /// lost created an Endpoint that nothing else will ever clean up. Those two
+    /// are not distinguishable from here, so an attempt counts — and the
+    /// revocation reads `404` as the first case.
+    ///
+    /// A `409` settles the cell too, and for agent mode that is still "ours":
+    /// the key was generated moments earlier, so the only way it can already be
+    /// registered is that an attempt of our own reached the server. (The
+    /// enrolment route cannot assume that, which is why it tracks `by_us`
+    /// separately — one Enrollment Key grows many Endpoints, and a `409` there
+    /// is usually somebody else's.)
+    /// **A `bool`, because the identity is not this type's to give.** An
+    /// Endpoint ID is derived from the keypair, which lives in the config
+    /// beside this credential; returning one from here would mean inventing a
+    /// value for the attempted case, and an empty string reaching a URL is a
+    /// worse failure than the one being fixed.
+    pub fn may_have_registered(&self) -> bool {
+        match self {
+            Credential::Auth0 {
+                registered,
+                attempted,
+                ..
+            } => {
+                registered.get().is_some()
+                    || attempted.load(std::sync::atomic::Ordering::Relaxed)
+            }
+            // Its own route out is `release_enrollment`, which gives the slot
+            // back rather than revoking, and which tracks whose slot it is.
+            Credential::Enrollment(_) => false,
+        }
+    }
+
+    /// Record that a registration is about to be attempted.
+    ///
+    /// **Taken before the request, not after**, which is the whole point: what
+    /// is being guarded against is never learning the outcome.
+    pub(crate) fn mark_registration_attempt(&self) {
+        if let Credential::Auth0 { attempted, .. } = self {
+            attempted.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// A current Auth0 access token, from the source when there is one.
+    ///
+    /// **The end of a task is the worst moment to be holding the token the
+    /// task started with.** Revocation happens last, and on a run of any length
+    /// the token captured at the beginning has expired by then.
+    pub async fn current_auth0_token(&self) -> anyhow::Result<Option<String>> {
+        let Credential::Auth0 { token, source, .. } = self else {
+            return Ok(None);
+        };
+        match source {
+            Some(source) => source.auth0_token().await.map(Some),
+            None => Ok(Some(token.clone())),
+        }
+    }
+}
+
 impl From<Enrollment> for Credential {
     fn from(enrollment: Enrollment) -> Self {
         Credential::Enrollment(enrollment)
@@ -137,6 +239,14 @@ pub struct Enrollment {
     /// against a principal (§8.8.3). Those two are the attended case and
     /// cannot be used by a job on its own.
     pub auth0: Option<Arc<dyn Auth0TokenSource>>,
+    /// Where the key was read from — an environment variable or a file.
+    ///
+    /// **Carried so that a refusal can name it.** A CI run holds two
+    /// Enrollment Keys with different permissions (client and server), and
+    /// `403 enrollment-key-invalid` is the same string for both; without this
+    /// the message sends the operator to reissue whichever they think of
+    /// first, and the wrong one is the one that fails again next run.
+    pub source: Option<String>,
     /// Which Endpoint this credential has already grown, if any.
     ///
     /// **Shared across clones, and it has to be.** [`crate::P2pConfig`] is
@@ -188,9 +298,16 @@ impl Enrollment {
             key: key.into(),
             assertion: None,
             auth0: None,
+            source: None,
             enrolled: Arc::new(OnceCell::new()),
             attempted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// Name where the key came from, for [`Enrollment::source`].
+    pub fn from_source(mut self, source: impl Into<String>) -> Self {
+        self.source = Some(source.into());
+        self
     }
 
     /// Mint assertions for the `oidc` binding from `source`.

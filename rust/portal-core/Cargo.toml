@@ -18,6 +18,8 @@ isekai-link-utils = { workspace = true }
 # phase 1c-iii-b: the forwarding's own transport is this, not scaffolding
 # behind a feature.
 isekai-p2p = { workspace = true }
+# The privacy policy, its version, and the record of agreeing to it (`consent`).
+isekai-privacy = { workspace = true }
 tokio-util = { workspace = true }
 # Reading the `expires_at` the proxy puts on a grant (`grant`).
 time = { workspace = true }
@@ -26,6 +28,13 @@ time = { workspace = true }
 # it is parsed are part of the security story -- see plan 4.3.
 serde = { workspace = true }
 toml = { workspace = true }
+# An operation's parameters arrive from the caller as JSON once the PEP exists
+# (`gateway::ValueSchema::accepts_json`); a policy row's attributes do not, and
+# are typed as strings by Identity. And the parameter schemas are patterns that
+# have to compile before the file is accepted rather than the first time an
+# operation runs.
+serde_json = { workspace = true }
+regex = { workspace = true }
 # The datagram payloads UDP forwarding carries (`datagram`). Also what
 # msquic-async's datagram API takes and returns.
 bytes = { workspace = true }

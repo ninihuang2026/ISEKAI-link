@@ -5,10 +5,20 @@ name: Android client
 # Apple ones, so without this the first thing to notice a broken Android build
 # is a person.
 #
-# Two jobs, split by what they need. `bindings` needs only a host toolchain and
-# proves the Kotlin bindings still generate from the Rust interface — the check
-# that replaces having them committed. `app` adds the NDK, cross-compiles the
-# core and assembles the APK, and is the slower half.
+# Three jobs, split by what they need. `bindings` needs only a host toolchain
+# and proves the Kotlin bindings still generate from the Rust interface — the
+# check that replaces having them committed. `app` adds the NDK, cross-compiles
+# the core and assembles the APK, and is the slower half. `portal-app` does the
+# same for the second Android client.
+#
+# **`android-portal` reached `main` with nothing in CI building it at all.**
+# The paths below listed `android/**` and the camera FFI's crates only, so a
+# pull request adding a whole second Android app ran these jobs — against the
+# camera app — and went green. What that hid: a `cacert.pem` the app opens at
+# startup was never committed (`.gitignore`'s `*.pem` with a per-app exception
+# that did not name it), so every build from a clean checkout could not
+# complete a single TLS handshake. #288 added a tree-level check for the file
+# and this job for the rest.
 
 on:
   push:
@@ -34,7 +44,30 @@ on:
       - 'rust/Cargo.toml'
       - '.cargo/config.toml'
       - 'android/**'
+      # The second Android client and the crates only it pulls in. `portal-core`
+      # and `portal-client-ffi` are not in the camera app's graph, and
+      # `portal-client-ffi` is its own workspace with its own lockfile, so
+      # `cargo check --workspace` never builds it either.
+      - 'android-portal/**'
+      - 'rust/portal-core/**'
+      - 'rust/portal-client-ffi/**'
+      # `isekai-privacy`, which **both** apps reach -- `portal-core` and
+      # `camera-core` each depend on it -- and which this list missed in both
+      # directions until it was resolved against the FFI's actual closure
+      # rather than read off the imports. A change confined to it still runs
+      # `camera-apps.yml` and `mutants.yml`, whose filters are a plain
+      # `rust/**`, so it is not unwatched; what it does not run is either
+      # cross-compile, which is where a dependency that will not build for the
+      # NDK shows up and nowhere else.
+      - 'rust/privacy/**'
       - 'submodules/msquic-async-rs'
+      # **The composite action these steps call.** `submodules` decides what a
+      # job fetches, and it was not watched, so a change to it would have run
+      # no workflow that uses it. The same hole as `scripts/**` and for the
+      # same reason: a path filter has to cover the inputs, not just the file
+      # it is written in. (This workflow caches no cargo build at all, so
+      # `rust-cache` is not among its inputs.)
+      - '.github/actions/**'
       - '.github/workflows/android.yml'
   pull_request:
     paths:
@@ -59,7 +92,30 @@ on:
       - 'rust/Cargo.toml'
       - '.cargo/config.toml'
       - 'android/**'
+      # The second Android client and the crates only it pulls in. `portal-core`
+      # and `portal-client-ffi` are not in the camera app's graph, and
+      # `portal-client-ffi` is its own workspace with its own lockfile, so
+      # `cargo check --workspace` never builds it either.
+      - 'android-portal/**'
+      - 'rust/portal-core/**'
+      - 'rust/portal-client-ffi/**'
+      # `isekai-privacy`, which **both** apps reach -- `portal-core` and
+      # `camera-core` each depend on it -- and which this list missed in both
+      # directions until it was resolved against the FFI's actual closure
+      # rather than read off the imports. A change confined to it still runs
+      # `camera-apps.yml` and `mutants.yml`, whose filters are a plain
+      # `rust/**`, so it is not unwatched; what it does not run is either
+      # cross-compile, which is where a dependency that will not build for the
+      # NDK shows up and nowhere else.
+      - 'rust/privacy/**'
       - 'submodules/msquic-async-rs'
+      # **The composite action these steps call.** `submodules` decides what a
+      # job fetches, and it was not watched, so a change to it would have run
+      # no workflow that uses it. The same hole as `scripts/**` and for the
+      # same reason: a path filter has to cover the inputs, not just the file
+      # it is written in. (This workflow caches no cargo build at all, so
+      # `rust-cache` is not among its inputs.)
+      - '.github/actions/**'
       - '.github/workflows/android.yml'
   workflow_dispatch:
 
@@ -110,11 +166,55 @@ jobs:
         run: scripts/prepare-machine.ps1 -Tls ${{ runner.os == 'Windows' && 'schannel' || 'quictls' }} -ForBuild
         shell: pwsh
         working-directory: submodules/msquic-async-rs/seera-msquic
+      # **Fetching the distribution is the least reliable step in this
+      # workflow.** `gradlew` downloads `gradle-8.7-bin.zip` before anything is
+      # built, and that download failed five times across one pull request
+      # (#347) — `504` from `github.com/gradle/gradle-distributions` three
+      # times and a 10-second timeout from `services.gradle.org` twice, so both
+      # of the wrapper's hosts rather than one bad mirror. Each failure cost a
+      # re-run of a job that had nothing to do with the change under test.
+      #
+      # **Not `setup-java`'s `cache: gradle`**, which would also store
+      # `~/.gradle/caches` — the whole AGP/Compose dependency cache, hundreds of
+      # megabytes per entry, per job, against the 10GB the repository shares
+      # with the rust-cache and vcpkg stores (`camera-apps.yml` reasons about
+      # exactly that quota). Its key is also hashed over every `*.gradle*` in
+      # the tree with no job discriminator, so editing `android-portal`'s build
+      # files would miss `android`'s cache and re-fetch the zip this exists to
+      # stop fetching.
+      #
+      # So: just the distribution, keyed on the two files that decide which one
+      # is wanted. Both apps pin the same version and the entry is the same
+      # distribution, so they share it deliberately rather than storing it
+      # twice.
+      #
+      # **No `restore-keys`**, unlike the vcpkg store next door: an old
+      # distribution contributes nothing towards fetching a new one, so seeding
+      # from it would only carry ~130MB forward per version bump. A bump costs
+      # one download.
+      #
+      # **A miss is still a fetch, and a failed job saves nothing** —
+      # `actions/cache@v4` is `post-if: success()`, and `save-always` is
+      # deprecated as not working. That is why the wrapper's own
+      # `networkTimeout` is raised alongside this: the cache makes the usual run
+      # not need these hosts, and the timeout gives the run that does a fair
+      # chance.
+      - name: Cache the Gradle distribution
+        uses: actions/cache@v4
+        with:
+          path: ~/.gradle/wrapper/dists
+          key: gradle-dist-${{ runner.os }}-${{ hashFiles('android/gradle/wrapper/gradle-wrapper.properties', 'android-portal/gradle/wrapper/gradle-wrapper.properties') }}
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
-      - uses: android-actions/setup-android@v3
+      # **v4 because v3's default package list asks for `tools`**, which Google
+      # has removed from the SDK repository -- `sdkmanager` answers "Failed to
+      # find package 'tools'" and the action exits 1 before any of this builds.
+      # It is a clock-driven break rather than a change-driven one: the last
+      # green run here was 2026-09-07 and nothing in the workflow moved. v4's
+      # default is `platform-tools` alone, which is what this needs.
+      - uses: android-actions/setup-android@v4
       # Deliberately not installing one: the runner ships an NDK and points
       # ANDROID_NDK_ROOT at it, so adding a second leaves cargo-ndk compiling
       # with one while quictls configures against the other -- which it says
@@ -145,3 +245,74 @@ jobs:
         with:
           name: IsekaiCameraClient-debug-apk
           path: android/app/build/outputs/apk/debug/*.apk
+
+  portal-app:
+    name: Build the portal app
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/submodules
+      - name: Prepare machine for seera-msquic
+        run: scripts/prepare-machine.ps1 -Tls ${{ runner.os == 'Windows' && 'schannel' || 'quictls' }} -ForBuild
+        shell: pwsh
+        working-directory: submodules/msquic-async-rs/seera-msquic
+      # Cached for the reason, and in the shape, the `app` job above gives.
+      - name: Cache the Gradle distribution
+        uses: actions/cache@v4
+        with:
+          path: ~/.gradle/wrapper/dists
+          key: gradle-dist-${{ runner.os }}-${{ hashFiles('android/gradle/wrapper/gradle-wrapper.properties', 'android-portal/gradle/wrapper/gradle-wrapper.properties') }}
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v4
+      # **This job does install an NDK, unlike `app` above, and for the reason
+      # that one gives for not installing one.** The hazard there is two NDKs,
+      # with cargo-ndk compiling against one while quictls configures against
+      # the other. `android-portal` pins `ndkVersion = 29.0.14206865` -- it has
+      # to, or AGP has no `llvm-strip` and packages a ~200MB unstripped `.so`
+      # -- so AGP will use that one whatever the runner ships. Installing it
+      # and pointing both NDK variables at it is what makes the two halves
+      # agree; leaving the runner's default in place is what would split them.
+      - name: Install the NDK this app pins
+        run: |
+          ndk=$(sed -nE 's/.*ndkVersion = "([^"]+)".*/\1/p' android-portal/app/build.gradle.kts)
+          test -n "$ndk" || { echo "::error::no ndkVersion in android-portal/app/build.gradle.kts"; exit 1; }
+          echo "pinned NDK: $ndk"
+          # No --channel: 29.0.14206865 is the stable r29, and sdkmanager's
+          # default channel has it. The r29 rc builds are the *lower* version
+          # numbers (…13113456 rc1 through …14033849 rc4), so a glance at the
+          # number is misleading -- checked against `sdkmanager --list`.
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$ndk"
+          # Both names, because the readers do not split the way it is
+          # tempting to write down. seera-msquic's build script tries
+          # ANDROID_NDK_HOME, then ANDROID_NDK_ROOT, then
+          # ANDROID_NDK_LATEST_HOME (`scripts/build.rs`), cargo-ndk reads
+          # ANDROID_NDK_HOME, and AGP reads neither -- it resolves the pinned
+          # `ndkVersion` under $ANDROID_HOME/ndk. Setting both to the same
+          # path is what makes that agree; neither is redundant.
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$ndk" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/$ndk" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+      # `arm64-v8a` only, which is what `portalAbis` defaults to and what a
+      # phone needs. The x86_64 an emulator wants is a `-PportalAbis` away and
+      # doubles a full native build of msquic and quictls, which is not worth
+      # paying for on every push.
+      - name: Cross-compile the core
+        run: ./gradlew --no-daemon :app:generateJniLibs
+        working-directory: android-portal
+      # Assembling runs `generateUniFfiBindings` on the way, so a Kotlin file
+      # that no longer matches the Rust interface fails here rather than on a
+      # phone.
+      - name: Assemble
+        run: ./gradlew --no-daemon assembleDebug
+        working-directory: android-portal
+      - uses: actions/upload-artifact@v4
+        with:
+          name: IsekaiPortalClient-debug-apk
+          path: android-portal/app/build/outputs/apk/debug/*.apk

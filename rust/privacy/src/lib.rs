@@ -4,11 +4,18 @@
 //! information — so every application asks for agreement before it does
 //! anything, and remembers the answer.
 //!
-//! **One text, three applications.** `camera-server`, `camera-client` and the
-//! iOS viewer all show what is in `docs/privacy-policy.*.md`, compiled in here
-//! rather than copied into each. The iOS app reaches it through the FFI for the
-//! same reason: three applications agreeing to three slightly different
-//! documents is worse than having no document at all.
+//! **One text, five applications.** `camera-server`, `camera-client`, the iOS
+//! viewer, `portal-server` and `portal-client` all show what is in
+//! `docs/privacy-policy.*.md`, compiled in here rather than copied into each.
+//! The iOS app reaches it through the FFI for the same reason: applications
+//! agreeing to five slightly different documents is worse than having no
+//! document at all.
+//!
+//! **The two families ask differently, and that is all that differs.** A
+//! desktop camera application draws the text and offers a button; a portal
+//! binary has no window, so it prints the text and refuses to start until
+//! `--accept-privacy-policy` is passed. Both record the same answer in the same
+//! place, and both are re-asked when [`VERSION`] moves.
 //!
 //! **The agreement records a version.** Consent to one text is not consent to
 //! the next one, so [`Consent`] stores which version was agreed and
@@ -25,7 +32,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Bump it whenever the documents change in a way a person would want to know
 /// about. A test keeps it in step with what the documents themselves say.
-pub const VERSION: &str = "2026-08-15";
+pub const VERSION: &str = "2026-10-16";
 
 /// Where the authoritative copy of the Japanese text lives.
 ///
@@ -78,6 +85,19 @@ impl Language {
         match self {
             Self::Japanese => "English",
             Self::English => "日本語",
+        }
+    }
+
+    /// What to call the rendering that is on screen.
+    ///
+    /// **In the language on screen**, because it labels the link to the text
+    /// this reader has just read — and a feature built on "agreeing to a
+    /// document you cannot read is not agreement" should not caption it in the
+    /// language they did not choose.
+    pub fn this_label(self) -> &'static str {
+        match self {
+            Self::Japanese => "この文書",
+            Self::English => "This text",
         }
     }
 
@@ -168,6 +188,24 @@ pub fn save(app: &str, language: Language) -> anyhow::Result<Consent> {
     Ok(consent)
 }
 
+/// Forget this user's agreement, so it is asked again.
+///
+/// **There has to be a way back.** An agreement that cannot be withdrawn on
+/// the machine that recorded it is a setting, not an agreement.
+///
+/// Here rather than in the caller, because the file's name is this module's to
+/// know: a `withdraw` that rebuilt the path would go on reporting success
+/// against a record that had moved.
+pub fn forget(app: &str) -> anyhow::Result<()> {
+    let path = consent_path(app)?;
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        // Nothing recorded is the state this asks for, not a failure.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("failed to remove {}", path.display())),
+    }
+}
+
 /// Where this user's agreement is kept.
 ///
 /// Deliberately **not** beside the working directory, unlike the Endpoint key
@@ -180,9 +218,10 @@ fn consent_path(app: &str) -> anyhow::Result<PathBuf> {
 
 /// The per-user configuration directory, by each platform's own convention.
 ///
-/// Shared with [`crate::paired`], so what it says when there is nowhere to
-/// write names no one caller.
-pub(crate) fn config_dir() -> anyhow::Result<PathBuf> {
+/// **Public, and shared beyond the consent record** — `camera-core` keeps the
+/// list of paired Endpoints beside it — so that what it says when there is
+/// nowhere to write names no one caller.
+pub fn config_dir() -> anyhow::Result<PathBuf> {
     #[cfg(target_os = "windows")]
     {
         let base = std::env::var_os("APPDATA")
@@ -275,6 +314,33 @@ mod tests {
         assert!(TEXT_EN.contains("Privacy Policy"));
     }
 
+    /// **Both families of application have to be named in the thing people
+    /// agree to.** The portal binaries were added to this crate's callers
+    /// before the documents mentioned them, which would have had an operator
+    /// agreeing to a policy about cameras.
+    #[test]
+    fn both_documents_cover_both_families() {
+        for (name, text) in [("ja", TEXT_JA), ("en", TEXT_EN)] {
+            for program in [
+                "camera-server",
+                "camera-client",
+                "portal-server",
+                "portal-client",
+            ] {
+                assert!(
+                    text.contains(program),
+                    "privacy-policy.{name}.md does not mention {program}",
+                );
+            }
+            // The flag the portal programs refuse to start without. A policy
+            // that does not say how to answer it is one nobody can get past.
+            assert!(
+                text.contains("--accept-privacy-policy"),
+                "privacy-policy.{name}.md does not say how the portal programs ask",
+            );
+        }
+    }
+
     /// Nothing is still waiting to be filled in.
     ///
     /// This replaces a check that the placeholders were *present*, which passed
@@ -309,10 +375,171 @@ mod tests {
         assert!(TEXT_EN.contains("SEERA Networks Corporation"));
     }
 
+    /// **Each rendering has to be the one it says it is.** Every test above
+    /// reads `TEXT_JA` and `TEXT_EN` directly, so nothing held `text()` to
+    /// returning them — a `Language` that handed back the wrong document, or
+    /// an empty one, would have passed the whole suite while showing somebody
+    /// a policy in a language they did not choose. (cargo-mutants found this:
+    /// `replace Language::text -> &'static str with ""` was missed.)
+    #[test]
+    fn a_language_hands_back_its_own_document() {
+        assert!(Language::Japanese.text().contains("プライバシーポリシー"));
+        assert!(Language::English.text().contains("Privacy Policy"));
+        assert_ne!(Language::Japanese.text(), Language::English.text());
+        // And not the other one's, which "contains" alone would allow if the
+        // documents ever quoted each other.
+        assert!(!Language::Japanese
+            .text()
+            .starts_with("# ISEKAI link Privacy"));
+    }
+
+    /// The link under the policy is the one that stays current, and following
+    /// it must not land on the document the reader just switched away from.
+    #[test]
+    fn each_link_points_at_the_text_beside_it() {
+        assert!(Language::Japanese.url().ends_with("privacy-policy.ja.md"));
+        assert!(Language::English.url().ends_with("privacy-policy.en.md"));
+        assert_eq!(Language::Japanese.toggled().url(), Language::English.url());
+    }
+
+    /// **The environment is process-wide**, and two tests that each point
+    /// `XDG_CONFIG_HOME` at their own directory will take each other's.
+    ///
+    /// It passed under `cargo test` and failed the moment cargo-mutants ran
+    /// the same suite — the ordering had been doing the work. Held rather than
+    /// hoped for.
+    ///
+    /// Poisoning is ignored on purpose: a panic in one of these tests has
+    /// already failed that test, and turning it into a second, confusing
+    /// failure in the other helps nobody.
+    ///
+    /// **And it puts back what it found.** The directory it points at is a
+    /// `TempDir` that is deleted when the test ends, so leaving the variable
+    /// behind would aim anything added to this binary later at a path that no
+    /// longer exists -- a failure that depends on test order, which is what
+    /// this exists to stop.
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "ios")))]
+    struct OwnedEnvironment {
+        _held: std::sync::MutexGuard<'static, ()>,
+        was: Option<std::ffi::OsString>,
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "ios")))]
+    impl Drop for OwnedEnvironment {
+        fn drop(&mut self) {
+            match &self.was {
+                Some(was) => std::env::set_var("XDG_CONFIG_HOME", was),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "ios")))]
+    fn config_dir_to_itself(dir: &std::path::Path) -> OwnedEnvironment {
+        static ENVIRONMENT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let held = ENVIRONMENT.lock().unwrap_or_else(|e| e.into_inner());
+        let was = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("XDG_CONFIG_HOME", dir);
+        OwnedEnvironment { _held: held, was }
+    }
+
+    /// **Recorded, read back, and forgotten** — the three together, because
+    /// separately none of them says anything: a `save` that wrote nowhere and
+    /// a `load` that always answered `None` agree with each other perfectly.
+    ///
+    /// (On Windows and macOS the directory comes from `APPDATA` and `HOME`
+    /// instead, which is why this is `cfg`-gated rather than written three
+    /// times.)
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "ios")))]
+    #[test]
+    fn an_agreement_is_written_down_read_back_and_withdrawn() {
+        let dir = tempfile::tempdir().expect("a place to keep it");
+        let _environment = config_dir_to_itself(dir.path());
+        let app = "test-app";
+
+        // Nothing recorded yet, which is the state every first run is in.
+        assert!(load(app).is_none());
+        assert!(needs_agreement(load(app).as_ref()));
+
+        let written = save(app, Language::Japanese).expect("recorded");
+        // **Where it landed, not just that it round-trips.** A `config_dir`
+        // that answered with a relative path would save and load perfectly
+        // well against the working directory — which is the one place an
+        // agreement must not live, since it would then depend on where the
+        // program was started from. (cargo-mutants: `replace config_dir with
+        // Ok(Default::default())` was missed until this line.)
+        let expected = dir
+            .path()
+            .join("isekai-link")
+            .join(format!("{app}-privacy-consent.json"));
+        assert!(expected.is_file(), "nothing at {}", expected.display());
+        assert_eq!(written.version, VERSION);
+        assert_eq!(written.language, "ja");
+        // **The timestamp is the evidence half of the record**, so it has to
+        // be a time rather than whatever was cheapest to produce.
+        assert!(
+            time::OffsetDateTime::parse(
+                &written.accepted_at,
+                &time::format_description::well_known::Rfc3339,
+            )
+            .is_ok(),
+            "accepted_at is {:?}",
+            written.accepted_at,
+        );
+
+        let read = load(app).expect("what was just written");
+        assert_eq!(read.version, written.version);
+        assert_eq!(read.accepted_at, written.accepted_at);
+        assert!(!needs_agreement(Some(&read)));
+
+        // **Another program's answer is not this one's.** Two programs on one
+        // machine are two installations to the person running them.
+        assert!(load("another-app").is_none());
+
+        forget(app).expect("withdrawn");
+        assert!(load(app).is_none(), "the record outlived the withdrawal");
+        // Withdrawing what is not there is the state it asks for, not an error
+        // -- a second `--withdraw-privacy-consent` must not fail.
+        forget(app).expect("withdrawing nothing");
+    }
+
+    /// **"Nothing to remove" is not the same as "could not remove it."** Only
+    /// the first is the state a withdrawal asks for; reporting the second as
+    /// success tells somebody their agreement is gone while the record is
+    /// still there and the next run still proceeds.
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "ios")))]
+    #[test]
+    fn a_record_that_cannot_be_removed_is_reported() {
+        let dir = tempfile::tempdir().expect("a place to keep it");
+        let _environment = config_dir_to_itself(dir.path());
+        let app = "undeletable-app";
+        // A directory where the record goes: `remove_file` refuses it, with
+        // something that is not `NotFound`.
+        let path = dir
+            .path()
+            .join("isekai-link")
+            .join(format!("{app}-privacy-consent.json"));
+        std::fs::create_dir_all(&path).expect("a thing that is not a file");
+        forget(app).expect_err("a record that is still there is not forgotten");
+    }
+
     #[test]
     fn the_other_language_is_offered_by_name() {
         assert_eq!(Language::Japanese.other_label(), "English");
         assert_eq!(Language::English.other_label(), "日本語");
         assert_eq!(Language::Japanese.toggled(), Language::English);
+    }
+
+    /// **Both labels follow the text, not the machine.** The one naming the
+    /// other language is in that language; the one naming this text is in
+    /// this one. Captioning the Japanese policy "This text" is the small
+    /// version of the mistake this whole module exists to avoid.
+    #[test]
+    fn each_rendering_names_itself_in_its_own_language() {
+        assert_eq!(Language::Japanese.this_label(), "この文書");
+        assert_eq!(Language::English.this_label(), "This text");
+        for language in [Language::Japanese, Language::English] {
+            assert_ne!(language.this_label(), language.other_label());
+        }
     }
 }

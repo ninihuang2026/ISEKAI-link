@@ -6,7 +6,8 @@
     <application
         android:name=".IsekaiApplication"
         android:label="Isekai Camera Client"
-        android:allowBackup="false">
+        android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules">
         <activity
             android:name=".MainActivity"
             android:exported="true"

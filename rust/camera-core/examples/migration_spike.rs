@@ -33,13 +33,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
-use isekai_p2p::agent::ObservedAddress;
+use isekai_p2p::agent::{ObservedAddress, SocketBinding};
 use msquic_async::{msquic, Connection, Listener, Registration, StreamType};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
 use tokio_util::sync::CancellationToken;
 
-/// ALPN for the spike's QUIC connections. Deliberately not `sample`, so a stray
+/// ALPN for the spike's QUIC connections. Deliberately not `mjpeg`, so a stray
 /// camera app on the same machine cannot be dialed by accident.
 const ALPN: &str = "isekai-spike";
 
@@ -119,6 +119,9 @@ fn observed_for(leg: SocketAddr) -> anyhow::Result<ObservedAddress> {
     Ok(ObservedAddress {
         local: leg,
         observed,
+        // The spike binds its own unconnected socket; this stands for what the
+        // connector would report for it.
+        binding: SocketBinding::Unconnected,
     })
 }
 
@@ -299,7 +302,9 @@ async fn role_server_prod(reg: &Arc<Registration>) -> anyhow::Result<String> {
     // Stand in for the bind leg's observed-address watch. Held for the whole
     // run: dropping the sender would close the watch and stop the advertisement
     // for the wrong reason.
-    let (_observed_tx, observed_rx) = tokio::sync::watch::channel(Some(observed_for(server_leg.addr)?));
+    let (_observed_tx, observed_rx) = tokio::sync::watch::channel(
+        [observed_for(server_leg.addr)?].into_iter().collect(),
+    );
 
     let (frame_tx, frame_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(16);
     let shutdown = CancellationToken::new();
@@ -353,7 +358,7 @@ async fn role_client_prod(reg: &Arc<Registration>) -> anyhow::Result<String> {
     let client_leg = RelayLeg::start_dialing(reg, proxy_addr).await?;
     let bridge = Bridge::start(loopback(video_port)).await?;
     let (_observed_tx, observed_rx) =
-        tokio::sync::watch::channel(Some(observed_for(client_leg.addr)?));
+        tokio::sync::watch::channel([observed_for(client_leg.addr)?].into_iter().collect());
 
     let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<(u64, bytes::Bytes)>(16);
     let (path_tx, mut path_rx) = tokio::sync::mpsc::channel::<camera_core::PathEvent>(16);
@@ -1210,6 +1215,14 @@ fn client_config(reg: &Registration, enable_natt: bool) -> anyhow::Result<msquic
         // As `isekai_p2p::peer::client_config` does, which this reproduces.
         .set_KeepAliveIntervalMs(10_000)
         .set_PeerUnidiStreamCount(100)
+        // **Every check from 6a down waits for `PathValidated`**, and since
+        // seera-msquic 2.7.0 it is raised only for a connection that asked:
+        // `QUIC_SETTINGS.PathValidatedEventEnabled`, where before it came to
+        // everyone. Without this the spike reports "15s 以内に PathValidated が
+        // 来ず" for every one of them — a silence that reads as the adopted
+        // design not working, rather than as the event not being asked for.
+        // `isekai_p2p::peer` sets it too, which is what this reproduces.
+        .set_PathValidatedEventEnabled()
         .set_StreamMultiReceiveEnabled()
         .set_ReceiveObservedAddressReports();
     // Two settings differ between this spike (which migrates everywhere) and
@@ -1329,6 +1342,10 @@ async fn spawn_listener_variant(
                     .set_DatagramReceiveEnabled()
                     .set_StreamMultiReceiveEnabled()
                     .set_ReceiveObservedAddressReports()
+                    // The same opt-in as the client above. Both ends, because
+                    // which one is told depends on which sent the
+                    // `PATH_CHALLENGE`.
+                    .set_PathValidatedEventEnabled()
                     .set_AddAddressMode(msquic::AddAddressMode::NatTraversal),
             ),
         )?;

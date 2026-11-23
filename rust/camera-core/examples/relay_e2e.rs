@@ -65,6 +65,7 @@ fn config(auth0: &str, identity: &str, proxy: &str, protocol: &str, key_path: &s
         device_name: Some("relay-e2e".to_owned()),
         token_ttl: None,
         key: load_or_generate_key(key_path).expect("load/generate key"),
+        narrowing: Default::default(),
     }
 }
 
@@ -80,7 +81,7 @@ async fn main() {
     let auth0 = std::env::var("AUTH0_TOKEN").expect("AUTH0_TOKEN is required");
     let identity = env_or("IDENTITY_URL", "https://127.0.0.1:9443");
     let proxy = env_or("PROXY_URL", "https://127.0.0.1:8443");
-    let protocol = env_or("PROTOCOL", "isekai-validator-v1");
+    let protocol = env_or("PROTOCOL", camera_core::CAMERA_PROTOCOL);
 
     let code = match run(&auth0, &identity, &proxy, &protocol).await {
         Ok(n) => {
@@ -151,7 +152,7 @@ async fn run(auth0: &str, identity: &str, proxy: &str, protocol: &str) -> anyhow
     )
     .await?;
     let connection_id = session.connection_id().to_owned();
-    let local_addr = session.local_addr;
+    let local_addr = session.local_addr();
     // Dial the per-endpoint FQDN with validation when the proxy issued a relay
     // certificate; otherwise fall back to 127.0.0.1 unvalidated (dev).
     let (video_host, verify) = match session.video_host() {

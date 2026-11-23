@@ -24,17 +24,31 @@ pub mod config;
 pub mod endpoints;
 /// Managing Enrollment Keys from the owner's side (§8.8.2 / §8.8.9).
 pub mod enrollment;
+/// The bookkeeping that creating grants on a schedule needs.
+pub mod grants;
 pub mod initiator;
 pub mod listener;
+/// What the signed-in person is in this tenant (`GET /v1/me`).
+pub mod membership;
 /// Where an unattended job's workload identity assertion comes from.
 pub mod oidc;
+/// Publishing a UDP service at a public address
+/// (`docs/public_listener_client_plan.md`).
+pub mod public;
 /// Holding a relay leg's lease open (proxy spec §8.14).
 pub mod relay_lease;
 pub mod secret;
 
 pub use auth::{AssertionSource, Auth0TokenSource, Credential, Enrollment, StaticAuth0Token};
-pub use config::{issue_endpoint_token, load_or_generate_key, proxy_client, P2pConfig};
-pub use initiator::{InitiatorSession, PeerDirectory};
+pub use config::{
+    issue_endpoint_token, list_policies, load_or_generate_key, policy_stream, proxy_client,
+    P2pConfig, PolicyStream,
+};
+// **A field of `P2pConfig` has to be nameable.** `portal-client` depends on
+// this crate alone, so without the re-export agent mode could only ever write
+// `Default::default()` -- the ceiling, which is the thing it exists to avoid.
+pub use isekai_p2p_core::identity::Narrowing;
+pub use initiator::{InitiatorSession, PeerDirectory, RelayLegWatch};
 pub use listener::{
     AcceptPolicy, LegDirectory, ListenerSession, SignalingEvent, SignalingState,
     MAX_CONCURRENT_PEERS,
@@ -45,14 +59,32 @@ pub use listener::{
 pub mod direct_path;
 pub mod endpoint_cert;
 pub mod peer;
+pub mod relay_family;
 /// Measuring the relays so a near one is chosen (`relay_proximity_plan.md`).
 pub mod relay_rtt;
+
+/// `Debug` that leaves secrets out; for the FFI crates, which reach
+/// `isekai-p2p-core` only through this one.
+pub use isekai_p2p_core::redacted_debug;
 
 /// Re-exports of the `isekai-p2p-core` items that appear in this crate's API.
 pub mod agent {
     pub use isekai_p2p_core::attestation::{attest, verify, Attestation, AttestationError};
     pub use isekai_p2p_core::bind::RelayOptions;
+    // The third step of the re-export, because `portal-core` and `camera-core`
+    // depend on this crate and not on `isekai-p2p-core`.
+    pub use isekai_p2p_core::datapath::{DatapathHook, Hop, Verdict};
+    // Both binaries settle this from their own arguments and configuration
+    // file, and neither depends on `isekai-p2p-core` — the same third step the
+    // line above is here for.
+    pub use isekai_p2p_core::local_address::{
+        set as set_excluded_local_prefixes, ExcludedPrefixes, MAX_EXCLUDED_PREFIXES,
+    };
+    // **The public address's own bind** (`docs/public_listener_client_plan.md`
+    // P1). Reached from outside this crate, by the example P4 asks for.
+    pub use isekai_p2p_core::bind::{open_public_bind_session, BindSession, MasqueClientEvent};
     pub use isekai_p2p_core::endpoint::EndpointKey;
+    pub use isekai_p2p_core::endpoint::ENDPOINT_ID_PREFIX;
     /// Whether a peer certificate names the host that was dialled (#134).
     pub use isekai_p2p_core::hostname::certificate_matches;
     pub use isekai_p2p_core::identity::{
@@ -60,19 +92,51 @@ pub mod agent {
         EnrollmentKeyRecord, EnrollmentRecord, IdentityAuth, IdentityError, IssuedEnrollmentKey,
         NewEnrollmentKey, RevokeAuth, RevokeEffects, RevokeReason, Revoked, RevokedEnrollmentKey,
     };
-    pub use isekai_p2p_core::observed::{ObservedAddress, ObservedAddressWatch};
-    pub use isekai_p2p_core::proxy::{
-        pairing_code_from_input, pairing_code_in_uri, pairing_uri, proxy_authority, redact_secrets,
-        secret_prefix, ticket_from_transfer, ticket_transfer, BindingView, Candidate,
-        CandidateType, Capability, CertBundle, ConnectionStateFilter, Grant, ListenerConnections,
-        ListenerEvent, PairingCode, PeerConnection, ProvisioningBinding, ProvisioningKey,
-        ProvisioningKeyRecord, ProvisioningRedemption, ReachableListener, RedeemedProvisioningKey,
-        RedeemedTicket, Ticket, TicketListener, TicketRecord, TicketRedemption, TicketTransfer,
-        ENROLLMENT_KEY_PREFIX, PROVISIONING_KEY_PREFIX, TICKET_PREFIX, TICKET_TRANSFER_PREFIX,
+    pub use isekai_p2p_core::identity::{
+        Membership, PolicyConstraints, PolicyEvent, PolicySnapshot,
     };
+    pub use isekai_p2p_core::observed::{
+        ObservedAddress, ObservedAddressWatch, ObservedAddresses,
+    };
+    // **The reading, not a replacement for `ProxyError`.** Both go out: an
+    // `Outcome` says what a caller can do, and the error it was read from is
+    // what `explain` came from and what the in-crate classifiers still need
+    // (`docs/p2p_sdk_error_type.md` §4.2).
+    pub use isekai_p2p_core::outcome::{Missing, Outcome, Reading, Unreachable};
     pub use isekai_p2p_core::proxy::{
-        CachedCertificate, CertificateParameters, IssuedCertificate, ProxyClient, ProxyError,
+        bound_to, pairing_code_from_input, pairing_code_in_uri, pairing_uri, proxy_authority,
+        redact_secrets, secret_prefix, ticket_from_transfer, ticket_transfer, BindingView, Bound,
+        Candidate, CandidateType, Capability, CertBundle, ConnectionStateFilter, Grant,
+        ListenerConnections, ListenerEvent, Made, PairingCode, PeerConnection, ProvisioningBinding,
+        ProvisioningBounds, ProvisioningKey, ProvisioningKeyRecord, ProvisioningRedemption,
+        ReachableListener, RedeemedProvisioningKey, RedeemedTicket, Ticket, TicketBounds,
+        TicketListener, TicketRecord, TicketRedemption, TicketTransfer, ENROLLMENT_KEY_PREFIX,
+        PROVISIONING_KEY_PREFIX, TICKET_PREFIX, TICKET_TRANSFER_PREFIX,
+    };
+    // `Problem` among them: it is the type of a field of `ProxyError::Problem`,
+    // a public variant, and without it no caller outside this crate can name
+    // what that variant holds -- or build one, which a test of a classifier has
+    // to.
+    // `ControlPlaneTransport` among them: `ProxyClient<T>` is generic over it,
+    // so without the re-export nothing outside this crate can name the bound --
+    // which means no caller can write a function over the transport, and the
+    // seam `p2p_sdk_api_review.md` §6-10 says exists but goes unused cannot be
+    // reached from here either.
+    pub use isekai_p2p_core::proxy::{
+        CachedCertificate, CertificateParameters, ControlPlaneTransport, IssuedCertificate,
+        Problem, ProxyClient, ProxyError,
     };
     pub use isekai_p2p_core::proxy::{RelayCandidate, RelayRttSample};
-    pub use isekai_p2p_core::transport::{drain_msquic, shutdown_msquic, MasqueH3Transport};
+    // **A public address is reached from outside this crate.** The example
+    // `docs/public_listener_client_plan.md` P4 asks for lives in
+    // `isekai-p2p/examples/`, which sees only what is re-exported here.
+    pub use isekai_p2p_core::proxy::{
+        PublicAddress, PublicListener, PublicTarget, RelayInfo, RelayRole, RelayTicket,
+    };
+    // `Binding` is renamed on the way out: `proxy::Binding`, re-exported above,
+    // is an entirely different thing — an Endpoint's control-plane binding, not
+    // a socket mode.
+    pub use isekai_p2p_core::transport::{
+        drain_msquic, shutdown_msquic, Binding as SocketBinding, MasqueH3Transport,
+    };
 }
