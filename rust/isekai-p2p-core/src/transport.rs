@@ -28,6 +28,80 @@ use tower::{Service, ServiceExt};
 
 use crate::proxy::{ControlPlaneTransport, HttpResponse};
 
+/// Which families a relay's name actually resolves to.
+///
+/// **The answer to "how should the probe budget be split between the
+/// families?" turned out to be "do not ask a family that has no address"**
+/// (plan §8.1). Measured in the field: asking for a family the name does not
+/// have costs nothing — `first_routable` has nothing to reorder and rejects at
+/// the route test rather than at a handshake — so the only expensive case left
+/// is a family that *does* resolve and black-holes UDP, which spends the whole
+/// `per_relay`. That one is visible here, before any packet is sent.
+///
+/// So a single-stack relay costs one probe instead of two. **It still costs
+/// one** — its single family is reported, because when the far end is
+/// dual-stack that one family is the half that decides. Dropping it is what
+/// stopped a direct path forming on 2026-11-04 (plan §8.1 追記 2).
+///
+/// **A resolver failure probes everything rather than nothing.** A hiccup in
+/// DNS should not quietly turn the observation off; the probe resolves again
+/// for itself and will fail there if the name really is gone.
+pub async fn families_resolved(base_url: &str) -> Vec<AddressFamily> {
+    let both = vec![AddressFamily::V4, AddressFamily::V6];
+    let Ok(uri) = base_url.parse::<Uri>() else {
+        return both;
+    };
+    let addrs = match h3_util::client::dns_resolve(&uri).await {
+        Ok(addrs) => addrs,
+        Err(err) => {
+            tracing::debug!(%err, base_url, "could not resolve a relay; probing both families");
+            return both;
+        }
+    };
+    let resolved: Vec<AddressFamily> = both
+        .iter()
+        .copied()
+        .filter(|family| addrs.iter().any(|addr| family.holds(addr)))
+        .collect();
+    if resolved.is_empty() {
+        // Resolved to nothing at all. Probing says so with a real error
+        // rather than an empty set that looks like a decision.
+        return both;
+    }
+    resolved
+}
+
+/// The family a wire spelling names, or `None` for anything else.
+///
+/// **Unknown is not an error.** A control plane that grows a third spelling,
+/// or a typo in a deployment's own config, must not cost the connection: the
+/// family is a preference and dropping it falls back to "no constraint",
+/// which is what absent already means (plan Q5, Q6). The caller logs it.
+///
+/// The inverse of [`family_name`], and the pair is what keeps a report and
+/// the answer to it talking about the same thing.
+pub fn family_from_name(name: &str) -> Option<AddressFamily> {
+    match name {
+        "v4" => Some(AddressFamily::V4),
+        "v6" => Some(AddressFamily::V6),
+        _ => None,
+    }
+}
+
+/// The wire spelling of an address family: `"v4"` / `"v6"`.
+///
+/// **One place, because two sides have to agree.** It is what
+/// [`RelayReach::families`](crate::proxy::RelayReach::families) is sent as and
+/// what `RelayInfo.family` comes back as, and `proxy` cannot name
+/// `AddressFamily` at all — that type arrives with the `msquic` feature, and
+/// the module holding the wire types builds without it.
+pub fn family_name(family: AddressFamily) -> &'static str {
+    match family {
+        AddressFamily::V4 => "v4",
+        AddressFamily::V6 => "v6",
+    }
+}
+
 /// An HTTP/3 control-plane transport to the MASQUE proxy.
 #[derive(Clone)]
 pub struct MasqueH3Transport {
@@ -215,7 +289,12 @@ impl MasqueH3Transport {
             measuring.is_some(),
             registration,
         )
-        .with_peer_certificate_callback(crate::hostname::refuse_other_hosts(host));
+        .with_peer_certificate_callback(crate::hostname::refuse_other_hosts(host))
+        // Read as the connector is built rather than passed in: what these
+        // describe is the host's network, and `connect` has a dozen callers
+        // that have no business knowing about it (see
+        // [`crate::local_address`]).
+        .with_local_address_policies(crate::local_address::current().as_policies());
         // Watched only where it is asked for, and read by the caller rather
         // than by a task of our own -- see [`landing`](Self::landing) for why
         // that is what makes it race-free.
@@ -359,19 +438,6 @@ fn shared_registration() -> anyhow::Result<Arc<msquic_async::Registration>> {
     Ok(registration)
 }
 
-/// Shut the msquic registration down and wait until every connection and stream
-/// derived from it has been closed. Returns `false` if `timeout` elapsed first.
-///
-/// Call this once, after everything holding an msquic handle has been dropped
-/// and before leaving `main`. `shutdown()` asks the connections to go away,
-/// which ends the background h3 drivers holding them; `wait_idle()` then
-/// resolves once the last handle is closed, which is exactly the condition
-/// under which `RegistrationClose` returns promptly instead of blocking in
-/// `CxPlatRundownReleaseAndWait`.
-///
-/// On timeout the registration is deliberately **leaked** rather than dropped:
-/// something still holds a handle, so `RegistrationClose` would block forever,
-/// and the caller is expected to fall back to a hard exit.
 /// Drain the registration without closing it, for a caller that is about to
 /// leave the process without running destructors.
 ///
@@ -403,6 +469,19 @@ pub async fn drain_msquic(timeout: Duration) -> bool {
     drained
 }
 
+/// Shut the msquic registration down and wait until every connection and stream
+/// derived from it has been closed. Returns `false` if `timeout` elapsed first.
+///
+/// Call this once, after everything holding an msquic handle has been dropped
+/// and before leaving `main`. `shutdown()` asks the connections to go away,
+/// which ends the background h3 drivers holding them; `wait_idle()` then
+/// resolves once the last handle is closed, which is exactly the condition
+/// under which `RegistrationClose` returns promptly instead of blocking in
+/// `CxPlatRundownReleaseAndWait`.
+///
+/// On timeout the registration is deliberately **leaked** rather than dropped:
+/// something still holds a handle, so `RegistrationClose` would block forever,
+/// and the caller is expected to fall back to a hard exit.
 pub async fn shutdown_msquic(timeout: Duration) -> bool {
     let registration = REGISTRATION
         .lock()
@@ -531,6 +610,29 @@ const RELAY_LEG_KEEPALIVE: u32 = 2_000;
 /// See [`RELAY_LEG_KEEPALIVE`].
 const RELAY_LEG_DISCONNECT_TIMEOUT: u32 = 6_000;
 
+/// How long a **path** on one of these connections may go without sending
+/// before it gets a PING.
+///
+/// `PathKeepAliveIntervalMs`, and deliberately not the `KeepAliveIntervalMs`
+/// above. The two look interchangeable and are not: the connection keepalive
+/// is re-armed by activity anywhere on the connection, so once a connection
+/// has two paths and the traffic is on one of them it never fires — and the
+/// other path decays, taking its NAT mapping with it.
+/// `isekai_p2p::peer::DIRECT_PATH_KEEPALIVE` documents that distinction at
+/// length, and it cost a field test to learn; it is the reason this is here
+/// and not a second connection keepalive.
+///
+/// Ten seconds, matching that constant and the listener's
+/// (`isekai_link_utils::PATH_KEEP_ALIVE_INTERVAL_MS`): well inside the 30 s
+/// idle timeout, and a path carrying traffic of its own never gets a redundant
+/// PING.
+///
+/// **This covers only our own paths.** The timer runs off each connection's
+/// settings and defaults to 0, so whether the proxy pings is the proxy's
+/// business. What this holds open is the mapping *our* paths own, which is the
+/// half that matters to a client behind a NAT.
+const PATH_KEEPALIVE: u32 = 10_000;
+
 /// Build an msquic client registration + configuration (ALPN `h3` or `h3qx-01`
 /// for qmux), mirroring the `agent` crate's client setup.
 ///
@@ -641,6 +743,99 @@ pub(crate) fn make_client_config(
         Liveness::ControlPlane | Liveness::PublicAddress => settings,
         Liveness::RelayLeg => settings.set_DisconnectTimeoutMs(RELAY_LEG_DISCONNECT_TIMEOUT),
     };
+    // **Several local addresses at once, instead of one at a time.** A
+    // phone holds Wi-Fi and cellular together, a laptop holds Ethernet and
+    // Wi-Fi, and until this a connection to the proxy used exactly one of
+    // them: the other was somewhere to migrate to if the first went away.
+    //
+    // The groundwork was already here, and that is what makes this a
+    // settings change rather than an API one. `AddAddressMode` defaults to
+    // `AUTO` -- "the connection manages its own paths" -- so every
+    // connection built here already assembles a candidate pair table from
+    // *every* address the host has (`QuicLibraryGetLocalAddresses`) and
+    // already reconciles it. What multipath changes is what the reconciler
+    // may then do with a second address, in two places:
+    //
+    // * `QuicConnReconcileCreatePaths` skips a pair whose remote already
+    //   has a path, and says why -- "without multipath a second local
+    //   address to it would be a migration". With multipath it opens the
+    //   path instead.
+    // * `QuicConnReconcileMigrate` returns immediately once multipath is
+    //   negotiated. There is no migration step left to take.
+    //
+    // So a relay leg whose address changes now **gains a path beside the
+    // old one** rather than moving onto it. That is a different shape from
+    // what v0.9.0 measured on the testbed, where the leg migrated -- and
+    // where a defect in exactly that migration (a migrated path landing on
+    // a connected socket, seera-networks/msquic#203) is what kept IPv4
+    // direct paths from validating. Make-before-break with both paths live
+    // does not go through that code at all, and `addrchange-check` is what
+    // can say what it does go through.
+    //
+    // **It is an offer, not a switch.** `MultipathNegotiated` is set only
+    // where the peer offered the transport parameter back, so against a
+    // proxy or a relay that does not, every connection here is the one it
+    // was before. Two things do follow from negotiating it: the
+    // reconciler's "has this path id an unused destination CID" gate is
+    // multipath-only, so the `PATH_CIDS_BLOCKED` machinery v0.9.0 brought
+    // in starts applying to these connections; and a leg with two paths
+    // reports an observed address for each, while [`crate::observed`]'s
+    // watch holds one at a time.
+    //
+    // # What this costs, chosen rather than missed
+    //
+    // **Every viable address gets a path, and "viable" is a low bar.**
+    // `QuicCandidatePairIsViable` applies two hard filters and no others: the
+    // family must match, and loopback/link-local scope must match in both
+    // directions. A docker bridge address, a VPN address and a stale private
+    // one are all viable against a public proxy, so a host carrying them opens
+    // paths it cannot validate -- each costing a UDP binding and a destination
+    // CID out of `QUIC_MAX_PATH_COUNT`, which is 4 and is also the active CID
+    // limit. msquic rate-limits the resulting churn itself, and says why:
+    // retirement "can outrun the peer's NEW_CONNECTION_ID issuance".
+    //
+    // **An operator can now narrow that set**, which is what this said was a
+    // different change and is no longer: `crate::local_address` carries the
+    // excluded prefixes and the connector above is given them. What is left of
+    // the cost is the host nobody has told anything about, where every address
+    // is still tried.
+    //
+    // **The single-address case trades an unthrottled migration for a
+    // reconciler pass.** With one address -- a phone, or any host being
+    // renumbered -- the two shapes are not equivalent. Today
+    // `QuicConnProcessLocalAddressChange` finds no validated alternate and
+    // migrates the active path onto the replacement at once, keeping the port:
+    // "a shared binding is keyed on the port, so keep the one the connection
+    // already has". That is what the testbed measured for v0.9.0 -- the leg
+    // moving to the new address *on its own port*. Under multipath only an
+    // already-validated alternate is promoted, so with nothing to promote the
+    // lost path is abandoned and the reconciler opens the new one: rate-limited,
+    // and on a fresh ephemeral port, because a table pair's local address
+    // carries no port at all.
+    //
+    // **And a second path inherits `MinimumMtu`.** `QuicPathInitialize` starts
+    // every path at it and PLPMTUD never probes below it, so on an interface
+    // under the 1350 set above the path validates -- a PATH_CHALLENGE is padded
+    // to 1200 -- and then drops every full-size relayed packet. A cellular IPv6
+    // interface at the 1280 minimum is exactly that. The floor cannot come
+    // down; the sum above it says why.
+    //
+    // **Not on QMux, which can never hold a second path.** `QuicConnQMuxAlloc`
+    // allocates no path ID, so `QuicConnQueueReconcile` and the local-address
+    // change handler both bail out for one -- and the transport-parameter site
+    // is guarded on `MultipathEnabled` alone, so without this a QMux
+    // connection would advertise `initial_max_path_id` and, against a peer that
+    // offered it back, switch on every `MultipathNegotiated` branch in the
+    // stack on the one connection kind the fork keeps clear of path code. The
+    // path keepalive goes with it: there is no second path for it to hold open,
+    // and it is the connection keepalive above that keeps a QMux tunnel warm.
+    let settings = if is_qmux {
+        settings
+    } else {
+        settings
+            .set_MultipathEnabled()
+            .set_PathKeepAliveIntervalMs(PATH_KEEPALIVE)
+    };
     let configuration = registration.open_configuration(&alpn, Some(&settings))?;
     // **`USE_TLS_BUILTIN_CERTIFICATE_VALIDATION` is deliberately not set here.**
     // It was, briefly, and it is wrong on three of the four platforms:
@@ -695,4 +890,31 @@ pub(crate) fn make_client_config(
     }
     configuration.load_credential(&credential)?;
     Ok((registration, Arc::new(configuration)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The pair has to agree, or a report and the answer to it are about
+    /// different things: this side sends `family_name` and reads back
+    /// `family_from_name`, and the control plane sits between them.
+    #[test]
+    fn the_spelling_survives_a_round_trip() {
+        for family in [AddressFamily::V4, AddressFamily::V6] {
+            assert_eq!(family_from_name(family_name(family)), Some(family));
+        }
+        assert_eq!(family_name(AddressFamily::V4), "v4");
+        assert_eq!(family_name(AddressFamily::V6), "v6");
+    }
+
+    /// Anything else drops the constraint rather than failing. A spelling this
+    /// does not know is a control plane newer than this binary, or a typo —
+    /// neither is a reason to lose the connection.
+    #[test]
+    fn an_unknown_spelling_is_no_constraint() {
+        for name in ["", "V4", "ipv4", "inet6", "4", "v7"] {
+            assert_eq!(family_from_name(name), None, "{name:?}");
+        }
+    }
 }
