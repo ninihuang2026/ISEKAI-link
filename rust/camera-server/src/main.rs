@@ -110,7 +110,15 @@ fn accepts_privacy_policy() -> bool {
         if arg == ACCEPT_FLAG {
             accept = true;
         } else {
-            eprintln!("usage: camera-server [{ACCEPT_FLAG}] [--version]\nunknown argument: {arg}");
+            // `--version` is not in the list because it is not parsed here:
+            // `version_if_asked!` answers it above, and only as the *first*
+            // argument -- a restriction `print_version_if_asked` writes down
+            // its reasons for. Listing it beside a flag that can go anywhere
+            // would promise `{ACCEPT_FLAG} --version`, which lands in this
+            // branch.
+            eprintln!("usage: camera-server [{ACCEPT_FLAG}]");
+            eprintln!("       camera-server --version");
+            eprintln!("unknown argument: {arg}");
             std::process::exit(2);
         }
     }
@@ -139,12 +147,29 @@ async fn main() -> eframe::Result<()> {
     // agreement to this version of the policy is on record.
     let accepted = accepts_privacy_policy();
     if accepted {
-        // Not fatal: the person has agreed, and the open below goes ahead on
-        // the flag either way. An unwritten record only means the screen comes
-        // back the next time the window is started by hand.
+        // **Fatal, and that is not what this first said.** It read "not fatal:
+        // the open below goes ahead on the flag either way", which the code
+        // does not do: `ConsentGate::new` reads the record a moment after
+        // this, and an unwritten one leaves `satisfied` false, so `ui` returns
+        // at the gate every frame and `open_on_start` is never reached.
+        //
+        // What that looks like is the failure `exit_when_stopped` exists to
+        // avoid, arriving through the line meant to prevent it: a consent
+        // screen on a display nobody is looking at, nothing opened, and a
+        // process systemd sees as healthy. Exiting instead puts it in the
+        // journal and lets `Restart=on-failure` try again once whatever
+        // stopped the write is fixed.
+        //
+        // Before the msquic registration below, so there is nothing to drain.
         if let Err(e) = camera_core::privacy::save(APP, camera_core::privacy::Language::preferred())
         {
-            tracing::warn!("could not record the agreement to the privacy policy: {e:#}");
+            eprintln!(
+                "camera-server: {ACCEPT_FLAG} could not record the agreement to the privacy \
+                 policy: {e:#}\nNot starting: the window would ask again, with nobody to \
+                 answer. Check that XDG_CONFIG_HOME names a writable directory -- the unit \
+                 points it at the service's StateDirectory."
+            );
+            std::process::exit(1);
         }
     }
 
